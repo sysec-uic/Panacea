@@ -28,11 +28,6 @@ validation. The final evaluation will use the newer dataset being rebuilt once i
 `bug_ids.txt` contains 10 straightforward bugs from `arvo.db` (spanning curl, skia, mupdf,
 imagemagick, harfbuzz, libxml2, wget2, and ffmpeg) used as a proof-of-concept validation set.
 
-`arvo.db` is too large to commit to the repo. Download it with:
-```bash
-wget https://github.com/n132/ARVO-Meta/releases/download/v3.0.0/arvo.db
-```
-
 ## Smoke test
 
 First, confirm `arvo.db` is in place and all bugs load correctly (no API key needed):
