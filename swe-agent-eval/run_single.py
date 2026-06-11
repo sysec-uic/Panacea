@@ -19,9 +19,9 @@ from minisweagent.models.litellm_model import LitellmModel
 ##############################################
 ## These will (likely) change in the future ##
 ##############################################
-BUG_ID = 42470114  # the bug we're using to validate the pipeline end-to-end
+BUG_ID = 40096184  # the bug we're using to validate the pipeline end-to-end
 MODEL_NAME = os.environ.get("MSWEA_MODEL_NAME", "gemini/gemini-2.5-flash")
-COST_LIMIT = 1.50  # stop the agent if a single attempt would cost more than this (USD)
+COST_LIMIT = 1.00  # stop the agent if a single attempt would cost more than this (USD)
 
 # Re-use the same agent prompt templates / config that mini-SWE-agent ships with
 DEFAULT_AGENT_CONFIG = yaml.safe_load((Path(package_dir) / "config" / "default.yaml").read_text())["agent"]
@@ -35,7 +35,7 @@ def main() -> None:
     print(f"Image: {instance['image_name']}")
     print(f"Ground-truth fix: {instance['patch_url']}\n")
 
-    env = DockerEnvironment(image=instance["image_name"])
+    env = DockerEnvironment(image=instance["image_name"], timeout=600)
     model = LitellmModel(model_name=MODEL_NAME, set_cache_control="default_end")
     agent = DefaultAgent(model, env, **{**DEFAULT_AGENT_CONFIG, "cost_limit": COST_LIMIT})
 
