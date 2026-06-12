@@ -1,0 +1,107 @@
+"""Verify whether an agent's patch.diff actually fixes an ARVO bug.
+
+Applies results/<bug_id>/patch.diff (written by run_single.py) to a fresh
+container of the bug's vulnerable image, rebuilds, and reruns the crashing
+input to classify the outcome.
+
+Classifications:
+- no_changes: the agent's diff was empty, nothing to verify
+- patch_apply_failed: the diff didn't apply cleanly to a fresh checkout
+- build_failed: `compile` failed after applying the patch
+- still_crashes: the rebuilt fuzz target still crashes on /tmp/poc
+- fixed: the rebuilt fuzz target no longer crashes on /tmp/poc
+"""
+
+import argparse
+import json
+import subprocess
+from pathlib import Path
+
+from build_instance import build_instance, load_bug
+
+COMPILE_TIMEOUT = 2400  # seconds - some projects take a long time to rebuild
+RUN_TIMEOUT = 60
+
+
+def docker_exec(container: str, command: str, *, input: str | None = None, timeout: int) -> subprocess.CompletedProcess:
+    cmd = ["docker", "exec"]
+    if input is not None:
+        cmd.append("-i")
+    cmd += [container, "bash", "-lc", command]
+    return subprocess.run(cmd, input=input, text=True, capture_output=True, timeout=timeout)
+
+
+def save(instance: dict, verification: dict) -> dict:
+    out_path = Path("results") / instance["instance_id"] / "verification.json"
+    out_path.write_text(json.dumps(verification, indent=2))
+    print(json.dumps(verification, indent=2))
+
+    classification = verification["classification"]
+    print(f"\n=== RESULT: {classification.upper()} ===")
+    print(f"Full details saved to {out_path}")
+    return verification
+
+
+def verify(bug_id: int, keep: bool = False) -> dict:
+    bug = load_bug(bug_id)
+    instance = build_instance(bug)
+    project = instance["project"]
+
+    diff_path = Path("results") / instance["instance_id"] / "patch.diff"
+    diff = diff_path.read_text() if diff_path.exists() else ""
+
+    verification = {"instance_id": instance["instance_id"], "project": project}
+
+    if not diff.strip():
+        verification["classification"] = "no_changes"
+        return save(instance, verification)
+
+    container = f"arvo-{instance['instance_id']}-verify"
+    subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+    subprocess.run(
+        ["docker", "run", "-d", "--name", container, instance["image_name"], "sleep", str(COMPILE_TIMEOUT + 600)],
+        check=True,
+        capture_output=True,
+    )
+
+    try:
+        apply_result = docker_exec(container, f"git -C /src/{project} apply -", input=diff, timeout=60)
+        if apply_result.returncode != 0:
+            verification["classification"] = "patch_apply_failed"
+            verification["apply_output"] = apply_result.stdout + apply_result.stderr
+            return save(instance, verification)
+
+        # Cap ninja's parallelism: this host has more cores than RAM can support for a
+        # full-parallel clang+ASan build, which previously crashed the WSL2 VM.
+        docker_exec(container, "sed -i 's#/depot_tools/ninja -C#/depot_tools/ninja -j3 -C#g' /src/build.sh 2>/dev/null || true", timeout=30)
+        build_result = docker_exec(container, f"cd /src/{project} && compile", timeout=COMPILE_TIMEOUT)
+        build_output = build_result.stdout + build_result.stderr
+        verification["build_output_tail"] = "\n".join(build_output.splitlines()[-50:])
+        if build_result.returncode != 0:
+            verification["classification"] = "build_failed"
+            return save(instance, verification)
+
+        run_result = docker_exec(container, "arvo", timeout=RUN_TIMEOUT)
+        run_output = run_result.stdout + run_result.stderr
+        verification["run_output_tail"] = "\n".join(run_output.splitlines()[-30:])
+        verification["run_returncode"] = run_result.returncode
+        if "ERROR: AddressSanitizer" in run_output or "SUMMARY: AddressSanitizer" in run_output:
+            verification["classification"] = "still_crashes"
+        elif run_result.returncode != 0:
+            verification["classification"] = "unexpected_exit"
+        else:
+            verification["classification"] = "fixed"
+        return save(instance, verification)
+    finally:
+        if keep:
+            verification["container"] = container
+        else:
+            subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("bug_id", type=int)
+    parser.add_argument("--keep", action="store_true", help="keep the verification container around for debugging")
+    args = parser.parse_args()
+    verify(args.bug_id, keep=args.keep)
