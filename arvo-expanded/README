@@ -1,0 +1,8 @@
+The tools available in this folder exist for the purpose of fetching information from the docker containers available for arvo and turning them into a database. The actual databases themselves are not stored here as they would need github LFS. After generating the database they are uploaded to releases on github.
+
+
+The optimal workflow is:
+1. Run fetch_arvo_tags.sh to get all the docker tags
+2. Manually do any sort of filtering (i.e. removing all elements after X date)
+3. Run create_db to create the empty database (only if you're not inserting into an already created one)
+4. Run insert_tags, will pull any tags from the provided jsonl file and insert them into the database provided
