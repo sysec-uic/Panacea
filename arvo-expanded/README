@@ -6,3 +6,4 @@ The optimal workflow is:
 2. Manually do any sort of filtering (i.e. removing all elements after X date)
 3. Run create_db to create the empty database (only if you're not inserting into an already created one)
 4. Run insert_tags, will pull any tags from the provided jsonl file and insert them into the database provided
+5. Run populate_from_reports.py to fetch all the metadata associated with every entry in the database
