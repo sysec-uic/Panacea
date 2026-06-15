@@ -19,9 +19,9 @@ from minisweagent.models.litellm_model import LitellmModel
 ##############################################
 ## These will (likely) change in the future ##
 ##############################################
-BUG_ID = 42470179  # the bug we're using to validate the pipeline end-to-end
+BUG_ID = int(os.environ.get("MSWEA_BUG_ID", 42470179))  # the bug we're using to validate the pipeline end-to-end
 MODEL_NAME = os.environ.get("MSWEA_MODEL_NAME", "gemini/gemini-2.5-flash")
-COST_LIMIT = 1.00  # stop the agent if a single attempt would cost more than this (USD)
+COST_LIMIT = 0.80  # stop the agent if a single attempt would cost more than this (USD)
 
 # Re-use the same agent prompt templates / config that mini-SWE-agent ships with
 DEFAULT_AGENT_CONFIG = yaml.safe_load((Path(package_dir) / "config" / "default.yaml").read_text())["agent"]
