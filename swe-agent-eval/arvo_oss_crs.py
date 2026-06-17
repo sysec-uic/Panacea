@@ -63,10 +63,14 @@ def extract_poc(bug_id: int, pov_path: Path) -> None:
     pov_path.write_bytes(result.stdout)
 
 
+SANITIZER_DIR = {"asan": "address", "msan": "memory", "ubsan": "undefined", "coverage": "coverage"}
+
+
 def find_latest_run_dir(sanitizer: str) -> Path | None:
     """Return the most recently created run directory in the OSS-CRS workdir."""
     base = OSS_CRS_DIR / ".oss-crs-workdir" / "crs_compose"
-    run_dirs = list(base.glob(f"*/{sanitizer}/runs/*/"))
+    sanitizer_dir = SANITIZER_DIR.get(sanitizer.lower(), sanitizer.lower())
+    run_dirs = list(base.glob(f"*/{sanitizer_dir}/runs/*/"))
     if not run_dirs:
         return None
     return max(run_dirs, key=lambda p: p.stat().st_mtime)
@@ -122,9 +126,6 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
         check=False,
     )
     run_elapsed = time.time() - run_start
-
-    # Pull results from the most recent run directory
-    run_dir = find_latest_run_dir(sanitizer)
     meta = {}
     patches = []
     if run_dir:
