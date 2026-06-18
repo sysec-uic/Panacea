@@ -1,7 +1,18 @@
 # SWE-Agent ARVO Repair Eval
 
+## Data
 
-## Setup
+Currently using the existing ARVO database (`arvo.db`) for pipeline development and
+validation. The final evaluation will use the newer dataset being rebuilt once it's ready.
+
+`bug_ids.txt` contains 10 straightforward bugs from `arvo.db` (spanning curl, skia, mupdf,
+imagemagick, harfbuzz, libxml2, wget2, and ffmpeg) used as a proof-of-concept validation set.
+
+---
+
+## Mini-SWE-Agent
+
+### Setup
 
 1. Create and activate a virtual environment:
    ```bash
@@ -20,15 +31,7 @@
    You'll need an API key for whichever model you choose (e.g. `GEMINI_API_KEY` for
    Gemini models, Google AI Studio offers a free tier).
 
-## Data
-
-Currently using the existing ARVO database (`arvo.db`) for pipeline development and
-validation. The final evaluation will use the newer dataset being rebuilt once it's ready.
-
-`bug_ids.txt` contains 10 straightforward bugs from `arvo.db` (spanning curl, skia, mupdf,
-imagemagick, harfbuzz, libxml2, wget2, and ffmpeg) used as a proof-of-concept validation set.
-
-## Smoke test
+### Smoke test
 
 First, confirm `arvo.db` is in place and all bugs load correctly (no API key needed):
 ```bash
@@ -41,9 +44,28 @@ Then confirm your model/API setup works with the built-in hello-world example:
 python -m minisweagent.run.hello_world -m gemini/gemini-2.5-flash --task "Create a file called test.txt with the text 'it works' inside it"
 ```
 
+### Running
+
+`run_single.py` runs mini-SWE-agent end-to-end on one ARVO bug: it pulls the bug's
+Docker image, lets the agent attempt a fix, and saves the full trajectory under
+`results/<bug_id>/trajectory.json`.
+
+```bash
+python run_single.py
+```
+
+By default it runs the bug ID hardcoded as `BUG_ID` in `run_single.py` using
+`gemini/gemini-2.5-flash`. Override the model with the `MSWEA_MODEL_NAME` env var:
+
+```bash
+MSWEA_MODEL_NAME=gemini/gemini-2.5-pro python run_single.py
+```
+
+---
+
 ## OSS-CRS Pipeline (crs-claude-code)
 
-An alternative pipeline using [OSS-CRS](https://github.com/ossf/oss-crs) with Claude Code as the patching agent. Won DARPA AIxCC. Generally more effective than mini-SWE-agent for C/C++ bugs due to better tooling and an incremental build loop.
+Uses [OSS-CRS](https://github.com/ossf/oss-crs) with Claude Code as the patching agent. Won DARPA AIxCC. Generally more effective than mini-SWE-agent for C/C++ bugs due to better tooling and an incremental build loop.
 
 ### Prerequisites
 
@@ -73,20 +95,3 @@ ARVO images don't match OSS-Fuzz's expected project format, so `arvo_oss_crs.py`
 ### Cost
 
 Each run uses Claude Opus 4.8 (~14 min, ~$2.50 API equivalent, ~30% of Claude Pro daily quota for a successful patch). Use `--skip-build` on reruns to avoid rebuilding the Docker snapshot.
-
-## Running the eval
-
-`run_single.py` runs mini-SWE-agent end-to-end on one ARVO bug: it pulls the bug's
-Docker image, lets the agent attempt a fix, and saves the full trajectory under
-`results/<bug_id>/trajectory.json`.
-
-```bash
-python run_single.py
-```
-
-By default it runs the bug ID hardcoded as `BUG_ID` in `run_single.py` using
-`gemini/gemini-2.5-flash`. Override the model with the `MSWEA_MODEL_NAME` env var:
-
-```bash
-MSWEA_MODEL_NAME=gemini/gemini-2.5-pro python run_single.py
-```
