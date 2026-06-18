@@ -26,6 +26,8 @@ COMPOSE_FILE = OSS_CRS_DIR / "example/crs-claude-code/compose-oauth.yaml"
 PROJECTS_DIR = Path.home() / ".arvo-oss-crs"   # stable per-bug project dirs live here
 RESULTS_DIR = Path(__file__).parent / "results"
 
+SANITIZER_DIR = {"asan": "address", "msan": "memory", "ubsan": "undefined", "coverage": "coverage"}
+
 
 def generate_fake_oss_fuzz_project(bug: dict, project_dir: Path) -> None:
     """Write a minimal OSS-Fuzz-compatible project dir wrapping an ARVO image.
@@ -49,7 +51,7 @@ def generate_fake_oss_fuzz_project(bug: dict, project_dir: Path) -> None:
         f"fuzzing_engines:\n"
         f"  - {bug['fuzz_engine'].lower()}\n"
         f"sanitizers:\n"
-        f"  - {bug['sanitizer'].lower()}\n"
+        f"  - {SANITIZER_DIR.get(bug['sanitizer'].lower(), bug['sanitizer'].lower())}\n"
     )
 
 
@@ -61,9 +63,6 @@ def extract_poc(bug_id: int, pov_path: Path) -> None:
         check=True,
     )
     pov_path.write_bytes(result.stdout)
-
-
-SANITIZER_DIR = {"asan": "address", "msan": "memory", "ubsan": "undefined", "coverage": "coverage"}
 
 
 def find_latest_run_dir(sanitizer: str) -> Path | None:
@@ -126,6 +125,7 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
         check=False,
     )
     run_elapsed = time.time() - run_start
+    run_dir = find_latest_run_dir(sanitizer)
     meta = {}
     patches = []
     if run_dir:

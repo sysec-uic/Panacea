@@ -41,6 +41,39 @@ Then confirm your model/API setup works with the built-in hello-world example:
 python -m minisweagent.run.hello_world -m gemini/gemini-2.5-flash --task "Create a file called test.txt with the text 'it works' inside it"
 ```
 
+## OSS-CRS Pipeline (crs-claude-code)
+
+An alternative pipeline using [OSS-CRS](https://github.com/ossf/oss-crs) with Claude Code as the patching agent. Won DARPA AIxCC. Generally more effective than mini-SWE-agent for C/C++ bugs due to better tooling and an incremental build loop.
+
+### Prerequisites
+
+- Clone OSS-CRS: `git clone https://github.com/ossf/oss-crs ~/oss-crs`
+- Run `uv run oss-crs prepare --compose-file ~/oss-crs/example/crs-claude-code/compose-oauth.yaml` once
+- Set `CLAUDE_CODE_OAUTH_TOKEN` in your shell (Claude Pro/Max OAuth token)
+- **Ubuntu 20.04+ ARVO images only** — older images (e.g. wget2, bug 42470179) use Ubuntu 16.04 and are incompatible with OSS-CRS's install step
+
+### Running
+
+```bash
+OSS_CRS_BUG_ID=435781342 python arvo_oss_crs.py
+```
+
+On subsequent runs, skip the Docker build step (reuses cached snapshot):
+
+```bash
+OSS_CRS_BUG_ID=435781342 python arvo_oss_crs.py --skip-build
+```
+
+Results are saved to `results/<bug_id>/oss_crs_result.json`. Patches go to the OSS-CRS workdir and are copied to `results/<bug_id>/oss_crs_patch_N.diff`.
+
+### How it works
+
+ARVO images don't match OSS-Fuzz's expected project format, so `arvo_oss_crs.py` generates a fake OSS-Fuzz project directory wrapping the ARVO Docker image (no-op `build.sh` since binaries are pre-compiled), extracts the POC from `/tmp/poc`, and drives OSS-CRS build + agent run. OSS-CRS handles the incremental build loop internally — after the first build it snapshots the container so patch attempts are fast.
+
+### Cost
+
+Each run uses Claude Opus 4.8 (~14 min, ~$2.50 API equivalent, ~30% of Claude Pro daily quota for a successful patch). Use `--skip-build` on reruns to avoid rebuilding the Docker snapshot.
+
 ## Running the eval
 
 `run_single.py` runs mini-SWE-agent end-to-end on one ARVO bug: it pulls the bug's
