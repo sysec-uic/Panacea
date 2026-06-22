@@ -1,0 +1,22 @@
+diff --git a/mruby/mrbgems/mruby-bigint/core/bigint.c b/mruby/mrbgems/mruby-bigint/core/bigint.c
+index df5c1894c..1b43ce420 100644
+--- a/mruby/mrbgems/mruby-bigint/core/bigint.c
++++ b/mruby/mrbgems/mruby-bigint/core/bigint.c
+@@ -2798,6 +2798,17 @@ bint_new(mpz_ctx_t *ctx, mpz_t *x)
+   }
+   else {
+     RBIGINT_SET_HEAP(b);
++#if MRB_BIGINT_POOL_SIZE > 0
++    /* The RBigint is a long-lived heap object, but x may be backed by the
++       transient (stack-allocated) pool.  Moving the pool pointer into the
++       object would leave it dangling once the pool's stack frame returns,
++       so copy the limbs out to the heap first. */
++    if (MPZ_HAS_POOL(ctx) && is_pool_memory(x, MPZ_POOL(ctx))) {
++      mp_limb *heap_p = (mp_limb*)mrb_malloc(MPZ_MRB(ctx), x->sz * sizeof(mp_limb));
++      memcpy(heap_p, x->p, x->sz * sizeof(mp_limb));
++      x->p = heap_p;
++    }
++#endif
+     mpz_move(ctx, &b->as.heap, x);
+   }
+   return b;
