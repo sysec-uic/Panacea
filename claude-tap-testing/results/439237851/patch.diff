@@ -1,0 +1,26 @@
+diff --git a/mrbgems/mruby-bigint/core/bigint.c b/mrbgems/mruby-bigint/core/bigint.c
+--- a/mrbgems/mruby-bigint/core/bigint.c
++++ b/mrbgems/mruby-bigint/core/bigint.c
+@@ -2798,7 +2798,21 @@ bint_new(mpz_ctx_t *ctx, mpz_t *x)
+   }
+   else {
+     RBIGINT_SET_HEAP(b);
+-    mpz_move(ctx, &b->as.heap, x);
++#if MRB_BIGINT_POOL_SIZE > 0
++    if (MPZ_HAS_POOL(ctx) && is_pool_memory(x, MPZ_POOL(ctx))) {
++      /* x->p lives in the (stack) memory pool, which is reclaimed when the
++         current operation returns.  This RBigint outlives that pool, so we
++         must copy the limbs onto the heap rather than aliasing pool memory
++         (which would leave the object dangling -> stack-use-after-return). */
++      mpz_init(ctx, &b->as.heap);
++      mpz_set(ctx, &b->as.heap, x);
++      mpz_clear(ctx, x);
++    }
++    else
++#endif
++    {
++      mpz_move(ctx, &b->as.heap, x);
++    }
+   }
+   return b;
+ }
