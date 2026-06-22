@@ -77,7 +77,7 @@ def find_latest_run_dir(sanitizer: str) -> Path | None:
 
 def collect_patches(run_dir: Path) -> list[Path]:
     """Find patch diff files the agent produced in this run."""
-    return list(run_dir.glob("EXCHANGE_DIR/*/*/diffs/*.diff"))
+    return list(run_dir.glob("SUBMIT_DIR/*/patches/*.diff"))
 
 
 def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
