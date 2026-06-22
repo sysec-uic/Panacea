@@ -1,0 +1,15 @@
+diff --git a/lib/http2.c b/lib/http2.c
+index 251fcd8..0e2bdcc 100644
+--- a/lib/http2.c
++++ b/lib/http2.c
+@@ -370,6 +370,10 @@ static ssize_t send_callback(nghttp2_session *h2,
+   (void)h2;
+   (void)flags;
+ 
++  if(!c->send_underlying)
++    /* if called "too early", this pointer isn't setup yet! */
++    return NGHTTP2_ERR_WOULDBLOCK;
++
+   written = ((Curl_send*)c->send_underlying)(conn, FIRSTSOCKET,
+                                              data, length, &result);
+ 
