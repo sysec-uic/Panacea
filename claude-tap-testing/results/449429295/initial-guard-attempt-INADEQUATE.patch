@@ -1,0 +1,27 @@
+--- a/mrbgems/mruby-compiler/core/codegen.c
++++ b/mrbgems/mruby-compiler/core/codegen.c
+@@ -680,15 +680,24 @@
+     prev_pc = i;
+     switch (i[0]) {
+     case OP_EXT1:
++      /* Need a following sub-opcode byte, and it must index the size table. */
++      if (i+1 >= pc || i[1] >= sizeof(mrb_insn_size1)) return NULL;
+       i += mrb_insn_size1[i[1]] + 1;
+       break;
+     case OP_EXT2:
++      if (i+1 >= pc || i[1] >= sizeof(mrb_insn_size2)) return NULL;
+       i += mrb_insn_size2[i[1]] + 1;
+       break;
+     case OP_EXT3:
++      if (i+1 >= pc || i[1] >= sizeof(mrb_insn_size3)) return NULL;
+       i += mrb_insn_size3[i[1]] + 1;
+       break;
+     default:
++      /* If the byte is not a valid opcode, the iseq is not cleanly
++         decodable up to pc; abandon the scan rather than reading
++         mrb_insn_size[] out of bounds.  Callers treat a NULL result as
++         "no previous instruction" and simply skip the peephole. */
++      if (i[0] >= sizeof(mrb_insn_size)) return NULL;
+       i += mrb_insn_size[i[0]];
+       break;
+     }

@@ -1,0 +1,19 @@
+--- a/mrbgems/mruby-compiler/core/codegen.c
++++ b/mrbgems/mruby-compiler/core/codegen.c
+@@ -5271,9 +5271,14 @@
+ codegen_colon3(codegen_scope *s, node *varnode, int val)
+ {
+   struct mrb_ast_colon3_node *n = (struct mrb_ast_colon3_node*)varnode;
+-  // Generate COLON3 (::Name) access manually
++  /* ::Name is a top-level constant lookup.  OP_OCLASS is a 1-operand (B)
++     instruction that loads ::Object into a register; emitting it with a
++     stray symbol operand (genop_2) writes a byte that is not part of any
++     instruction, corrupting the iseq.  Load ::Object, then fetch the named
++     constant from it with OP_GETMCNST. */
+   int sym = new_sym(s, n->name);
+-  genop_2(s, OP_OCLASS, cursp(), sym);
++  genop_1(s, OP_OCLASS, cursp());
++  genop_2(s, OP_GETMCNST, cursp(), sym);
+   if (val) push();
+ }
+ 
