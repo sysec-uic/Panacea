@@ -1,0 +1,16 @@
+--- a/mrbgems/mruby-bigint/core/bigint.c
++++ b/mrbgems/mruby-bigint/core/bigint.c
+@@ -342,6 +342,13 @@
+ static void
+ uadd(mpz_t *z, mpz_t *x, mpz_t *y)
+ {
++  /* The loops below read both operands up to x->sz, then read the tail of y
++     up to y->sz.  This is only correct when x is the shorter operand, so
++     ensure x->sz <= y->sz.  Addition is commutative, so swapping is safe. */
++  if (x->sz > y->sz) {
++    mpz_t *t = x; x = y; y = t;
++  }
++
+   /* Core multi-limb addition with carry propagation */
+   mp_dbl_limb c = 0;
+   size_t i;
