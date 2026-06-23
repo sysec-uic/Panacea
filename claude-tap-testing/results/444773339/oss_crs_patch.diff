@@ -1,0 +1,19 @@
+diff --git a/mruby/mrbgems/mruby-bigint/core/bigint.c b/mruby/mrbgems/mruby-bigint/core/bigint.c
+index df5c1894c..782cb1069 100644
+--- a/mruby/mrbgems/mruby-bigint/core/bigint.c
++++ b/mruby/mrbgems/mruby-bigint/core/bigint.c
+@@ -342,6 +342,14 @@ trim(mpz_t *x)
+ static void
+ uadd(mpz_t *z, mpz_t *x, mpz_t *y)
+ {
++  /* Ensure y is the operand with at least as many limbs as x.
++     The loops below read y->p[i] for every i < x->sz and then continue
++     through the remaining limbs of y, so y must not be the shorter
++     operand or it would be read out of bounds. */
++  if (y->sz < x->sz) {
++    mpz_t *t = x; x = y; y = t;
++  }
++
+   /* Core multi-limb addition with carry propagation */
+   mp_dbl_limb c = 0;
+   size_t i;
