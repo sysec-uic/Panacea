@@ -95,3 +95,4 @@ base and patched, so ground-truth validation used the fuzzer binary directly):
 | Output tokens | 71,581 |
 | Cache-read tokens | 4,235,338 |
 | Cache-write tokens | 150,325 |
+| **Total tokens** | **4,467,294** |

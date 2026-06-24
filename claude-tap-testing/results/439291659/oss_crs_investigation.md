@@ -104,3 +104,4 @@ The guard compiles out entirely when `MRB_BIGINT_POOL_SIZE == 0`. See `oss_crs_p
 | Output tokens | 41,734 |
 | Cache-read tokens | 2,366,308 |
 | Cache-write tokens | 120,974 |
+| **Total tokens** | **2,537,577** |

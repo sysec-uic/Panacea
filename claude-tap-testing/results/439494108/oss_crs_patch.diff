@@ -1,0 +1,32 @@
+diff --git a/mruby/mrbgems/mruby-bigint/core/bigint.c b/mruby/mrbgems/mruby-bigint/core/bigint.c
+index df5c1894c..248a4ce04 100644
+--- a/mruby/mrbgems/mruby-bigint/core/bigint.c
++++ b/mruby/mrbgems/mruby-bigint/core/bigint.c
+@@ -310,6 +310,27 @@ static void
+ mpz_move(mpz_ctx_t *ctx, mpz_t *y, mpz_t *x)
+ {
+   mpz_clear(ctx, y);
++#if MRB_BIGINT_POOL_SIZE > 0
++  if (MPZ_HAS_POOL(ctx) && is_pool_memory(x, MPZ_POOL(ctx))) {
++    /* The source uses scoped pool memory, which is reclaimed when the pool
++       scope unwinds (and lives on the stack frame that owns the pool).
++       Ownership of such storage cannot be transferred, so copy the value
++       into freshly allocated heap memory that the destination can own. */
++    y->sn = x->sn;
++    y->sz = x->sz;
++    if (x->sz > 0) {
++      y->p = (mp_limb*)mrb_malloc(MPZ_MRB(ctx), x->sz * sizeof(mp_limb));
++      memcpy(y->p, x->p, x->sz * sizeof(mp_limb));
++    }
++    else {
++      y->p = NULL;
++    }
++    x->p = NULL;
++    x->sn = 0;
++    x->sz = 0;
++    return;
++  }
++#endif
+   y->sn = x->sn;
+   y->sz = x->sz;
+   y->p = x->p;
