@@ -1,0 +1,25 @@
+--- a/mrbgems/mruby-bigint/core/bigint.c
++++ b/mrbgems/mruby-bigint/core/bigint.c
+@@ -2798,6 +2798,22 @@
+   }
+   else {
+     RBIGINT_SET_HEAP(b);
++#if MRB_BIGINT_POOL_SIZE > 0
++    /* The pool is transient (stack) scratch space.  mpz_move would alias
++       x->p into this persistent object, so if x lives in the pool the
++       object would be left holding a dangling pointer once the pool goes
++       out of scope -- later freed by GC as a bad pointer.  Copy pool-backed
++       limbs onto the heap before storing them. */
++    if (MPZ_HAS_POOL(ctx) && is_pool_memory(x, MPZ_POOL(ctx))) {
++      mpz_t h;
++      mpz_init_heap(ctx, &h, x->sz);
++      if (x->p) memcpy(h.p, x->p, x->sz*sizeof(mp_limb));
++      h.sn = x->sn;
++      b->as.heap = h;
++      mpz_clear(ctx, x);  /* pool-aware: leaves pool memory untouched */
++    }
++    else
++#endif
+     mpz_move(ctx, &b->as.heap, x);
+   }
+   return b;
