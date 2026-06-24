@@ -91,3 +91,7 @@ base and patched, so ground-truth validation used the fuzzer binary directly):
 | POV runs | 4 |
 | Patch builds | 2 |
 | Patches produced | 1 |
+| Input tokens | 10,050 |
+| Output tokens | 71,581 |
+| Cache-read tokens | 4,235,338 |
+| Cache-write tokens | 150,325 |
