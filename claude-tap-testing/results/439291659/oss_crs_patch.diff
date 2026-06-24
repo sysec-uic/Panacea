@@ -1,0 +1,27 @@
+diff --git a/mruby/mrbgems/mruby-bigint/core/bigint.c b/mruby/mrbgems/mruby-bigint/core/bigint.c
+index df5c1894c..dd99b4928 100644
+--- a/mruby/mrbgems/mruby-bigint/core/bigint.c
++++ b/mruby/mrbgems/mruby-bigint/core/bigint.c
+@@ -2798,6 +2798,22 @@ bint_new(mpz_ctx_t *ctx, mpz_t *x)
+   }
+   else {
+     RBIGINT_SET_HEAP(b);
++#if MRB_BIGINT_POOL_SIZE > 0
++    /* A GC-managed bigint must own heap memory.  The scratch pool lives on
++       the stack and is reclaimed when the current scope returns, so moving
++       pool memory into a persistent object would leave a dangling pointer
++       that crashes when the object is later freed.  Copy it to the heap. */
++    if (MPZ_HAS_POOL(ctx) && is_pool_memory(x, MPZ_POOL(ctx))) {
++      size_t sz = x->sz;
++      mp_limb *heap_p = (mp_limb*)mrb_malloc(MPZ_MRB(ctx), sz * sizeof(mp_limb));
++      memcpy(heap_p, x->p, sz * sizeof(mp_limb));
++      b->as.heap.p = heap_p;
++      b->as.heap.sz = sz;
++      b->as.heap.sn = x->sn;
++      mpz_clear(ctx, x);  /* pool memory: resets x without freeing */
++    }
++    else
++#endif
+     mpz_move(ctx, &b->as.heap, x);
+   }
+   return b;
