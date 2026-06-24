@@ -1,0 +1,32 @@
+diff --git a/mruby/mrbgems/mruby-bigint/core/bigint.c b/mruby/mrbgems/mruby-bigint/core/bigint.c
+index df5c1894c..88656c250 100644
+--- a/mruby/mrbgems/mruby-bigint/core/bigint.c
++++ b/mruby/mrbgems/mruby-bigint/core/bigint.c
+@@ -310,6 +310,27 @@ static void
+ mpz_move(mpz_ctx_t *ctx, mpz_t *y, mpz_t *x)
+ {
+   mpz_clear(ctx, y);
++#if MRB_BIGINT_POOL_SIZE > 0
++  if (x->p && MPZ_HAS_POOL(ctx) && is_pool_memory(x, MPZ_POOL(ctx))) {
++    /* The source uses transient pool (typically stack) storage that is
++       reclaimed when the current pool scope unwinds.  Transferring its
++       pointer would leave the destination dangling, so copy the limbs into
++       persistent heap memory instead. */
++    y->sn = x->sn;
++    y->sz = x->sz;
++    if (x->sz > 0) {
++      y->p = (mp_limb*)mrb_malloc(MPZ_MRB(ctx), x->sz * sizeof(mp_limb));
++      memcpy(y->p, x->p, x->sz * sizeof(mp_limb));
++    }
++    else {
++      y->p = NULL;
++    }
++    x->p = NULL;
++    x->sn = 0;
++    x->sz = 0;
++    return;
++  }
++#endif
+   y->sn = x->sn;
+   y->sz = x->sz;
+   y->p = x->p;
