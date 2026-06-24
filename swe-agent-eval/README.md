@@ -10,7 +10,7 @@ imagemagick, harfbuzz, libxml2, wget2, and ffmpeg) used as a proof-of-concept va
 
 ---
 
-## Mini-SWE-Agent
+# Mini-SWE-Agent
 
 ### Setup
 
@@ -63,7 +63,7 @@ MSWEA_MODEL_NAME=gemini/gemini-2.5-pro python run_single.py
 
 ---
 
-## OSS-CRS Pipeline (crs-claude-code)
+# OSS-CRS Pipeline (crs-claude-code)
 
 Uses [OSS-CRS](https://github.com/ossf/oss-crs) with Claude Code as the patching agent. Won DARPA AIxCC. Generally more effective than mini-SWE-agent for C/C++ bugs due to better tooling and an incremental build loop.
 
@@ -86,12 +86,45 @@ On subsequent runs, skip the Docker build step (reuses cached snapshot):
 OSS_CRS_BUG_ID=435781342 python arvo_oss_crs.py --skip-build
 ```
 
+If using a different database (e.g. `arvo_new.db`, available at https://github.com/sysec-uic/Panacea/releases/tag/ARVO_New_in_prog):
+```bash
+ARVO_DB_PATH=arvo_new.db OSS_CRS_BUG_ID=439279102 python arvo_oss_crs.py
+```
+
 Results are saved to `results/<bug_id>/oss_crs_result.json`. Patches go to the OSS-CRS workdir and are copied to `results/<bug_id>/oss_crs_patch_N.diff`.
 
 ### How it works
 
 ARVO images don't match OSS-Fuzz's expected project format, so `arvo_oss_crs.py` generates a fake OSS-Fuzz project directory wrapping the ARVO Docker image (no-op `build.sh` since binaries are pre-compiled), extracts the POC from `/tmp/poc`, and drives OSS-CRS build + agent run. OSS-CRS handles the incremental build loop internally — after the first build it snapshots the container so patch attempts are fast.
 
+### Token counts
+
+Claude Code saves its session as a JSONL file inside the run's `LOG_DIR`. To extract token
+usage after a run (file is root-owned, hence `sudo`):
+
+```bash
+SESSION=$(find ~/oss-crs/.oss-crs-workdir -name "*.jsonl" -path "*/.claude/*" | xargs ls -t 2>/dev/null | head -1)
+sudo cat "$SESSION" | python3 -c "
+import json, sys
+inp = out = cache_r = cache_w = 0
+for line in sys.stdin:
+    u = json.loads(line).get('message', {}).get('usage', {})
+    if u:
+        inp += u.get('input_tokens', 0); out += u.get('output_tokens', 0)
+        cache_r += u.get('cache_read_input_tokens', 0); cache_w += u.get('cache_creation_input_tokens', 0)
+print(f'Input: {inp:,}  Output: {out:,}  Cache-read: {cache_r:,}  Cache-write: {cache_w:,}')
+"
+```
+
 ### Cost
 
-Each run uses Claude Opus 4.8 (~14 min, ~$2.50 API equivalent, ~30% of Claude Pro daily quota for a successful patch). Use `--skip-build` on reruns to avoid rebuilding the Docker snapshot.
+Each run uses Claude Opus 4.8. Typical token usage for a successful patch (~300–700 s):
+
+| Metric | Typical range |
+|--------|--------------|
+| Input tokens | ~8K–11K |
+| Output tokens | ~30K–70K |
+| Cache-read tokens | ~2M–4M |
+| Cache-write tokens | ~100K–150K |
+
+Cache-read dominates cost as the conversation grows across turns. Use `--skip-build` on reruns to avoid rebuilding the Docker snapshot.
