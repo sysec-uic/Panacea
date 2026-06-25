@@ -1,0 +1,50 @@
+--- a/include/mruby/khash.h
++++ b/include/mruby/khash.h
+@@ -165,28 +165,37 @@
+     return h->size;  /* Not found - return end position */              \
+   }                                                                     \
+   static inline void kh__rebuild_##name(mrb_state *mrb, kh_##name##_t *h, khint_t new_n_buckets) { \
+-    /* Save old state */                                                \
+-    void *old_data = h->data;                                           \
++    /* Rehashing recomputes each key's hash via __hash_func; for some       \
++       instantiations (e.g. mruby-set) that runs arbitrary Ruby and can     \
++       trigger GC, which marks the live keys through *h.  *h must therefore  \
++       keep describing the complete OLD table until every key has been       \
++       migrated -- otherwise a not-yet-migrated key is unreachable during a  \
++       GC, gets swept, and the rehash loop then hashes a freed object.       \
++       Build the resized table in a temporary header and publish it into *h  \
++       only after the rehash has finished. */                               \
++    kh_##name##_t nh = *h;                                              \
+     khkey_t *old_keys = kh_keys_##name(h);                              \
+     khval_t *old_vals = kh_vals_##name(h);                              \
+     uint8_t *old_flags = kh__is_small_##name(h) ? NULL : kh_flags_##name(h); \
+     khint_t old_n_buckets = h->n_buckets;                               \
+     khint_t old_size = h->size;                                         \
+-    /* Allocate new table */                                            \
+-    h->n_buckets = new_n_buckets;                                       \
+-    h->size = 0;                                                        \
+-    kh__alloc_##name(mrb, h);                                           \
+-    /* Rehash elements */                                               \
++    /* Allocate the new table into the temporary header only */         \
++    nh.n_buckets = new_n_buckets;                                       \
++    nh.size = 0;                                                        \
++    kh__alloc_##name(mrb, &nh);                                         \
++    /* Rehash elements (may trigger GC; *h still describes the old table) */ \
+     khint_t limit = old_flags ? old_n_buckets : old_size;               \
+     for (khint_t i = 0; i < limit; i++) {                               \
+       if (old_flags && __ac_iseither(old_flags, i)) continue;           \
+-      khint_t k = kh_put_##name(mrb, h, old_keys[i], NULL);             \
++      khint_t k = kh_put_##name(mrb, &nh, old_keys[i], NULL);           \
+       if (kh_is_map) {                                                  \
+-        khval_t *new_vals = kh_vals_##name(h);                          \
++        khval_t *new_vals = kh_vals_##name(&nh);                        \
+         new_vals[k] = old_vals[i];                                      \
+       }                                                                 \
+     }                                                                   \
+-    /* Cleanup */                                                       \
++    /* Publish the finished table and release the old storage */        \
++    void *old_data = h->data;                                           \
++    *h = nh;                                                            \
+     mrb_free(mrb, old_data);                                            \
+   }                                                                     \
+   static inline khint_t kh__put_small_##name(mrb_state *mrb, kh_##name##_t *h, khkey_t key, int *ret) { \
