@@ -1,0 +1,124 @@
+diff --git a/mruby/mrbgems/mruby-set/src/set.c b/mruby/mrbgems/mruby-set/src/set.c
+index 6b6f12a2e..0b3b7fe7e 100644
+--- a/mruby/mrbgems/mruby-set/src/set.c
++++ b/mruby/mrbgems/mruby-set/src/set.c
+@@ -61,6 +61,9 @@ typedef khint_t kset_iter_t;
+ #define kset_is_uninitialized(s) ((s)->data == NULL)
+ #define kset_is_empty(s) (kset_is_uninitialized(s) || kset_size(s) == 0)
+ 
++/* Insert a key into a set, firing the GC write barrier (see definition). */
++static void set_put_value(mrb_state *mrb, kset_t *set, mrb_value key, int *ret);
++
+ /* Copy all elements from src to dst (merge operation) */
+ static void
+ kset_copy_merge(mrb_state *mrb, kset_t *dst, kset_t *src)
+@@ -68,7 +71,7 @@ kset_copy_merge(mrb_state *mrb, kset_t *dst, kset_t *src)
+   if (!kset_is_empty(src)) {
+     int ai = mrb_gc_arena_save(mrb);
+     KSET_FOREACH(src, k) {
+-      kset_put(mrb, dst, kset_key(src, k));
++      set_put_value(mrb, dst, kset_key(src, k), NULL);
+       mrb_gc_arena_restore(mrb, ai);
+     }
+   }
+@@ -85,6 +88,28 @@ mrb_static_assert_object_size(struct RSet);
+ 
+ #define mrb_set_ptr(o) ((struct RSet*)mrb_obj_ptr(o))
+ 
++/*
++ * Insert KEY into SET, then fire the GC write barrier on the owning Set
++ * object. Without this, an object inserted into an already-marked (black) Set
++ * during incremental GC would never be re-marked and could be swept while the
++ * Set still references it, causing a use-after-free on the next access (e.g.
++ * when rehashing the key during a resize). The kset_t is embedded directly in
++ * its struct RSet, so the owning object is recovered via offsetof.
++ * Mirrors the write barriers in core hash.c / array.c.
++ */
++static void
++set_put_value(mrb_state *mrb, kset_t *set, mrb_value key, int *ret)
++{
++  if (ret) {
++    kset_put2(mrb, set, key, ret);
++  }
++  else {
++    kset_put(mrb, set, key);
++  }
++  struct RSet *s = (struct RSet*)((char*)set - offsetof(struct RSet, set));
++  mrb_field_write_barrier_value(mrb, (struct RBasic*)s, key);
++}
++
+ /* Get pointer to embedded set */
+ static kset_t*
+ set_get_kset(mrb_state *mrb, mrb_value self)
+@@ -288,7 +313,7 @@ set_add(mrb_state *mrb, mrb_value self)
+   kset_t *set = set_get_kset(mrb, self);
+   set_ensure_initialized(mrb, set);
+ 
+-  kset_put(mrb, set, obj);
++  set_put_value(mrb, set, obj, NULL);
+   return self;
+ }
+ 
+@@ -307,7 +332,7 @@ set_add_p(mrb_state *mrb, mrb_value self)
+   set_ensure_initialized(mrb, set);
+ 
+   int ret;
+-  kset_put2(mrb, set, obj, &ret);
++  set_put_value(mrb, set, obj, &ret);
+   return (ret == 0) ? mrb_nil_value() : self;
+ }
+ 
+@@ -506,7 +531,7 @@ set_core_intersection(mrb_state *mrb, mrb_value self)
+ 
+     /* If key exists in self, add it to result */
+     if (self_k != kset_end(self_set)) {
+-      kset_put(mrb, result_set, key);
++      set_put_value(mrb, result_set, key, NULL);
+     }
+   }
+ 
+@@ -554,7 +579,7 @@ set_core_xor(mrb_state *mrb, mrb_value self)
+ 
+     /* Add to result if not in other */
+     if (other_k == kset_end(other_set)) {
+-      kset_put(mrb, result_set, key);
++      set_put_value(mrb, result_set, key, NULL);
+     }
+     mrb_gc_arena_restore(mrb, ai);
+   }
+@@ -566,7 +591,7 @@ set_core_xor(mrb_state *mrb, mrb_value self)
+ 
+     /* Add to result if not in self */
+     if (self_k == kset_end(self_set)) {
+-      kset_put(mrb, result_set, key);
++      set_put_value(mrb, result_set, key, NULL);
+     }
+     mrb_gc_arena_restore(mrb, ai);
+   }
+@@ -1144,7 +1169,7 @@ set_add_all(mrb_state *mrb, mrb_value self)
+ 
+   int ai = mrb_gc_arena_save(mrb);
+   for (mrb_int i = 0; i < argc; i++) {
+-    kset_put(mrb, set, argv[i]);
++    set_put_value(mrb, set, argv[i], NULL);
+     mrb_gc_arena_restore(mrb, ai);
+   }
+ 
+@@ -1199,7 +1224,7 @@ set_flatten_recursive(mrb_state *mrb, kset_t *target, kset_t *source, int *seen_
+     }
+     else {
+       /* Add non-Set element directly */
+-      kset_put(mrb, target, elem);
++      set_put_value(mrb, target, elem, NULL);
+     }
+     mrb_gc_arena_restore(mrb, ai);
+   }
+@@ -1410,7 +1435,7 @@ set_s_create(mrb_state *mrb, mrb_value klass)
+   kset_t *ks = set_get_kset(mrb, set);
+ 
+   for (mrb_int i = 0; i < argc; i++) {
+-    kset_put(mrb, ks, argv[i]);
++    set_put_value(mrb, ks, argv[i], NULL);
+   }
+ 
+   return set;

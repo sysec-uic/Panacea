@@ -35,13 +35,13 @@ imagemagick, harfbuzz, libxml2, wget2, and ffmpeg) used as a proof-of-concept va
 
 First, confirm `arvo.db` is in place and all bugs load correctly (no API key needed):
 ```bash
-python build_instance.py
+python3 build_instance.py
 ```
 You should see a one-line summary for each of the 10 bugs in `bug_ids.txt`.
 
 Then confirm your model/API setup works with the built-in hello-world example:
 ```bash
-python -m minisweagent.run.hello_world -m gemini/gemini-2.5-flash --task "Create a file called test.txt with the text 'it works' inside it"
+python3 -m minisweagent.run.hello_world -m gemini/gemini-2.5-flash --task "Create a file called test.txt with the text 'it works' inside it"
 ```
 
 ### Running
@@ -51,14 +51,14 @@ Docker image, lets the agent attempt a fix, and saves the full trajectory under
 `results/<bug_id>/trajectory.json`.
 
 ```bash
-python run_single.py
+python3 run_single.py
 ```
 
 By default it runs the bug ID hardcoded as `BUG_ID` in `run_single.py` using
 `gemini/gemini-2.5-flash`. Override the model with the `MSWEA_MODEL_NAME` env var:
 
 ```bash
-MSWEA_MODEL_NAME=gemini/gemini-2.5-pro python run_single.py
+MSWEA_MODEL_NAME=gemini/gemini-2.5-pro python3 run_single.py
 ```
 
 ---
@@ -77,18 +77,18 @@ Uses [OSS-CRS](https://github.com/ossf/oss-crs) with Claude Code as the patching
 ### Running
 
 ```bash
-OSS_CRS_BUG_ID=435781342 python arvo_oss_crs.py
+OSS_CRS_BUG_ID=435781342 python3 arvo_oss_crs.py
 ```
 
 On subsequent runs, skip the Docker build step (reuses cached snapshot):
 
 ```bash
-OSS_CRS_BUG_ID=435781342 python arvo_oss_crs.py --skip-build
+OSS_CRS_BUG_ID=435781342 python3 arvo_oss_crs.py --skip-build
 ```
 
 If using a different database (e.g. `arvo_new.db`, available at https://github.com/sysec-uic/Panacea/releases/tag/ARVO_New_in_prog):
 ```bash
-ARVO_DB_PATH=arvo_new.db OSS_CRS_BUG_ID=439279102 python arvo_oss_crs.py
+ARVO_DB_PATH=arvo_new.db OSS_CRS_BUG_ID=439279102 python3 arvo_oss_crs.py
 ```
 
 Results are saved to `results/<bug_id>/oss_crs_result.json`. Patches go to the OSS-CRS workdir and are copied to `results/<bug_id>/oss_crs_patch_N.diff`.

@@ -15,6 +15,7 @@ Prerequisites:
 
 import json
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -77,7 +78,13 @@ def find_latest_run_dir(sanitizer: str) -> Path | None:
 
 def collect_patches(run_dir: Path) -> list[Path]:
     """Find patch diff files the agent produced in this run."""
-    return list(run_dir.glob("SUBMIT_DIR/*/patches/*.diff"))
+    return list(run_dir.glob("**/SUBMIT_DIR/*/patches/*.diff"))
+
+
+def copy_session_files(run_dir: Path, output_dir: Path) -> None:
+    """Copy claude_stdout.log to output_dir."""
+    for log in run_dir.glob("crs/crs-claude-code/*/LOG_DIR/*/agent/claude_stdout.log"):
+        shutil.copy2(log, output_dir / "oss_crs_claude_stdout.log")
 
 
 def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
@@ -138,6 +145,9 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
             dest = output_dir / f"oss_crs_patch_{i}.diff"
             dest.write_bytes(patch_file.read_bytes())
             print(f"[{bug_id}] Saved patch to {dest}")
+
+        copy_session_files(run_dir, output_dir)
+        print(f"[{bug_id}] Saved session files to {output_dir}")
 
     n_patches = meta.get("totals", {}).get("artifacts", {}).get("patches", 0)
     summary = {
