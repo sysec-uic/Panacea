@@ -1,0 +1,114 @@
+--- a/mrbgems/mruby-set/src/set.c
++++ b/mrbgems/mruby-set/src/set.c
+@@ -61,30 +61,35 @@
+ #define kset_is_uninitialized(s) ((s)->data == NULL)
+ #define kset_is_empty(s) (kset_is_uninitialized(s) || kset_size(s) == 0)
+ 
++/* Embedded set structure in RSet - exactly 3 pointers */
++struct RSet {
++  MRB_OBJECT_HEADER;
++  kset_t set; /* Embedded directly, not a pointer */
++};
++
++mrb_static_assert_object_size(struct RSet);
++
++#define mrb_set_ptr(o) ((struct RSet*)mrb_obj_ptr(o))
++
++/* Get RSet pointer from embedded kset_t pointer */
++#define kset_to_rset(kset) ((struct RBasic*)((char*)(kset) - offsetof(struct RSet, set)))
++
+ /* Copy all elements from src to dst (merge operation) */
+ static void
+ kset_copy_merge(mrb_state *mrb, kset_t *dst, kset_t *src)
+ {
+   if (!kset_is_empty(src)) {
++    struct RBasic *dst_obj = kset_to_rset(dst);
+     int ai = mrb_gc_arena_save(mrb);
+     KSET_FOREACH(src, k) {
+-      kset_put(mrb, dst, kset_key(src, k));
++      mrb_value key = kset_key(src, k);
++      kset_put(mrb, dst, key);
++      mrb_field_write_barrier_value(mrb, dst_obj, key);
+       mrb_gc_arena_restore(mrb, ai);
+     }
+   }
+ }
+ 
+-
+-/* Embedded set structure in RSet - exactly 3 pointers */
+-struct RSet {
+-  MRB_OBJECT_HEADER;
+-  kset_t set; /* Embedded directly, not a pointer */
+-};
+-
+-mrb_static_assert_object_size(struct RSet);
+-
+-#define mrb_set_ptr(o) ((struct RSet*)mrb_obj_ptr(o))
+-
+ /* Get pointer to embedded set */
+ static kset_t*
+ set_get_kset(mrb_state *mrb, mrb_value self)
+@@ -289,6 +294,7 @@
+   set_ensure_initialized(mrb, set);
+ 
+   kset_put(mrb, set, obj);
++  mrb_field_write_barrier_value(mrb, kset_to_rset(set), obj);
+   return self;
+ }
+ 
+@@ -308,6 +314,7 @@
+ 
+   int ret;
+   kset_put2(mrb, set, obj, &ret);
++  mrb_field_write_barrier_value(mrb, kset_to_rset(set), obj);
+   return (ret == 0) ? mrb_nil_value() : self;
+ }
+ 
+@@ -507,6 +514,7 @@
+     /* If key exists in self, add it to result */
+     if (self_k != kset_end(self_set)) {
+       kset_put(mrb, result_set, key);
++      mrb_field_write_barrier_value(mrb, kset_to_rset(result_set), key);
+     }
+   }
+ 
+@@ -555,6 +563,7 @@
+     /* Add to result if not in other */
+     if (other_k == kset_end(other_set)) {
+       kset_put(mrb, result_set, key);
++      mrb_field_write_barrier_value(mrb, kset_to_rset(result_set), key);
+     }
+     mrb_gc_arena_restore(mrb, ai);
+   }
+@@ -567,6 +576,7 @@
+     /* Add to result if not in self */
+     if (self_k == kset_end(self_set)) {
+       kset_put(mrb, result_set, key);
++      mrb_field_write_barrier_value(mrb, kset_to_rset(result_set), key);
+     }
+     mrb_gc_arena_restore(mrb, ai);
+   }
+@@ -1145,6 +1155,7 @@
+   int ai = mrb_gc_arena_save(mrb);
+   for (mrb_int i = 0; i < argc; i++) {
+     kset_put(mrb, set, argv[i]);
++    mrb_field_write_barrier_value(mrb, kset_to_rset(set), argv[i]);
+     mrb_gc_arena_restore(mrb, ai);
+   }
+ 
+@@ -1200,6 +1211,7 @@
+     else {
+       /* Add non-Set element directly */
+       kset_put(mrb, target, elem);
++      mrb_field_write_barrier_value(mrb, kset_to_rset(target), elem);
+     }
+     mrb_gc_arena_restore(mrb, ai);
+   }
+@@ -1411,6 +1423,7 @@
+ 
+   for (mrb_int i = 0; i < argc; i++) {
+     kset_put(mrb, ks, argv[i]);
++    mrb_field_write_barrier_value(mrb, kset_to_rset(ks), argv[i]);
+   }
+ 
+   return set;
