@@ -153,9 +153,12 @@ Plan:   `docs/superpowers/plans/2026-06-29-mruby-heuristic-learning-loop.md`
 - `ANTHROPIC_API_KEY` — *optional*. Only set this if you'd rather bill the extractor to an
   API key than your Claude subscription. Don't set both an API key and the OAuth token —
   the API rejects dual auth. (`llm.py` prefers the API key when both are present.)
-- The Phase 0 spikes confirmed: the playbook is injected as `HEURISTICS.md` in the
-  per-bug project dir, and the mruby correctness gate runs `cd /src/mruby && rake test`
-  (see `MRUBY_TEST_CMD` in `verify_fix.py` and `INJECT_FILENAME` in `injector.py`).
+- The mruby correctness gate runs `cd /src/mruby && rake test`
+  (see `MRUBY_TEST_CMD` in `verify_fix.py`).
+- The playbook is injected as `HEURISTICS.md` written by `injector.py` into the
+  per-bug project dir, then copied by `arvo_oss_crs.py` into the agent's actual
+  working directory (the OSS-CRS `target-source` dir) before the run starts
+  (see `inject_heuristics` in `arvo_oss_crs.py`).
 
 ### Repair loop & learning
 

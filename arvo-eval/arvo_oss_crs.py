@@ -76,6 +76,38 @@ def find_latest_run_dir(sanitizer: str) -> Path | None:
     return max(run_dirs, key=lambda p: p.stat().st_mtime)
 
 
+def find_target_source_dir(sanitizer: str) -> Path | None:
+    """Return the most recently modified target-source directory in the OSS-CRS workdir.
+
+    OSS-CRS extracts the bug's Docker image WORKDIR (/src) here; this is the
+    directory the agent runs in (cwd=source_dir in claude_code.py).
+    """
+    base = OSS_CRS_DIR / ".oss-crs-workdir" / "crs_compose"
+    sanitizer_dir = SANITIZER_DIR.get(sanitizer.lower(), sanitizer.lower())
+    dirs = list(base.glob(f"*/{sanitizer_dir}/builds/*/targets/*/target-source"))
+    if not dirs:
+        return None
+    return max(dirs, key=lambda p: p.stat().st_mtime)
+
+
+def inject_heuristics(project_dir: Path, sanitizer: str, bug_id: int) -> None:
+    """Copy HEURISTICS.md from project_dir into the agent's source directory.
+
+    HEURISTICS.md is written to the fake OSS-Fuzz project dir by injector.py
+    but that dir never reaches the agent.  This bridges the gap by copying it
+    directly into the extracted target-source dir where the agent runs.
+    """
+    src = project_dir / "HEURISTICS.md"
+    if not src.exists():
+        return
+    target_source = find_target_source_dir(sanitizer)
+    if target_source is None:
+        print(f"[{bug_id}] Warning: could not find target-source dir, skipping heuristics injection")
+        return
+    shutil.copy2(src, target_source / "HEURISTICS.md")
+    print(f"[{bug_id}] Injected HEURISTICS.md into {target_source}")
+
+
 def collect_patches(run_dir: Path) -> list[Path]:
     """Find patch diff files the agent produced in this run."""
     return list(run_dir.glob("**/SUBMIT_DIR/*/patches/*.diff"))
@@ -119,6 +151,8 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
         )
     else:
         print(f"[{bug_id}] Skipping build (--skip-build set).")
+
+    inject_heuristics(project_dir, sanitizer, bug_id)
 
     print(f"[{bug_id}] Running agent (harness: {bug['fuzz_target']})...")
     run_start = time.time()
