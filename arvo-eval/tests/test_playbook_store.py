@@ -12,6 +12,22 @@ def make_h(text="lesson", tags=("suar",)):
             "how_to_apply": "deep-copy on escape", "tags": list(tags), "confidence": "high"}
 
 
+def make_contrastive():
+    return {"trigger": "OOB read over bytecode", "wrong_approach": "guarded the reader",
+            "correct_approach": "fixed the writer", "lesson": "corrupt bytecode, not a missing check",
+            "how_to_apply": "trace the emission", "tags": ["asan"], "confidence": "high",
+            "kind": "contrastive"}
+
+
+def test_render_handles_contrastive_lessons():
+    s = new_state()
+    s = add_heuristic(s, make_contrastive(), source_bug=449429295, after_bug=449429295)
+    md = render_playbook(s, before_bug=999999999)
+    assert "**Don't:** guarded the reader" in md
+    assert "**Do:** fixed the writer" in md
+    assert "corrupt bytecode, not a missing check" in md
+
+
 def test_add_assigns_provenance_and_bumps_version():
     s = new_state()
     assert s["version"] == 0

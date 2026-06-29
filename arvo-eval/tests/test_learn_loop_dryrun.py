@@ -48,3 +48,45 @@ def test_dryrun_control_pass_injects_nothing(tmp_path):
         agent=stub_agent, verify=stub_verify, extract=stub_extract,
     )
     assert result[1]["injected_seen"] == ""   # never injected, even though store grew
+
+
+GUARD, FIX = "GUARD_DIFF", "FIX_DIFF"
+
+
+def retrying_agent(bug_id, project_dir, skip_build):
+    # The agent reads its context (HEURISTICS.md). It only switches to the real fix
+    # once it has received feedback about the failing attempt -- mirroring recovery.
+    hfile = Path(project_dir) / "HEURISTICS.md"
+    ctx = hfile.read_text() if hfile.exists() else ""
+    diff = FIX if "Feedback" in ctx else GUARD
+    return {"diff": diff, "trajectory_summary": "t"}
+
+
+def retry_verify(bug_id, diff):
+    if diff == FIX:
+        return {"classification": "verified_correct", "make_test_ok": True}
+    return {"classification": "fixed_tests_failed", "make_test_tail": "::FOO expected 42 got Object"}
+
+
+def test_retry_learns_contrastively_from_own_attempts(tmp_path):
+    captured = {}
+
+    def contrastive(bug, rejected_diff, accepted_diff, rejected_verdict):
+        captured.update(rejected=rejected_diff, accepted=accepted_diff, verdict=rejected_verdict)
+        return {"trigger": "t", "wrong_approach": "guarded reader", "correct_approach": "fixed writer",
+                "lesson": "fix the writer", "how_to_apply": "trace emission", "tags": ["asan"],
+                "confidence": "high", "kind": "contrastive"}
+
+    bugs = [{"localId": 300, "crash_type": "c", "sanitizer": "asan", "fuzz_target": "f", "crash_output": ""}]
+    result = run_pass(
+        bugs=bugs, pass_name="treatment", inject_enabled=True,
+        state_path=tmp_path / "state.json", ledger_path=tmp_path / "ledger.jsonl",
+        project_dir_for=lambda bid: tmp_path / f"proj-{bid}",
+        agent=retrying_agent, verify=retry_verify, contrastive=contrastive, max_attempts=5,
+    )
+    # Solved on the second attempt after recovering from feedback.
+    assert result[0]["classification"] == "verified_correct"
+    assert result[0]["n_attempts"] == 2
+    # The contrastive lesson was learned from the agent's OWN rejected vs accepted attempts.
+    assert captured["rejected"] == GUARD and captured["accepted"] == FIX
+    assert captured["verdict"] == "fixed_tests_failed"

@@ -152,18 +152,42 @@ Plan:   `docs/superpowers/plans/2026-06-29-mruby-heuristic-learning-loop.md`
   per-bug project dir, and the mruby correctness gate runs `cd /src/mruby && rake test`
   (see `MRUBY_TEST_CMD` in `verify_fix.py` and `INJECT_FILENAME` in `injector.py`).
 
+### Repair loop & learning
+
+Each bug gets up to `LEARN_MAX_ATTEMPTS` (default 5) repair attempts. Between attempts
+the agent is re-run with **deployment-faithful feedback only** — the crash trace and the
+failing `make test` output, never the `-fix` image (the system must keep working on bugs
+that have no known fix). A lesson is learned only from solved bugs:
+
+- solved after a failure → a **contrastive** lesson from the agent's own rejected vs
+  accepted attempts (`contrastive_extract.py`); rendered as a "Don't / Do" entry.
+- solved on the first try → a plain success lesson (`extract_heuristic.py`).
+
+The ledger records `n_attempts` per bug — watch it trend down on later bugs if the
+playbook is helping. See `demo_retry_learn.py` for a stub-driven walk-through.
+
 ### Running the experiment
 
 Two passes over the same chronological ordering — a control (no playbook injected)
 and a treatment (injected):
 
 ```bash
+# Smoke-test on a few bugs first (cheap) before the full multi-hour run:
+ARVO_DB_PATH=arvo_new.db LEARN_PASS=treatment python3 learn_loop.py --limit 3
+# or specific bugs:
+ARVO_DB_PATH=arvo_new.db LEARN_PASS=treatment python3 learn_loop.py --bugs 439494108,449429295
+
+# Full experiment:
 ARVO_DB_PATH=arvo_new.db LEARN_PASS=control   python3 learn_loop.py
 ARVO_DB_PATH=arvo_new.db LEARN_PASS=treatment python3 learn_loop.py
 ```
 
 Per-run records accumulate in `results/learn/ledger.jsonl`. The accumulated playbook
 state is `playbook/playbook_state_<pass>.json`.
+
+**Local model:** `llm.py` reads `LLM_MODEL` and `LLM_BASE_URL` from the environment, so
+point it at a local Anthropic-compatible endpoint without code changes. A local server
+that speaks the OpenAI API instead needs a small adapter client passed via `client=`.
 
 > **Note:** `results/` is git-ignored, so the ledger is a local artifact. The
 > `playbook/` directory is tracked — commit the resulting playbook if you want to
