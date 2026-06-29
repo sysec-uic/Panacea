@@ -38,3 +38,20 @@ def test_normalize_equal_modulo_noise():
 
 def test_normalize_keeps_semantic_difference():
     assert normalize("value=7\n") != normalize("value=8\n")
+
+
+from differential_oracle import outputs_diverge
+
+
+def test_outputs_diverge_exit_mismatch():
+    assert outputs_diverge((0, "x"), (1, "x")) == "exit"
+
+
+def test_outputs_diverge_stdout_mismatch():
+    assert outputs_diverge((0, "value=7\n"), (0, "value=8\n")) == "stdout"
+
+
+def test_outputs_diverge_agree_modulo_noise():
+    a = (0, "==1==WARNING: MemorySanitizer: q\nvalue=7\n")
+    b = (0, "==2==WARNING: MemorySanitizer: q\nvalue=7\n")
+    assert outputs_diverge(a, b) is None
