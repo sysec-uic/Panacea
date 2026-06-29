@@ -1,8 +1,12 @@
 """Chronological self-improving repair loop for mruby ARVO bugs.
 
-Per bug (in localId order): render the holdout-filtered playbook, optionally
-inject it, run the agent, verify, log, and -- only on verified_correct -- extract a
-heuristic and add it to the store AFTER the bug has been evaluated.
+Per bug (in localId order): render the holdout-filtered playbook, optionally inject
+it, then make up to `max_attempts` repair attempts with deployment-faithful feedback
+between them (crash trace + make test only -- never the -fix image). A lesson is
+learned only from SOLVED bugs, and added to the store AFTER the bug is evaluated:
+  - solved after a failure -> a CONTRASTIVE lesson from the agent's own rejected vs
+    accepted attempts (richer; warns future bugs off the dead end);
+  - solved on the first try -> a plain success lesson.
 """
 import os
 import sys
@@ -13,6 +17,7 @@ from injector import inject
 from curator import maybe_compress
 from ledger import append_record
 from mruby_bugs import mruby_bug_ids
+from repair_loop import repair_with_retries
 
 
 def _default_agent(bug_id, project_dir, skip_build):
@@ -40,42 +45,92 @@ def _default_extract(bug, diff, trajectory_summary, verdict):
     return extract_heuristic(bug=bug, diff=diff, trajectory_summary=trajectory_summary, verdict=verdict)
 
 
+def _default_contrastive(bug, rejected_diff, accepted_diff, rejected_verdict):
+    from contrastive_extract import extract_contrastive_heuristic
+    return extract_contrastive_heuristic(bug=bug, rejected_diff=rejected_diff,
+                                         accepted_diff=accepted_diff, rejected_verdict=rejected_verdict)
+
+
 def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
              project_dir_for, agent=_default_agent, verify=_default_verify,
-             extract=_default_extract, skip_build=False):
-    """Run one full pass over `bugs` (already in chronological order)."""
+             extract=_default_extract, contrastive=_default_contrastive,
+             max_attempts=5, skip_build=False):
+    """Run one full pass over `bugs` (already in chronological order).
+
+    Each bug gets up to `max_attempts` attempts; between them the agent is re-run with
+    deployment-faithful feedback (delivered the same way as the playbook -- written into
+    the agent's project dir). Both the playbook and the feedback reach the agent via
+    `inject`, so the agent contract stays `agent(bug_id, project_dir, skip_build)`.
+    """
     state = load_state(state_path)
     records = []
     for bug in bugs:
         bug_id = bug["localId"]
         project_dir = Path(project_dir_for(bug_id))
         project_dir.mkdir(parents=True, exist_ok=True)
+        last_run = {}
 
-        # Holdout-filtered render: only lessons from strictly-earlier bugs.
-        playbook = render_playbook(state, before_bug=bug_id)
-        if inject_enabled:
-            inject(maybe_compress(playbook), project_dir)
+        def attempt_agent(attempt_no, feedback, _bug_id=bug_id, _project_dir=project_dir):
+            # Render is holdout-filtered: only lessons from strictly-earlier bugs. Read at
+            # call time, so it reflects this bug's pre-update store.
+            text = maybe_compress(render_playbook(state, before_bug=_bug_id)) if inject_enabled else ""
+            if feedback:
+                text = (text + "\n\n## Feedback on your previous attempt\n" + feedback).strip()
+            inject(text, _project_dir)
+            run = agent(_bug_id, _project_dir, skip_build)
+            last_run.clear()
+            last_run.update(run)
+            return {"diff": run.get("diff", ""), "trajectory_summary": run.get("trajectory_summary", "")}
 
-        run = agent(bug_id, project_dir, skip_build)
-        diff = run.get("diff", "")
-        verdict = verify(bug_id, diff)["classification"] if diff.strip() else "no_changes"
+        result = repair_with_retries(bug=bug, agent=attempt_agent, verify=verify,
+                                     max_attempts=max_attempts)
+        solved = result["status"] == "solved"
+        final_verdict = "verified_correct" if solved else (
+            result["attempts"][-1]["verdict"] if result["attempts"] else "no_changes")
 
-        record = {"bug_id": bug_id, "pass": pass_name, "classification": verdict,
-                  "playbook_version": state["version"]}
+        record = {"bug_id": bug_id, "pass": pass_name, "classification": final_verdict,
+                  "n_attempts": len(result["attempts"]), "playbook_version": state["version"]}
         append_record(ledger_path, record)
 
-        if verdict == "verified_correct":
-            heuristic = extract(bug, diff, run.get("trajectory_summary", ""), verdict)
-            state = add_heuristic(state, heuristic, source_bug=bug_id, after_bug=bug_id)
+        if solved:
+            accepted = result["accepted"]
+            pair = result["contrastive_pair"]
+            if pair:                      # failed-then-succeeded: learn from the gap
+                rejected, _ = pair
+                lesson = contrastive(bug, rejected["diff"], accepted["diff"], rejected["verdict"])
+            else:                         # solved first try: plain success lesson
+                lesson = extract(bug, accepted["diff"], accepted.get("trajectory_summary", ""),
+                                 "verified_correct")
+            state = add_heuristic(state, lesson, source_bug=bug_id, after_bug=bug_id)
             save_state(state, state_path)
 
-        records.append({**record, **{k: run[k] for k in ("injected_seen",) if k in run}})
+        records.append({**record, **{k: last_run[k] for k in ("injected_seen",) if k in last_run}})
     return records
+
+
+def _arg_value(flag):
+    """Read `--flag value` or `--flag=value` from argv; None if absent."""
+    for i, a in enumerate(sys.argv):
+        if a == flag and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if a.startswith(flag + "="):
+            return a.split("=", 1)[1]
+    return None
 
 
 def main():
     db = Path(os.environ.get("ARVO_DB_PATH", Path(__file__).parent / "arvo_new.db"))
     bugs_ids = mruby_bug_ids(db)
+
+    # Subset selection for cheap smoke tests before the full multi-hour run.
+    bugs_arg = _arg_value("--bugs")
+    if bugs_arg:
+        wanted = {int(x) for x in bugs_arg.split(",")}
+        bugs_ids = [b for b in bugs_ids if b in wanted]
+    limit = _arg_value("--limit")
+    if limit:
+        bugs_ids = bugs_ids[:int(limit)]
+
     from build_instance import load_bug
     bugs = [load_bug(b) for b in bugs_ids]
 
@@ -86,11 +141,14 @@ def main():
 
     pass_name = os.environ.get("LEARN_PASS", "treatment")
     inject_enabled = pass_name == "treatment"
+    print(f"[learn_loop] pass={pass_name} inject={inject_enabled} "
+          f"bugs={len(bugs)} max_attempts={os.environ.get('LEARN_MAX_ATTEMPTS', '5')}")
     run_pass(
         bugs=bugs, pass_name=pass_name, inject_enabled=inject_enabled,
         state_path=pb_dir / f"playbook_state_{pass_name}.json",
         ledger_path=learn_dir / "ledger.jsonl",
         project_dir_for=project_dir_for,
+        max_attempts=int(os.environ.get("LEARN_MAX_ATTEMPTS", "5")),
         skip_build="--skip-build" in sys.argv,
     )
 

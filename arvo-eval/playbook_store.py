@@ -35,12 +35,16 @@ def render_playbook(state: dict, before_bug: int) -> str:
              "Lessons learned from earlier fixes in this project. Apply when relevant.", ""]
     for h in active:
         tags = ", ".join(h.get("tags", []))
-        lines += [
-            f"## {h['trigger']}  ({tags})",
-            f"- **Lesson:** {h['root_cause_lesson']}",
-            f"- **How to apply:** {h['how_to_apply']}",
-            "",
-        ]
+        lines.append(f"## {h['trigger']}  ({tags})")
+        if h.get("kind") == "contrastive":
+            # Learned from a rejected vs accepted attempt: warn off the dead end.
+            lines.append(f"- **Don't:** {h['wrong_approach']}")
+            lines.append(f"- **Do:** {h['correct_approach']}")
+            lines.append(f"- **Lesson:** {h['lesson']}")
+        else:
+            lines.append(f"- **Lesson:** {h['root_cause_lesson']}")
+        lines.append(f"- **How to apply:** {h['how_to_apply']}")
+        lines.append("")
     return "\n".join(lines)
 
 
