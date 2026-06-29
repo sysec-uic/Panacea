@@ -128,3 +128,72 @@ Each run uses Claude Opus 4.8. Typical token usage for a successful patch (~300�
 | Cache-write tokens | ~100K–150K |
 
 Cache-read dominates cost as the conversation grows across turns. Use `--skip-build` on reruns to avoid rebuilding the Docker snapshot.
+
+---
+
+# Heuristic Learning Loop (mruby)
+
+A self-improving agent memory over mruby's 30 ARVO bugs, run in chronological
+(`localId`) order. After each verified-correct fix, an LLM extracts a reusable
+heuristic into a playbook that is injected into the agent's context on later bugs.
+Because a bug's lesson is only added *after* it is evaluated, no bug is ever tested
+against a playbook containing its own answer (chronological holdout).
+
+Design: `docs/superpowers/specs/2026-06-29-mruby-heuristic-learning-loop-design.md`
+Plan:   `docs/superpowers/plans/2026-06-29-mruby-heuristic-learning-loop.md`
+
+### Prerequisites
+
+- `arvo_new.db` present in this directory (download from the
+  [ARVO_New release](https://github.com/sysec-uic/Panacea/releases/tag/ARVO_New_in_prog)).
+- `CLAUDE_CODE_OAUTH_TOKEN` — the OSS-CRS patching agent (see the OSS-CRS section above).
+- `ANTHROPIC_API_KEY` — used by the heuristic extractor/curator (`claude-opus-4-8`).
+- The Phase 0 spikes confirmed: the playbook is injected as `HEURISTICS.md` in the
+  per-bug project dir, and the mruby correctness gate runs `cd /src/mruby && rake test`
+  (see `MRUBY_TEST_CMD` in `verify_fix.py` and `INJECT_FILENAME` in `injector.py`).
+
+### Running the experiment
+
+Two passes over the same chronological ordering — a control (no playbook injected)
+and a treatment (injected):
+
+```bash
+ARVO_DB_PATH=arvo_new.db LEARN_PASS=control   python3 learn_loop.py
+ARVO_DB_PATH=arvo_new.db LEARN_PASS=treatment python3 learn_loop.py
+```
+
+Per-run records accumulate in `results/learn/ledger.jsonl`. The accumulated playbook
+state is `playbook/playbook_state_<pass>.json`.
+
+> **Note:** `results/` is git-ignored, so the ledger is a local artifact. The
+> `playbook/` directory is tracked — commit the resulting playbook if you want to
+> share what the system learned.
+
+### Reading the result
+
+Compare the verified-correct rate on the later ~two-thirds of bugs (where an
+accumulated playbook exists) between the two passes:
+
+```bash
+PYTHONPATH=. python3 -c "
+from ledger import read_records
+r = read_records('results/learn/ledger.jsonl')
+for p in ('control','treatment'):
+    rows = [x for x in r if x['pass']==p]
+    tail = rows[len(rows)//3:]   # later two-thirds
+    ok = sum(1 for x in tail if x['classification']=='verified_correct')
+    print(p, 'tail verified_correct:', ok, '/', len(tail))
+"
+```
+
+N=30 (≈20 in the holdout tail) is a **pilot** — read the control/treatment delta as
+directional signal, not statistical proof.
+
+### Unit tests
+
+The pure-logic pieces (store, ledger, injector, verifier classification, extractor,
+curator, orchestrator) are covered without Docker or network:
+
+```bash
+PYTHONPATH=. python3 -m pytest tests -q
+```
