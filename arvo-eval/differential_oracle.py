@@ -9,7 +9,11 @@ import re
 import subprocess
 from pathlib import Path
 
+from build_instance import build_instance
+from verify_fix import docker_exec, COMPILE_TIMEOUT, RUN_TIMEOUT
+
 PROBE_DIR = Path(__file__).parent / "differential" / "mruby_probes"
+PROBE_RUN_TIMEOUT = 60
 
 
 def default_probes() -> list[Path]:
@@ -22,7 +26,7 @@ _NOISE_PATTERNS = [
     re.compile(r"^SUMMARY:.*$", re.MULTILINE),        # sanitizer summary line
     re.compile(r"0x[0-9a-fA-F]+"),                    # hex addresses
     re.compile(r"\b(?:AddressSanitizer|MemorySanitizer|UndefinedBehaviorSanitizer)\b"),
-    re.compile(r"(?:pid|tid)[=: ]*\d+", re.IGNORECASE),
+    re.compile(r"\b(?:pid|tid)[=: ]*\d+", re.IGNORECASE),
     re.compile(r"\bin \d+(?:\.\d+)? ?(?:ms|s)\b"),    # timing fragments
 ]
 
@@ -109,6 +113,9 @@ def grade(bug, agent_diff, *, probes=None, script_texts=None,
         label = decide_label(fix_image_available=True, errored=False, divergences=divergences)
         return {"label": label, "fix_image_available": True, "divergences": divergences}
     except (OracleError, subprocess.SubprocessError) as exc:
+        # Intentional bypass of decide_label: the error path carries an extra
+        # "error" key, so it builds the oracle_error dict directly. Keep this in
+        # sync with decide_label's errored=True branch if that label ever changes.
         return {"label": "oracle_error", "fix_image_available": True,
                 "divergences": [], "error": str(exc)}
     finally:
@@ -116,12 +123,6 @@ def grade(bug, agent_diff, *, probes=None, script_texts=None,
             ops.cleanup(agent_c)
         if fix_c:
             ops.cleanup(fix_c)
-
-
-from build_instance import build_instance  # noqa: E402
-from verify_fix import docker_exec, COMPILE_TIMEOUT, RUN_TIMEOUT  # noqa: E402
-
-PROBE_RUN_TIMEOUT = 60
 
 
 class DockerOps:
@@ -144,20 +145,24 @@ class DockerOps:
         subprocess.run(
             ["docker", "run", "-d", "--name", container, instance["image_name"],
              "sleep", str(COMPILE_TIMEOUT + 600)], check=True, capture_output=True)
-        apply_res = docker_exec(container, f"git -C /src/{project} apply -",
-                                input=diff, timeout=60)
-        if apply_res.returncode != 0:
+        try:
+            apply_res = docker_exec(container, f"git -C /src/{project} apply -",
+                                    input=diff, timeout=60)
+            if apply_res.returncode != 0:
+                raise OracleError(f"agent patch did not apply: {apply_res.stderr[:500]}")
+            docker_exec(container,
+                        "sed -i 's#/depot_tools/ninja -C#/depot_tools/ninja -j3 -C#g' "
+                        "/src/build.sh 2>/dev/null || true", timeout=30)
+            build_res = docker_exec(container, f"cd /src/{project} && compile",
+                                    timeout=COMPILE_TIMEOUT)
+            if build_res.returncode != 0:
+                raise OracleError("agent build failed under oracle")
+            return container
+        except BaseException:
+            # Any failure (raise or non-zero handled above) must not leak the
+            # container: grade()'s finally can't clean it since it never got the name.
             subprocess.run(["docker", "rm", "-f", container], capture_output=True)
-            raise OracleError(f"agent patch did not apply: {apply_res.stderr[:500]}")
-        docker_exec(container,
-                    "sed -i 's#/depot_tools/ninja -C#/depot_tools/ninja -j3 -C#g' "
-                    "/src/build.sh 2>/dev/null || true", timeout=30)
-        build_res = docker_exec(container, f"cd /src/{project} && compile",
-                                timeout=COMPILE_TIMEOUT)
-        if build_res.returncode != 0:
-            subprocess.run(["docker", "rm", "-f", container], capture_output=True)
-            raise OracleError("agent build failed under oracle")
-        return container
+            raise
 
     def start_fix(self, local_id: int) -> str:
         container = f"arvo-{local_id}-oracle-fix"

@@ -40,6 +40,11 @@ def test_normalize_keeps_semantic_difference():
     assert normalize("value=7\n") != normalize("value=8\n")
 
 
+def test_normalize_does_not_eat_words_ending_in_pid():
+    # The pid/tid scrubber must be word-anchored: "rapid=5" is real output.
+    assert "rapid=5" in normalize("rapid=5\n")
+
+
 from differential_oracle import outputs_diverge
 
 
@@ -80,7 +85,6 @@ def test_decide_label_confirmed():
                         divergences=[]) == "oracle_confirmed"
 
 
-import differential_oracle as do_mod
 from differential_oracle import grade, OracleError
 
 
@@ -153,3 +157,10 @@ def test_grade_oracle_error_on_build_failure():
     res = grade(BUG, "diff", probes=[], script_texts=["S"], ops=ops)
     assert res["label"] == "oracle_error"
     assert "fix-c" not in ops.cleaned        # fix container never started
+
+
+def test_grade_divergent_on_poc_exit():
+    ops = FakeOps(agent={"poc": (1, "crash\n")}, fix={"poc": (0, "")})
+    res = grade(BUG, "diff", probes=[], script_texts=[], ops=ops)
+    assert res["label"] == "divergent"
+    assert res["divergences"][0] == {"probe": "poc", "kind": "exit"}
