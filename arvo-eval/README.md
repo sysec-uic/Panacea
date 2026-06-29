@@ -146,8 +146,13 @@ Plan:   `docs/superpowers/plans/2026-06-29-mruby-heuristic-learning-loop.md`
 
 - `arvo_new.db` present in this directory (download from the
   [ARVO_New release](https://github.com/sysec-uic/Panacea/releases/tag/ARVO_New_in_prog)).
-- `CLAUDE_CODE_OAUTH_TOKEN` — the OSS-CRS patching agent (see the OSS-CRS section above).
-- `ANTHROPIC_API_KEY` — used by the heuristic extractor/curator (`claude-opus-4-8`).
+- `CLAUDE_CODE_OAUTH_TOKEN` — the OSS-CRS patching agent (see the OSS-CRS section
+  above). **The heuristic extractor/curator reuses this same token** (sent as a Bearer
+  token + the `oauth-2025-04-20` beta header), so a single OAuth credential runs the whole
+  loop — no separate API key needed.
+- `ANTHROPIC_API_KEY` — *optional*. Only set this if you'd rather bill the extractor to an
+  API key than your Claude subscription. Don't set both an API key and the OAuth token —
+  the API rejects dual auth. (`llm.py` prefers the API key when both are present.)
 - The Phase 0 spikes confirmed: the playbook is injected as `HEURISTICS.md` in the
   per-bug project dir, and the mruby correctness gate runs `cd /src/mruby && rake test`
   (see `MRUBY_TEST_CMD` in `verify_fix.py` and `INJECT_FILENAME` in `injector.py`).
