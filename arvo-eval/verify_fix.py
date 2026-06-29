@@ -9,7 +9,9 @@ Classifications:
 - patch_apply_failed: the diff didn't apply cleanly to a fresh checkout
 - build_failed: `compile` failed after applying the patch
 - still_crashes: the rebuilt fuzz target still crashes on /tmp/poc
-- fixed: the rebuilt fuzz target no longer crashes on /tmp/poc
+- unexpected_exit: crash gone but the target exited non-zero
+- fixed_tests_failed: crash gone but `make test` (mruby correctness gate) failed
+- verified_correct: crash gone and the correctness gate passed
 """
 
 import argparse
