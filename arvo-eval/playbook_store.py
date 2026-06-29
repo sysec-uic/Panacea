@@ -35,7 +35,8 @@ def render_playbook(state: dict, before_bug: int) -> str:
              "Lessons learned from earlier fixes in this project. Apply when relevant.", ""]
     for h in active:
         tags = ", ".join(h.get("tags", []))
-        lines.append(f"## {h['trigger']}  ({tags})")
+        marker = "  ✓ fix-confirmed" if h.get("oracle") == "confirmed" else ""
+        lines.append(f"## {h['trigger']}  ({tags}){marker}")
         if h.get("kind") == "contrastive":
             # Learned from a rejected vs accepted attempt: warn off the dead end.
             lines.append(f"- **Don't:** {h['wrong_approach']}")

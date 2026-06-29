@@ -63,3 +63,22 @@ def test_save_and_load_roundtrip(tmp_path):
     p = tmp_path / "state.json"
     save_state(s, p)
     assert load_state(p)["heuristics"][0]["source_bug"] == 439494108
+
+
+def test_render_marks_oracle_confirmed_heuristic():
+    state = new_state()
+    h = {"trigger": "bigint pool escape", "root_cause_lesson": "L",
+         "how_to_apply": "A", "tags": ["suar"], "confidence": "high",
+         "oracle": "confirmed"}
+    add_heuristic(state, h, source_bug=439494108, after_bug=439494108)
+    out = render_playbook(state, before_bug=999999999)
+    assert "✓ fix-confirmed" in out
+
+
+def test_render_omits_marker_when_not_confirmed():
+    state = new_state()
+    h = {"trigger": "x", "root_cause_lesson": "L", "how_to_apply": "A",
+         "tags": [], "confidence": "medium", "oracle": "tests_only"}
+    add_heuristic(state, h, source_bug=1, after_bug=1)
+    out = render_playbook(state, before_bug=999999999)
+    assert "fix-confirmed" not in out
