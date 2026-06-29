@@ -21,6 +21,52 @@ from build_instance import build_instance, load_bug
 
 COMPILE_TIMEOUT = 2400  # seconds - some projects take a long time to rebuild
 RUN_TIMEOUT = 60
+MRUBY_TEST_CMD = "cd /src/mruby && rake test"  # confirmed in PHASE0_NOTES.md
+TEST_TIMEOUT = 1800
+
+# Crash signatures keyed by sanitizer. A rebuilt target "still crashes" if any
+# of its sanitizer's signatures appears in the rerun output.
+SANITIZER_SIGNATURES = {
+    "asan": ("ERROR: AddressSanitizer", "SUMMARY: AddressSanitizer"),
+    "msan": ("WARNING: MemorySanitizer", "ERROR: MemorySanitizer", "SUMMARY: MemorySanitizer"),
+    "ubsan": ("runtime error:", "SUMMARY: UndefinedBehaviorSanitizer"),
+}
+
+
+def crashed(sanitizer: str, run_output: str) -> bool:
+    sigs = SANITIZER_SIGNATURES.get(sanitizer.lower(), ("ERROR: AddressSanitizer",))
+    return any(sig in run_output for sig in sigs)
+
+
+def classify_run(
+    *,
+    sanitizer: str,
+    diff: str,
+    apply_ok: bool = True,
+    build_ok: bool = True,
+    run_output: str = "",
+    run_returncode: int = 0,
+    make_test_ok: bool | None = None,
+) -> str:
+    """Pure classification of a verification run. No Docker, fully testable.
+
+    Returns one of: no_changes, patch_apply_failed, build_failed, still_crashes,
+    unexpected_exit, fixed_tests_failed, verified_correct.
+    """
+    if not diff.strip():
+        return "no_changes"
+    if not apply_ok:
+        return "patch_apply_failed"
+    if not build_ok:
+        return "build_failed"
+    if crashed(sanitizer, run_output):
+        return "still_crashes"
+    if run_returncode != 0:
+        return "unexpected_exit"
+    # Crash is gone. Correctness gate (v1): make test must pass.
+    if make_test_ok is False:
+        return "fixed_tests_failed"
+    return "verified_correct"
 
 
 def docker_exec(container: str, command: str, *, input: str | None = None, timeout: int) -> subprocess.CompletedProcess:
