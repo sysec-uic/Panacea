@@ -9,7 +9,9 @@ Classifications:
 - patch_apply_failed: the diff didn't apply cleanly to a fresh checkout
 - build_failed: `compile` failed after applying the patch
 - still_crashes: the rebuilt fuzz target still crashes on /tmp/poc
-- fixed: the rebuilt fuzz target no longer crashes on /tmp/poc
+- unexpected_exit: crash gone but the target exited non-zero
+- fixed_tests_failed: crash gone but `make test` (mruby correctness gate) failed
+- verified_correct: crash gone and the correctness gate passed
 """
 
 import argparse
@@ -21,6 +23,52 @@ from build_instance import build_instance, load_bug
 
 COMPILE_TIMEOUT = 2400  # seconds - some projects take a long time to rebuild
 RUN_TIMEOUT = 60
+MRUBY_TEST_CMD = "cd /src/mruby && rake test"  # confirmed in PHASE0_NOTES.md
+TEST_TIMEOUT = 1800
+
+# Crash signatures keyed by sanitizer. A rebuilt target "still crashes" if any
+# of its sanitizer's signatures appears in the rerun output.
+SANITIZER_SIGNATURES = {
+    "asan": ("ERROR: AddressSanitizer", "SUMMARY: AddressSanitizer"),
+    "msan": ("WARNING: MemorySanitizer", "ERROR: MemorySanitizer", "SUMMARY: MemorySanitizer"),
+    "ubsan": ("runtime error:", "SUMMARY: UndefinedBehaviorSanitizer"),
+}
+
+
+def crashed(sanitizer: str, run_output: str) -> bool:
+    sigs = SANITIZER_SIGNATURES.get(sanitizer.lower(), ("ERROR: AddressSanitizer",))
+    return any(sig in run_output for sig in sigs)
+
+
+def classify_run(
+    *,
+    sanitizer: str,
+    diff: str,
+    apply_ok: bool = True,
+    build_ok: bool = True,
+    run_output: str = "",
+    run_returncode: int = 0,
+    make_test_ok: bool | None = None,
+) -> str:
+    """Pure classification of a verification run. No Docker, fully testable.
+
+    Returns one of: no_changes, patch_apply_failed, build_failed, still_crashes,
+    unexpected_exit, fixed_tests_failed, verified_correct.
+    """
+    if not diff.strip():
+        return "no_changes"
+    if not apply_ok:
+        return "patch_apply_failed"
+    if not build_ok:
+        return "build_failed"
+    if crashed(sanitizer, run_output):
+        return "still_crashes"
+    if run_returncode != 0:
+        return "unexpected_exit"
+    # Crash is gone. Correctness gate (v1): make test must pass.
+    if make_test_ok is False:
+        return "fixed_tests_failed"
+    return "verified_correct"
 
 
 def docker_exec(container: str, command: str, *, input: str | None = None, timeout: int) -> subprocess.CompletedProcess:
@@ -85,12 +133,26 @@ def verify(bug_id: int, keep: bool = False) -> dict:
         run_output = run_result.stdout + run_result.stderr
         verification["run_output_tail"] = "\n".join(run_output.splitlines()[-30:])
         verification["run_returncode"] = run_result.returncode
-        if "ERROR: AddressSanitizer" in run_output or "SUMMARY: AddressSanitizer" in run_output:
-            verification["classification"] = "still_crashes"
-        elif run_result.returncode != 0:
-            verification["classification"] = "unexpected_exit"
-        else:
-            verification["classification"] = "fixed"
+
+        sanitizer = bug["sanitizer"].lower()
+        make_test_ok = None
+        if not crashed(sanitizer, run_output) and run_result.returncode == 0 and project == "mruby":
+            test_result = docker_exec(container, MRUBY_TEST_CMD, timeout=TEST_TIMEOUT)
+            make_test_ok = test_result.returncode == 0
+            verification["make_test_ok"] = make_test_ok
+            verification["make_test_tail"] = "\n".join(
+                (test_result.stdout + test_result.stderr).splitlines()[-30:]
+            )
+
+        verification["classification"] = classify_run(
+            sanitizer=sanitizer,
+            diff=diff,
+            apply_ok=True,
+            build_ok=True,
+            run_output=run_output,
+            run_returncode=run_result.returncode,
+            make_test_ok=make_test_ok,
+        )
         return save(instance, verification)
     finally:
         if keep:

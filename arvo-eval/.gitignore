@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 arvo.db
 results/
+arvo_new.db
