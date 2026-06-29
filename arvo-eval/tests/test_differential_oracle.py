@@ -55,3 +55,26 @@ def test_outputs_diverge_agree_modulo_noise():
     a = (0, "==1==WARNING: MemorySanitizer: q\nvalue=7\n")
     b = (0, "==2==WARNING: MemorySanitizer: q\nvalue=7\n")
     assert outputs_diverge(a, b) is None
+
+
+from differential_oracle import decide_label
+
+
+def test_decide_label_no_fix_takes_precedence():
+    assert decide_label(fix_image_available=False, errored=True,
+                         divergences=[{"probe": "poc"}]) == "no_fix_available"
+
+
+def test_decide_label_error():
+    assert decide_label(fix_image_available=True, errored=True,
+                        divergences=[]) == "oracle_error"
+
+
+def test_decide_label_divergent():
+    assert decide_label(fix_image_available=True, errored=False,
+                        divergences=[{"probe": "poc"}]) == "divergent"
+
+
+def test_decide_label_confirmed():
+    assert decide_label(fix_image_available=True, errored=False,
+                        divergences=[]) == "oracle_confirmed"
