@@ -27,7 +27,7 @@ def _grade_stub(label):
     """Return a grade collaborator that always produces the given label."""
     def _g(bug, diff):
         n = 1 if label == "divergent" else 0
-        avail = label not in ("no_fix_available",)
+        avail = label != "no_fix_available"
         return {"label": label, "fix_image_available": avail,
                 "divergences": [{"probe": "poc", "kind": "stdout"}] * n}
     return _g
@@ -35,7 +35,11 @@ def _grade_stub(label):
 
 @pytest.fixture
 def dryrun_kwargs(tmp_path):
-    """Factory fixture: returns collaborator stubs + tmp paths for a single solved bug."""
+    """Factory fixture: returns collaborator stubs + tmp paths for a single solved bug.
+
+    The `grade` collaborator is intentionally NOT provided here -- each oracle test
+    supplies its own `grade=_grade_stub(...)` so the verdict under test is explicit.
+    """
     def _make(solved=True):
         def _verify(bug_id, diff):
             if solved:
@@ -53,7 +57,6 @@ def dryrun_kwargs(tmp_path):
             "agent": stub_agent,
             "verify": _verify,
             "extract": stub_extract,
-            "grade": _grade_stub("no_fix_available"),
         }
     return _make
 
@@ -143,6 +146,9 @@ def test_confirmed_lesson_is_added_high_confidence(dryrun_kwargs):
     assert len(state["heuristics"]) == 1
     assert state["heuristics"][0]["oracle"] == "confirmed"
     assert state["heuristics"][0]["confidence"] == "high"
+    from ledger import read_records
+    rec = read_records(kw["ledger_path"])[-1]
+    assert rec["oracle_label"] == "oracle_confirmed"
 
 
 def test_divergent_lesson_is_suppressed(dryrun_kwargs):

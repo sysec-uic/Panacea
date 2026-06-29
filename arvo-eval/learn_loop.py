@@ -94,6 +94,7 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
             result["attempts"][-1]["verdict"] if result["attempts"] else "no_changes")
 
         oracle_fields = {}
+        playbook_version_snap = state["version"]   # snapshot before any add_heuristic bumps it
         if solved:
             accepted = result["accepted"]
             pair = result["contrastive_pair"]
@@ -122,7 +123,7 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
                 save_state(state, state_path)
 
         record = {"bug_id": bug_id, "pass": pass_name, "classification": final_verdict,
-                  "n_attempts": len(result["attempts"]), "playbook_version": state["version"],
+                  "n_attempts": len(result["attempts"]), "playbook_version": playbook_version_snap,
                   **oracle_fields}
         append_record(ledger_path, record)
 
