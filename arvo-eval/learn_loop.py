@@ -51,10 +51,15 @@ def _default_contrastive(bug, rejected_diff, accepted_diff, rejected_verdict):
                                          accepted_diff=accepted_diff, rejected_verdict=rejected_verdict)
 
 
+def _default_grade(bug, diff):
+    from differential_oracle import grade
+    return grade(bug, diff)
+
+
 def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
              project_dir_for, agent=_default_agent, verify=_default_verify,
              extract=_default_extract, contrastive=_default_contrastive,
-             max_attempts=5, skip_build=False):
+             grade=_default_grade, max_attempts=5, skip_build=False):
     """Run one full pass over `bugs` (already in chronological order).
 
     Each bug gets up to `max_attempts` attempts; between them the agent is re-run with
@@ -88,21 +93,38 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
         final_verdict = "verified_correct" if solved else (
             result["attempts"][-1]["verdict"] if result["attempts"] else "no_changes")
 
-        record = {"bug_id": bug_id, "pass": pass_name, "classification": final_verdict,
-                  "n_attempts": len(result["attempts"]), "playbook_version": state["version"]}
-        append_record(ledger_path, record)
-
+        oracle_fields = {}
         if solved:
             accepted = result["accepted"]
             pair = result["contrastive_pair"]
-            if pair:                      # failed-then-succeeded: learn from the gap
+            if pair:                      # failed-then-succeeded: contrastive lesson
                 rejected, _ = pair
                 lesson = contrastive(bug, rejected["diff"], accepted["diff"], rejected["verdict"])
             else:                         # solved first try: plain success lesson
                 lesson = extract(bug, accepted["diff"], accepted.get("trajectory_summary", ""),
                                  "verified_correct")
-            state = add_heuristic(state, lesson, source_bug=bug_id, after_bug=bug_id)
-            save_state(state, state_path)
+
+            verdict = grade(bug, accepted["diff"])
+            oracle_fields = {"oracle_label": verdict["label"],
+                             "fix_image_available": verdict["fix_image_available"],
+                             "n_divergences": len(verdict["divergences"])}
+
+            if verdict["label"] == "oracle_confirmed":
+                lesson["oracle"] = "confirmed"
+                lesson["confidence"] = "high"
+                state = add_heuristic(state, lesson, source_bug=bug_id, after_bug=bug_id)
+                save_state(state, state_path)
+            elif verdict["label"] == "divergent":
+                pass                      # VETO: patch diverges from canonical fix; learn nothing
+            else:                         # no_fix_available | oracle_error
+                lesson["oracle"] = "tests_only"
+                state = add_heuristic(state, lesson, source_bug=bug_id, after_bug=bug_id)
+                save_state(state, state_path)
+
+        record = {"bug_id": bug_id, "pass": pass_name, "classification": final_verdict,
+                  "n_attempts": len(result["attempts"]), "playbook_version": state["version"],
+                  **oracle_fields}
+        append_record(ledger_path, record)
 
         records.append({**record, **{k: last_run[k] for k in ("injected_seen",) if k in last_run}})
     return records
