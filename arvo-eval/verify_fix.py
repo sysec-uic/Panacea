@@ -131,12 +131,26 @@ def verify(bug_id: int, keep: bool = False) -> dict:
         run_output = run_result.stdout + run_result.stderr
         verification["run_output_tail"] = "\n".join(run_output.splitlines()[-30:])
         verification["run_returncode"] = run_result.returncode
-        if "ERROR: AddressSanitizer" in run_output or "SUMMARY: AddressSanitizer" in run_output:
-            verification["classification"] = "still_crashes"
-        elif run_result.returncode != 0:
-            verification["classification"] = "unexpected_exit"
-        else:
-            verification["classification"] = "fixed"
+
+        sanitizer = bug["sanitizer"].lower()
+        make_test_ok = None
+        if not crashed(sanitizer, run_output) and run_result.returncode == 0 and project == "mruby":
+            test_result = docker_exec(container, MRUBY_TEST_CMD, timeout=TEST_TIMEOUT)
+            make_test_ok = test_result.returncode == 0
+            verification["make_test_ok"] = make_test_ok
+            verification["make_test_tail"] = "\n".join(
+                (test_result.stdout + test_result.stderr).splitlines()[-30:]
+            )
+
+        verification["classification"] = classify_run(
+            sanitizer=sanitizer,
+            diff=diff,
+            apply_ok=True,
+            build_ok=True,
+            run_output=run_output,
+            run_returncode=run_result.returncode,
+            make_test_ok=make_test_ok,
+        )
         return save(instance, verification)
     finally:
         if keep:
