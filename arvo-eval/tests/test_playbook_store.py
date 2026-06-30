@@ -28,6 +28,23 @@ def test_render_handles_contrastive_lessons():
     assert "corrupt bytecode, not a missing check" in md
 
 
+def test_add_tags_source_project_and_crash_class():
+    s = new_state()
+    s = add_heuristic(s, make_h(), source_bug=439494108, after_bug=439494108,
+                      source_project="mruby", crash_class="stack-oob")
+    h = s["heuristics"][0]
+    assert h["source_project"] == "mruby"
+    assert h["crash_class"] == "stack-oob"
+
+
+def test_add_without_tags_stays_backward_compatible():
+    s = new_state()
+    s = add_heuristic(s, make_h(), source_bug=1, after_bug=1)
+    h = s["heuristics"][0]
+    assert h.get("source_project") is None
+    assert h.get("crash_class") is None
+
+
 def test_add_assigns_provenance_and_bumps_version():
     s = new_state()
     assert s["version"] == 0

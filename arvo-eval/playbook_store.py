@@ -13,11 +13,15 @@ def new_state() -> dict:
     return {"version": 0, "heuristics": []}
 
 
-def add_heuristic(state: dict, heuristic: dict, *, source_bug: int, after_bug: int) -> dict:
+def add_heuristic(state: dict, heuristic: dict, *, source_bug: int, after_bug: int,
+                  source_project: str | None = None, crash_class: str | None = None) -> dict:
     entry = dict(heuristic)
     entry["id"] = f"h-{source_bug}"
     entry["source_bug"] = source_bug
     entry["added_after_bug"] = after_bug
+    # Cross-project transfer tags (None for the single-project mruby loop).
+    entry["source_project"] = source_project
+    entry["crash_class"] = crash_class
     state["heuristics"].append(entry)
     state["version"] += 1
     return state
@@ -28,7 +32,15 @@ def active_heuristics(state: dict, before_bug: int) -> list[dict]:
 
 
 def render_playbook(state: dict, before_bug: int) -> str:
-    active = active_heuristics(state, before_bug)
+    return render_heuristics(active_heuristics(state, before_bug))
+
+
+def render_heuristics(active: list[dict]) -> str:
+    """Render a given list of heuristics to injectable markdown (no holdout filter).
+
+    The holdout/selection is the caller's job: render_playbook applies the
+    chronological filter; the transfer runner passes an arm-selected slice.
+    """
     if not active:
         return "No heuristics yet.\n"
     lines = ["# mruby Repair Playbook", "",
