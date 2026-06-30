@@ -126,7 +126,8 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
 
     project_dir = PROJECTS_DIR / str(bug_id) / "project"
     pov_path = PROJECTS_DIR / str(bug_id) / "poc"
-    output_dir = RESULTS_DIR / str(bug_id)
+    _pass = os.environ.get("LEARN_PASS", "")
+    output_dir = RESULTS_DIR / _pass / str(bug_id) if _pass else RESULTS_DIR / str(bug_id)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     generate_fake_oss_fuzz_project(bug, project_dir)

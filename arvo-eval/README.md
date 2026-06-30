@@ -91,7 +91,7 @@ If using a different database (e.g. `arvo_new.db`, available at https://github.c
 ARVO_DB_PATH=arvo_new.db OSS_CRS_BUG_ID=439279102 python3 arvo_oss_crs.py
 ```
 
-Results are saved to `results/<bug_id>/oss_crs_result.json`. Patches are copied to `results/<bug_id>/oss_crs_patch_N.diff`. The agent's stdout log is saved to `results/<bug_id>/oss_crs_claude_stdout.log`.
+Results are saved to `results/<bug_id>/oss_crs_result.json`. Patches are copied to `results/<bug_id>/oss_crs_patch_N.diff`. The agent's stdout log is saved to `results/<bug_id>/oss_crs_claude_stdout.log`. When running via `learn_loop.py` with `LEARN_PASS` set, results are namespaced under `results/<pass>/<bug_id>/` so control and treatment runs don't overwrite each other.
 
 ### How it works
 

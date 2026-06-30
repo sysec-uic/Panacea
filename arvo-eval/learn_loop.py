@@ -24,7 +24,8 @@ def _default_agent(bug_id, project_dir, skip_build):
     """Real agent: drive OSS-CRS, then return the chosen patch + trajectory tail."""
     from arvo_oss_crs import run_oss_crs
     summary = run_oss_crs(bug_id, skip_build=skip_build)
-    results_dir = Path(__file__).parent / "results" / str(bug_id)
+    _pass = os.environ.get("LEARN_PASS", "")
+    results_dir = Path(__file__).parent / "results" / _pass / str(bug_id) if _pass else Path(__file__).parent / "results" / str(bug_id)
     patch = results_dir / "oss_crs_patch_0.diff"
     diff = patch.read_text() if patch.exists() else ""
     log = results_dir / "oss_crs_claude_stdout.log"
