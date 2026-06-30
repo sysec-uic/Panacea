@@ -1,6 +1,6 @@
 import json
 
-from transfer_runner import run_transfer_arm, score_outcome
+from transfer_runner import run_transfer_arm, score_outcome, _completed_cells
 
 
 def H(bug_id, project, cls, after):
@@ -109,3 +109,33 @@ def test_empty_diff_is_no_changes_not_solved(tmp_path):
                          grade=_grade("oracle_confirmed"), tmp_path=tmp_path)
     # blank diff never reaches verify; classified no_changes, scored 0.
     assert records[0]["classification"] == "no_changes" and records[0]["score"] == 0
+
+
+# --- resumability ----------------------------------------------------------
+
+def test_done_cells_are_skipped(tmp_path):
+    calls = []
+
+    def agent(bug_id, project_dir, skip_build):
+        calls.append(bug_id)
+        return {"diff": "--- p ---", "trajectory_summary": "t"}
+
+    records = run_transfer_arm(
+        eval_bugs=[TARGET], arm="matched_foreign", heuristics=HS, trials=2,
+        ledger_path=tmp_path / "l.jsonl", project_dir_for=lambda b: tmp_path / str(b),
+        agent=agent, verify=_verify("verified_correct"), grade=_grade("divergent"),
+        inject=lambda t, pd: None, done_cells={(20, "matched_foreign", 0)})
+    assert calls == [20]                       # trial 0 skipped, only trial 1 ran
+    assert [r["trial"] for r in records] == [1]
+    assert (tmp_path / "l.jsonl").read_text().count("\n") == 1
+
+
+def test_completed_cells_reads_bug_arm_trial_keys(tmp_path):
+    p = tmp_path / "l.jsonl"
+    p.write_text(json.dumps({"bug_id": 20, "arm": "matched_foreign", "trial": 0}) + "\n" +
+                 json.dumps({"bug_id": 20, "arm": "placebo_foreign", "trial": 1}) + "\n")
+    assert _completed_cells(p) == {(20, "matched_foreign", 0), (20, "placebo_foreign", 1)}
+
+
+def test_completed_cells_missing_file_is_empty(tmp_path):
+    assert _completed_cells(tmp_path / "nope.jsonl") == set()
