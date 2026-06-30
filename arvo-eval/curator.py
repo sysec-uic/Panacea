@@ -14,10 +14,27 @@ SYSTEM = (
 )
 
 
+def _triggers(playbook_text: str) -> list[str]:
+    """The trigger headers a render emits: '## <trigger>  (tags)...' -> '<trigger>'."""
+    out = []
+    for line in playbook_text.splitlines():
+        if line.startswith("## "):
+            head = line[3:]
+            idx = head.find("  (")          # render appends "  (tags)" after the trigger
+            out.append((head[:idx] if idx != -1 else head).strip())
+    return [t for t in out if t]
+
+
 def maybe_compress(playbook_text: str, *, llm=call_llm) -> str:
     if len(playbook_text) <= MAX_PLAYBOOK_CHARS:
         return playbook_text
-    return llm(
+    compressed = llm(
         f"Compress this playbook to under {MAX_PLAYBOOK_CHARS} characters:\n\n{playbook_text}",
         system=SYSTEM,
     )
+    # Fidelity guard: a compressor that silently drops a distinct lesson degrades
+    # every future injection. If any trigger vanished, fall back to the full render
+    # -- an oversized-but-complete playbook beats a lossy one.
+    if any(t not in compressed for t in _triggers(playbook_text)):
+        return playbook_text
+    return compressed
