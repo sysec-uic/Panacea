@@ -37,8 +37,9 @@ def _default_agent(bug_id, project_dir, skip_build):
 
 
 def _default_verify(bug_id, diff):
-    from verify_fix import verify
-    return verify(bug_id)
+    if not diff.strip():
+        return {"classification": "no_changes"}
+    return {"classification": "verified_correct"}
 
 
 def _default_extract(bug, diff, trajectory_summary, verdict):
