@@ -134,6 +134,57 @@ def test_retry_learns_contrastively_from_own_attempts(tmp_path):
     assert captured["verdict"] == "fixed_tests_failed"
 
 
+def _bug(localId):
+    return {"localId": localId, "crash_type": "c", "sanitizer": "asan",
+            "fuzz_target": "f", "crash_output": ""}
+
+
+def test_resume_skips_bugs_already_recorded_for_this_pass(tmp_path):
+    from ledger import append_record
+    ledger = tmp_path / "ledger.jsonl"
+    append_record(ledger, {"bug_id": 100, "pass": "treatment",
+                           "classification": "verified_correct", "n_attempts": 1})
+
+    called = []
+
+    def recording_agent(bug_id, project_dir, skip_build):
+        called.append(bug_id)
+        return stub_agent(bug_id, project_dir, skip_build)
+
+    result = run_pass(
+        bugs=[_bug(100), _bug(200)], pass_name="treatment", inject_enabled=True,
+        state_path=tmp_path / "state.json", ledger_path=ledger,
+        project_dir_for=lambda bid: tmp_path / f"proj-{bid}",
+        agent=recording_agent, verify=stub_verify, extract=stub_extract,
+        grade=_grade_stub("no_fix_available"),
+    )
+    assert called == [200]                          # bug 100 skipped, agent not re-run
+    assert [r["bug_id"] for r in result] == [200]   # only the newly-run bug returned
+
+
+def test_resume_is_scoped_to_pass_name(tmp_path):
+    # A record from the 'control' pass must not make the 'treatment' pass skip it.
+    from ledger import append_record
+    ledger = tmp_path / "ledger.jsonl"
+    append_record(ledger, {"bug_id": 100, "pass": "control",
+                           "classification": "verified_correct", "n_attempts": 1})
+
+    called = []
+
+    def recording_agent(bug_id, project_dir, skip_build):
+        called.append(bug_id)
+        return stub_agent(bug_id, project_dir, skip_build)
+
+    run_pass(
+        bugs=[_bug(100)], pass_name="treatment", inject_enabled=True,
+        state_path=tmp_path / "state.json", ledger_path=ledger,
+        project_dir_for=lambda bid: tmp_path / f"proj-{bid}",
+        agent=recording_agent, verify=stub_verify, extract=stub_extract,
+        grade=_grade_stub("no_fix_available"),
+    )
+    assert called == [100]   # different pass -> not skipped
+
+
 # ---------------------------------------------------------------------------
 # Oracle veto-and-promote tests
 # ---------------------------------------------------------------------------

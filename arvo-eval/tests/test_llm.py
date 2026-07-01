@@ -1,5 +1,70 @@
 import pytest
-from llm import call_llm, _client_args, OAUTH_BETA
+from llm import call_llm, with_retries, _client_args, OAUTH_BETA
+
+
+class Boom(Exception):
+    """Stand-in for anthropic.APIStatusError: carries a status_code."""
+    def __init__(self, status_code=429):
+        super().__init__("boom")
+        self.status_code = status_code
+
+
+def test_with_retries_retries_then_succeeds():
+    calls = {"n": 0}
+    slept = []
+
+    def fn():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise Boom(429)
+        return "ok"
+
+    out = with_retries(fn, sleep=slept.append, backoff=lambda exc, attempt: attempt)
+    assert out == "ok"
+    assert calls["n"] == 3
+    assert slept == [0, 1]  # backed off before the 2nd and 3rd tries
+
+
+def test_with_retries_gives_up_after_max_retries():
+    calls = {"n": 0}
+
+    def fn():
+        calls["n"] += 1
+        raise Boom(429)
+
+    with pytest.raises(Boom):
+        with_retries(fn, max_retries=2, sleep=lambda s: None, backoff=lambda exc, a: 0)
+    assert calls["n"] == 3  # initial attempt + 2 retries
+
+
+def test_with_retries_does_not_retry_non_retriable():
+    calls = {"n": 0}
+
+    def fn():
+        calls["n"] += 1
+        raise Boom(400)  # client error, not transient
+
+    with pytest.raises(Boom):
+        with_retries(fn, sleep=lambda s: None)
+    assert calls["n"] == 1  # no retries
+
+
+def test_call_llm_retries_on_rate_limit():
+    state = {"n": 0}
+
+    class FlakyMessages:
+        def create(self, **kw):
+            state["n"] += 1
+            if state["n"] == 1:
+                raise Boom(429)
+            return type("R", (), {"content": [type("B", (), {"text": "recovered"})()]})()
+
+    class FlakyClient:
+        messages = FlakyMessages()
+
+    out = call_llm("hi", client=FlakyClient(), sleep=lambda s: None)
+    assert out == "recovered"
+    assert state["n"] == 2
 
 
 class FakeMessages:
