@@ -71,6 +71,18 @@ def with_retries(fn, *, max_retries=MAX_RETRIES, is_retriable=_is_retriable,
             attempt += 1
 
 
+def have_credentials() -> bool:
+    """True if any usable Anthropic credential is in the environment.
+
+    Mirrors the detection in `_client_args` so callers (e.g. demos) can choose
+    real-vs-stub the SAME way the client is built -- an OAuth token counts, not
+    just an API key -- without constructing a client or catching its RuntimeError.
+    """
+    return bool(os.environ.get("ANTHROPIC_API_KEY")
+                or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+                or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+
+
 def _client_args() -> dict:
     """Build kwargs for anthropic.Anthropic(...) from available credentials.
 
