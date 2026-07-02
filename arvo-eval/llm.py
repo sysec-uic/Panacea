@@ -1,15 +1,19 @@
 """Thin Anthropic-style wrapper. `client` is injectable for tests.
 
-Credentials (first match wins) — a Claude OAuth token works, so no separate API
-key is required:
-  ANTHROPIC_API_KEY      - standard API key (x-api-key), if you have one
-  CLAUDE_CODE_OAUTH_TOKEN- the same Claude Pro/Max OAuth token the repair agent
-                           uses; sent as a Bearer token + the oauth beta header,
-                           exactly how Claude Code authenticates to /v1/messages
+Credentials — the API key is PREFERRED; the OAuth token is the FALLBACK. You may
+safely export BOTH at once (e.g. an API key to bill this extractor to pay-per-use
+plus the repair agent's OAuth subscription token): this module picks the API key
+and sends only ONE credential per request, so there is no dual-auth rejection.
+  ANTHROPIC_API_KEY      - standard API key (x-api-key). Used first when present.
+  CLAUDE_CODE_OAUTH_TOKEN- the Claude Pro/Max OAuth token the repair agent uses;
+                           sent as a Bearer token + the oauth beta header, exactly
+                           how Claude Code authenticates to /v1/messages. Used only
+                           when no API key is set.
   ANTHROPIC_AUTH_TOKEN   - generic bearer-token env var (e.g. from `ant auth`)
 
-Do NOT set ANTHROPIC_API_KEY *and* an OAuth token at once — the API rejects dual
-auth. This module sends only one.
+Note: a subscription OAuth token is provisioned for Claude Code, not raw API
+access, so using it here is rate-limited far more aggressively than an API key —
+prefer ANTHROPIC_API_KEY for unattended multi-hour runs.
 
 Backend is also env-configurable for a future local model:
   LLM_MODEL    - model id           (default: claude-opus-4-8)
@@ -17,6 +21,7 @@ Backend is also env-configurable for a future local model:
 
 A local server that speaks the OpenAI API instead needs a small adapter client
 with the same `.messages.create(...)` shape — pass it via the `client=` arg.
+See the NETWORK LLM CALL SITE marker in call_llm() for the exact seam to swap.
 """
 import os
 import time
@@ -102,6 +107,14 @@ def call_llm(prompt: str, *, system: str = "", client=None, max_tokens: int = MA
     client = client or _default_client()
 
     def _once():
+        # ============================ NETWORK LLM CALL SITE ============================
+        # This is the ONE place this module hits a model over the network. To run the
+        # heuristic loop against a LOCAL LLM, either:
+        #   * point LLM_BASE_URL at a local Anthropic-compatible server (no code change), or
+        #   * pass a `client=` object exposing this same `.messages.create(...)` shape
+        #     (e.g. a thin adapter over a local OpenAI-style server).
+        # Keep the request/response contract below stable and swaps stay drop-in.
+        # ==============================================================================
         resp = client.messages.create(
             model=MODEL,
             max_tokens=max_tokens,
