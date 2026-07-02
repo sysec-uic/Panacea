@@ -104,7 +104,28 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
 
         oracle_fields = {}
         playbook_version_snap = state["version"]   # snapshot before any add_heuristic bumps it
+        verdict = None
         if solved:
+            # Oracle grade first: it's a Docker differential test (no LLM), so it can't
+            # rate-limit, and its label feeds both the ledger record and the veto below.
+            verdict = grade(bug, result["accepted"]["diff"])
+            oracle_fields = {"oracle_label": verdict["label"],
+                             "fix_image_available": verdict["fix_image_available"],
+                             "n_divergences": len(verdict["divergences"])}
+
+        # Record the outcome BEFORE the fragile LLM extraction below. A solved bug's
+        # repair is expensive; if the extractor rate-limits we must not discard it.
+        # Once recorded, the `done` resume-set skips this bug on the next run.
+        record = {"bug_id": bug_id, "pass": pass_name, "classification": final_verdict,
+                  "n_attempts": len(result["attempts"]), "playbook_version": playbook_version_snap,
+                  **oracle_fields}
+        append_record(ledger_path, record)
+        records.append({**record, **{k: last_run[k] for k in ("injected_seen",) if k in last_run}})
+
+        # Learn only from solved, non-divergent bugs. Extraction (an LLM call) runs
+        # AFTER the ledger write, so a failure here costs at most this bug's lesson --
+        # never the completed repair, which is already durably recorded above.
+        if solved and verdict["label"] != "divergent":
             accepted = result["accepted"]
             pair = result["contrastive_pair"]
             if pair:                      # failed-then-succeeded: contrastive lesson
@@ -114,29 +135,13 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
                 lesson = extract(bug, accepted["diff"], accepted.get("trajectory_summary", ""),
                                  "verified_correct")
 
-            verdict = grade(bug, accepted["diff"])
-            oracle_fields = {"oracle_label": verdict["label"],
-                             "fix_image_available": verdict["fix_image_available"],
-                             "n_divergences": len(verdict["divergences"])}
-
             if verdict["label"] == "oracle_confirmed":
                 lesson["oracle"] = "confirmed"
                 lesson["confidence"] = "high"
-                state = add_heuristic(state, lesson, source_bug=bug_id, after_bug=bug_id)
-                save_state(state, state_path)
-            elif verdict["label"] == "divergent":
-                pass                      # VETO: patch diverges from canonical fix; learn nothing
             else:                         # no_fix_available | oracle_error
                 lesson["oracle"] = "tests_only"
-                state = add_heuristic(state, lesson, source_bug=bug_id, after_bug=bug_id)
-                save_state(state, state_path)
-
-        record = {"bug_id": bug_id, "pass": pass_name, "classification": final_verdict,
-                  "n_attempts": len(result["attempts"]), "playbook_version": playbook_version_snap,
-                  **oracle_fields}
-        append_record(ledger_path, record)
-
-        records.append({**record, **{k: last_run[k] for k in ("injected_seen",) if k in last_run}})
+            state = add_heuristic(state, lesson, source_bug=bug_id, after_bug=bug_id)
+            save_state(state, state_path)
     return records
 
 
