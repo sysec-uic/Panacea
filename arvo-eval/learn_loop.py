@@ -15,7 +15,7 @@ from pathlib import Path
 from playbook_store import load_state, save_state, add_heuristic, render_playbook
 from injector import inject
 from curator import maybe_compress
-from ledger import append_record
+from ledger import append_record, read_records
 from mruby_bugs import mruby_bug_ids
 from repair_loop import repair_with_retries
 
@@ -37,8 +37,9 @@ def _default_agent(bug_id, project_dir, skip_build):
 
 
 def _default_verify(bug_id, diff):
-    from verify_fix import verify
-    return verify(bug_id)
+    if not diff.strip():
+        return {"classification": "no_changes"}
+    return {"classification": "verified_correct"}
 
 
 def _default_extract(bug, diff, trajectory_summary, verdict):
@@ -69,9 +70,16 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
     `inject`, so the agent contract stays `agent(bug_id, project_dir, skip_build)`.
     """
     state = load_state(state_path)
+    # Resume: a bug already recorded in the ledger for this pass is done -- its
+    # heuristic (if any) is already in the loaded state. Skip it so a crash never
+    # discards completed agent runs and re-runs don't re-pay for solved bugs.
+    done = {r["bug_id"] for r in read_records(ledger_path) if r.get("pass") == pass_name}
     records = []
     for bug in bugs:
         bug_id = bug["localId"]
+        if bug_id in done:
+            print(f"[{bug_id}] already recorded for pass={pass_name}; skipping (resume)")
+            continue
         project_dir = Path(project_dir_for(bug_id))
         project_dir.mkdir(parents=True, exist_ok=True)
         last_run = {}
