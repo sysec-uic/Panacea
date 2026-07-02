@@ -24,6 +24,7 @@ with the same `.messages.create(...)` shape — pass it via the `client=` arg.
 See the NETWORK LLM CALL SITE marker in call_llm() for the exact seam to swap.
 """
 import os
+import sys
 import time
 
 MODEL = os.environ.get("LLM_MODEL", "claude-opus-4-8")
@@ -41,6 +42,26 @@ def _is_retriable(exc) -> bool:
     """Detect by status_code so this covers anthropic.APIStatusError subclasses
     (RateLimitError=429, InternalServerError=500, ...) and any error exposing one."""
     return getattr(exc, "status_code", None) in RETRIABLE_STATUS
+
+
+def _rl_summary(exc) -> str:
+    """Human-readable dump of the rate-limit headers on a 429 so we can tell a
+    transient per-minute throttle (recoverable) from a hard daily/org cap (not)."""
+    resp = getattr(exc, "response", None)
+    headers = getattr(resp, "headers", None) or {}
+    interesting = ("retry-after", "anthropic-ratelimit-unified-reset",
+                   "anthropic-ratelimit-unified-status",
+                   "anthropic-ratelimit-requests-remaining",
+                   "anthropic-ratelimit-tokens-remaining")
+    parts = [f"{k}={headers.get(k)}" for k in interesting if headers.get(k) is not None]
+    return ", ".join(parts) or "(no rate-limit headers on response)"
+
+
+def _oauth_only() -> bool:
+    """Using a subscription OAuth token and NO API key -- the combination that gets
+    throttled hard on raw /v1/messages regardless of interactive Claude Code headroom."""
+    return not os.environ.get("ANTHROPIC_API_KEY") and bool(
+        os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
 
 
 def _backoff_seconds(exc, attempt: int) -> float:
@@ -67,7 +88,13 @@ def with_retries(fn, *, max_retries=MAX_RETRIES, is_retriable=_is_retriable,
         except Exception as exc:
             if attempt >= max_retries or not is_retriable(exc):
                 raise
-            sleep(backoff(exc, attempt))
+            if getattr(exc, "status_code", None) == 429:
+                wait = backoff(exc, attempt)
+                print(f"[llm] 429 rate-limited (attempt {attempt + 1}/{max_retries + 1}); "
+                      f"retrying in {wait:.0f}s. {_rl_summary(exc)}", file=sys.stderr)
+                sleep(wait)
+            else:
+                sleep(backoff(exc, attempt))
             attempt += 1
 
 
@@ -135,4 +162,21 @@ def call_llm(prompt: str, *, system: str = "", client=None, max_tokens: int = MA
         )
         return "".join(block.text for block in resp.content).strip()
 
-    return with_retries(_once, sleep=sleep)
+    try:
+        return with_retries(_once, sleep=sleep)
+    except Exception as exc:
+        # A 429 that survives every retry on an OAuth-only credential is almost never
+        # a transient blip: subscription tokens are throttled hard on raw /v1/messages.
+        # Turn the opaque anthropic.RateLimitError into an actionable instruction.
+        if getattr(exc, "status_code", None) == 429 and _oauth_only():
+            raise RuntimeError(
+                "Anthropic returned 429 for the heuristic extractor after exhausting "
+                f"retries ({_rl_summary(exc)}). You're authenticating with a Claude "
+                "subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN) and no API key; "
+                "subscription tokens are rate-limited hard on raw /v1/messages calls, "
+                "independent of your interactive Claude Code headroom. To fix: set "
+                "ANTHROPIC_API_KEY (billed to the API, keeps the OAuth token for the "
+                "repair agent), or point LLM_BASE_URL at a local Anthropic-compatible "
+                "model to run the extractor locally."
+            ) from exc
+        raise
