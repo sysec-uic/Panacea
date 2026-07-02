@@ -12,18 +12,31 @@ and sends only ONE credential per request, so there is no dual-auth rejection.
   ANTHROPIC_AUTH_TOKEN   - generic bearer-token env var (e.g. from `ant auth`)
 
 Note: a subscription OAuth token is provisioned for Claude Code, not raw API
-access, so using it here is rate-limited far more aggressively than an API key —
-prefer ANTHROPIC_API_KEY for unattended multi-hour runs.
+access, so using it against /v1/messages is rate-limited (429) far more
+aggressively than an API key — see the claude_cli backend below, which is the
+way to run this on a bare subscription.
 
-Backend is also env-configurable for a future local model:
+Backend selection (LLM_BACKEND, else auto):
+  api         - the raw Anthropic API via the anthropic SDK (needs an API key,
+                OAuth token, or LLM_BASE_URL). Default when an API key or a
+                custom LLM_BASE_URL is set.
+  claude_cli  - drive the Claude Code CLI (`claude -p`) instead of the API, so a
+                Pro/Max SUBSCRIPTION runs the extractor with NO API key, on the
+                same sanctioned path as the OSS-CRS repair agent. Auto-selected
+                when no API key and no LLM_BASE_URL are set and `claude` is on PATH.
+
   LLM_MODEL    - model id           (default: claude-opus-4-8)
   LLM_BASE_URL - override endpoint   (e.g. a local Anthropic-compatible server)
 
 A local server that speaks the OpenAI API instead needs a small adapter client
-with the same `.messages.create(...)` shape — pass it via the `client=` arg.
-See the NETWORK LLM CALL SITE marker in call_llm() for the exact seam to swap.
+with the same `.messages.create(...)` shape — pass it via the `client=` arg
+(ClaudeCLIClient is exactly such an adapter). See the NETWORK LLM CALL SITE
+marker in call_llm() for the exact seam to swap.
 """
+import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 
@@ -99,12 +112,15 @@ def with_retries(fn, *, max_retries=MAX_RETRIES, is_retriable=_is_retriable,
 
 
 def have_credentials() -> bool:
-    """True if any usable Anthropic credential is in the environment.
+    """True if we can make a real model call some way -- so callers (e.g. demos) can
+    choose real-vs-stub the SAME way `_default_client` picks a backend, without
+    constructing a client or catching its RuntimeError.
 
-    Mirrors the detection in `_client_args` so callers (e.g. demos) can choose
-    real-vs-stub the SAME way the client is built -- an OAuth token counts, not
-    just an API key -- without constructing a client or catching its RuntimeError.
+    Counts an API key, an OAuth token, OR the Claude Code CLI backend (its own login),
+    matching `_select_backend`.
     """
+    if _select_backend() == "claude_cli":
+        return True
     return bool(os.environ.get("ANTHROPIC_API_KEY")
                 or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
                 or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
@@ -136,7 +152,78 @@ def _client_args() -> dict:
     return args
 
 
+class _CLIBlock:
+    """Mimics an anthropic content block: exposes `.text`."""
+    __slots__ = ("text",)
+
+    def __init__(self, text):
+        self.text = text
+
+
+class _CLIResponse:
+    """Mimics an anthropic Message: exposes `.content` -> [block with .text]."""
+
+    def __init__(self, text):
+        self.content = [_CLIBlock(text)]
+
+
+class ClaudeCLIClient:
+    """Runs the extractor through the Claude Code CLI (`claude -p`) instead of the raw
+    API, so a Pro/Max SUBSCRIPTION can drive it with no API key -- the same sanctioned
+    path the OSS-CRS repair agent uses, and not rate-limited the way subscription OAuth
+    tokens are on /v1/messages.
+
+    Exposes only the sliver of the anthropic client that `call_llm` touches:
+    `client.messages.create(...)` returning an object with `.content[i].text`.
+    """
+
+    def __init__(self, *, timeout=600, cli="claude"):
+        self.timeout = timeout
+        self.cli = cli
+        self.messages = self          # so `client.messages.create(...)` resolves here
+
+    def create(self, *, model, max_tokens, system, messages):
+        # Our usage is always a single user turn; join any user content defensively.
+        prompt = "\n\n".join(m["content"] for m in messages if m.get("role") == "user")
+        # --system-prompt REPLACES Claude Code's default agent prompt so the extractor
+        # follows exactly our instructions (clean JSON, no tool use). Prompt via stdin
+        # to sidestep argv length/escaping limits on large diffs.
+        cmd = [self.cli, "-p", "--output-format", "json", "--model", model]
+        if system:
+            cmd += ["--system-prompt", system]
+        proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                              timeout=self.timeout)
+        if proc.returncode != 0:
+            raise RuntimeError(f"claude CLI exited {proc.returncode}: "
+                               f"{(proc.stderr or proc.stdout).strip()[:500]}")
+        try:
+            data = json.loads(proc.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"claude CLI returned non-JSON: {proc.stdout[:500]}") from exc
+        if data.get("is_error"):
+            raise RuntimeError(f"claude CLI reported an error: "
+                               f"{data.get('result') or data.get('api_error_status')}")
+        return _CLIResponse(data.get("result", ""))
+
+
+def _select_backend() -> str:
+    """'api' or 'claude_cli'. Explicit LLM_BACKEND wins. Otherwise fall back to the
+    Claude Code CLI whenever there's no API key and no custom endpoint: the raw-API
+    path can't work on a bare subscription (OAuth tokens 429 on /v1/messages), but the
+    CLI authenticates via its own login and runs on the subscription like the agent."""
+    explicit = os.environ.get("LLM_BACKEND")
+    if explicit:
+        return explicit
+    if (not os.environ.get("ANTHROPIC_API_KEY")
+            and not os.environ.get("LLM_BASE_URL")
+            and shutil.which("claude")):
+        return "claude_cli"
+    return "api"
+
+
 def _default_client():
+    if _select_backend() == "claude_cli":
+        return ClaudeCLIClient()
     import anthropic
     return anthropic.Anthropic(**_client_args())
 

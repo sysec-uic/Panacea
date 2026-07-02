@@ -1,5 +1,7 @@
+import json
 import pytest
-from llm import call_llm, with_retries, _client_args, OAUTH_BETA
+from llm import (call_llm, with_retries, _client_args, OAUTH_BETA,
+                 _select_backend, ClaudeCLIClient, have_credentials)
 
 
 class Boom(Exception):
@@ -110,3 +112,87 @@ def test_raises_without_any_credential(monkeypatch):
     _clear(monkeypatch)
     with pytest.raises(RuntimeError):
         _client_args()
+
+
+# --- backend selection & Claude Code CLI adapter -----------------------------
+
+def _clear_backend(monkeypatch):
+    _clear(monkeypatch)
+    monkeypatch.delenv("LLM_BACKEND", raising=False)
+
+
+def test_backend_explicit_env_wins(monkeypatch):
+    _clear_backend(monkeypatch)
+    monkeypatch.setenv("LLM_BACKEND", "api")
+    monkeypatch.setattr("llm.shutil.which", lambda _: "/usr/bin/claude")
+    assert _select_backend() == "api"
+
+
+def test_backend_prefers_api_when_key_present(monkeypatch):
+    _clear_backend(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setattr("llm.shutil.which", lambda _: "/usr/bin/claude")
+    assert _select_backend() == "api"
+
+
+def test_backend_falls_back_to_cli_on_subscription(monkeypatch):
+    # No API key, no custom endpoint, but the claude CLI is installed.
+    _clear_backend(monkeypatch)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-xyz")
+    monkeypatch.setattr("llm.shutil.which", lambda _: "/usr/bin/claude")
+    assert _select_backend() == "claude_cli"
+    assert have_credentials() is True
+
+
+def test_backend_stays_api_when_cli_absent(monkeypatch):
+    _clear_backend(monkeypatch)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-xyz")
+    monkeypatch.setattr("llm.shutil.which", lambda _: None)
+    assert _select_backend() == "api"
+
+
+def test_cli_client_parses_result(monkeypatch):
+    class _Proc:
+        returncode = 0
+        stdout = json.dumps({"is_error": False, "result": '{"root":"uaf"}'})
+        stderr = ""
+
+    seen = {}
+
+    def fake_run(cmd, input, capture_output, text, timeout):
+        seen["cmd"] = cmd
+        seen["input"] = input
+        return _Proc()
+
+    monkeypatch.setattr("llm.subprocess.run", fake_run)
+    client = ClaudeCLIClient()
+    resp = client.messages.create(model="claude-opus-4-8", max_tokens=1024,
+                                  system="be terse", messages=[{"role": "user", "content": "hi"}])
+    assert "".join(b.text for b in resp.content) == '{"root":"uaf"}'
+    assert seen["input"] == "hi"                       # prompt goes via stdin
+    assert "--system-prompt" in seen["cmd"] and "be terse" in seen["cmd"]
+    assert "--model" in seen["cmd"] and "claude-opus-4-8" in seen["cmd"]
+
+
+def test_cli_client_raises_on_error_payload(monkeypatch):
+    class _Proc:
+        returncode = 0
+        stdout = json.dumps({"is_error": True, "result": "rate limited"})
+        stderr = ""
+
+    monkeypatch.setattr("llm.subprocess.run", lambda *a, **k: _Proc())
+    with pytest.raises(RuntimeError, match="claude CLI reported an error"):
+        ClaudeCLIClient().messages.create(model="m", max_tokens=1, system="",
+                                          messages=[{"role": "user", "content": "x"}])
+
+
+def test_cli_client_raises_on_nonzero_exit(monkeypatch):
+    class _Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "not logged in"
+
+    monkeypatch.setattr("llm.subprocess.run", lambda *a, **k: _Proc())
+    with pytest.raises(RuntimeError, match="claude CLI exited 1"):
+        ClaudeCLIClient().messages.create(model="m", max_tokens=1, system="",
+                                          messages=[{"role": "user", "content": "x"}])
