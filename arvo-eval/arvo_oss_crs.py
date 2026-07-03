@@ -40,6 +40,8 @@ def generate_fake_oss_fuzz_project(bug: dict, project_dir: Path) -> None:
 
     (project_dir / "Dockerfile").write_text(
         f"FROM n132/arvo:{bug['localId']}-vul\n"
+        f"RUN printf '#!/bin/bash\\ncd /src/mruby && rake test\\n'"
+        f" > /src/run_tests.sh && chmod +x /src/run_tests.sh\n"
     )
 
     build_sh = project_dir / "build.sh"

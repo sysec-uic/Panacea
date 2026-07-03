@@ -146,13 +146,18 @@ Plan:   `docs/superpowers/plans/2026-06-29-mruby-heuristic-learning-loop.md`
 
 - `arvo_new.db` present in this directory (download from the
   [ARVO_New release](https://github.com/sysec-uic/Panacea/releases/tag/ARVO_New_in_prog)).
-- `CLAUDE_CODE_OAUTH_TOKEN` — the OSS-CRS patching agent (see the OSS-CRS section
-  above). **The heuristic extractor/curator reuses this same token** (sent as a Bearer
-  token + the `oauth-2025-04-20` beta header), so a single OAuth credential runs the whole
-  loop — no separate API key needed.
-- `ANTHROPIC_API_KEY` — *optional*. Only set this if you'd rather bill the extractor to an
-  API key than your Claude subscription. Don't set both an API key and the OAuth token —
-  the API rejects dual auth. (`llm.py` prefers the API key when both are present.)
+- `CLAUDE_CODE_OAUTH_TOKEN` — the OSS-CRS patching agent (see the OSS-CRS section above).
+- **Extractor/curator/grader backend** (`llm.py`) — selected automatically:
+  - *Subscription only (no API key):* `llm.py` drives the **Claude Code CLI** (`claude -p`)
+    on the same login/subscription as the repair agent — no separate API key needed. This
+    is the default whenever `ANTHROPIC_API_KEY` and `LLM_BASE_URL` are unset and `claude`
+    is on `PATH`. (The raw `/v1/messages` API rejects subscription OAuth tokens with a 429,
+    so do **not** rely on the OAuth token for the extractor's raw-API path — use the CLI.)
+  - *API key:* set `ANTHROPIC_API_KEY` to bill the extractor to the API instead. You may
+    export it alongside the OAuth token — `llm.py` prefers the key and only ever sends one
+    credential per request, so there's no dual-auth rejection.
+  - *Local model:* set `LLM_BASE_URL` (Anthropic-compatible) or pass a custom `client=`.
+  - Force a backend explicitly with `LLM_BACKEND=api|claude_cli`.
 - The mruby correctness gate runs `cd /src/mruby && rake test`
   (see `MRUBY_TEST_CMD` in `verify_fix.py`).
 - The playbook is injected as `HEURISTICS.md` written by `injector.py` into the

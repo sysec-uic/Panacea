@@ -16,14 +16,40 @@ Classifications:
 
 import argparse
 import json
+import os
+import shlex
 import subprocess
 from pathlib import Path
 
 from build_instance import build_instance, load_bug
 
+RESULTS_DIR = Path(__file__).parent / "results"
+
+
+def results_dir(instance_id) -> Path:
+    """Per-bug results dir, namespaced by LEARN_PASS to match the producers
+    (arvo_oss_crs.py / learn_loop.py) so control and treatment stay separate and
+    verify reads the patch the agent actually wrote."""
+    _pass = os.environ.get("LEARN_PASS", "")
+    return RESULTS_DIR / _pass / str(instance_id) if _pass else RESULTS_DIR / str(instance_id)
+
 COMPILE_TIMEOUT = 2400  # seconds - some projects take a long time to rebuild
 RUN_TIMEOUT = 60
-MRUBY_TEST_CMD = "cd /src/mruby && rake test"  # confirmed in PHASE0_NOTES.md
+# The correctness gate rebuilds mrbtest, which links libmruby.a — but `compile`
+# built that library with ASan + SanitizerCoverage instrumentation. A plain
+# `rake test` links mrbtest without those flags and fails on undefined __asan_* /
+# __sanitizer_cov_* symbols. Thread the container's own sanitizer + coverage flags
+# (the same ones `compile` uses: CFLAGS="$CFLAGS $SANITIZER_FLAGS $COVERAGE_FLAGS")
+# into the test build so mrbtest links against the runtime. Referencing the
+# container's SANITIZER_FLAGS_${SANITIZER}/COVERAGE_FLAGS keeps this correct across
+# sanitizers instead of hardcoding asan.
+MRUBY_TEST_CMD = (
+    'cd /src/mruby && '
+    'sf="SANITIZER_FLAGS_${SANITIZER}" && '
+    'flags="${!sf-} ${COVERAGE_FLAGS-}" && '
+    'export CFLAGS="$CFLAGS $flags" CXXFLAGS="$CXXFLAGS $flags" LDFLAGS="$LDFLAGS $flags" && '
+    'rake test'
+)
 TEST_TIMEOUT = 1800
 
 # Crash signatures keyed by sanitizer. A rebuilt target "still crashes" if any
@@ -79,8 +105,43 @@ def docker_exec(container: str, command: str, *, input: str | None = None, timeo
     return subprocess.run(cmd, input=input, text=True, capture_output=True, timeout=timeout)
 
 
+SANITIZER_ENV = {"asan": "address", "msan": "memory", "ubsan": "undefined"}
+
+
+def compile_env(bug: dict) -> dict:
+    """OSS-Fuzz build env the ARVO `compile` wrapper requires (it runs under
+    `set -u`). ARVO containers don't reliably carry these, so derive them from the
+    bug metadata, falling back to OSS-Fuzz's own defaults."""
+    return {
+        "FUZZING_LANGUAGE": bug.get("language") or "c++",
+        "SANITIZER": SANITIZER_ENV.get((bug.get("sanitizer") or "").lower(), "address"),
+        "FUZZING_ENGINE": bug.get("fuzz_engine") or "libfuzzer",
+        "ARCHITECTURE": "x86_64",
+    }
+
+
+def env_prefix(env: dict) -> str:
+    """Render an env dict as a shell command prefix: `K=v K2=v2`."""
+    return " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env.items())
+
+
+def apply_patch(exec_fn, project: str, diff: str):
+    """Apply `diff` in the bug's source tree, tolerating an extra leading path
+    component. OSS-CRS nests the repo under a project-named dir, so its diffs carry
+    an extra prefix and only apply at -p2; plain diffs apply at -p1. Try -p1 first,
+    fall back to -p2. `exec_fn(command, diff)` returns a CompletedProcess. Returns
+    the first successful attempt, else the last one."""
+    result = None
+    for strip in (1, 2):
+        result = exec_fn(f"git -C /src/{project} apply -p{strip} -", diff)
+        if result.returncode == 0:
+            return result
+    return result
+
+
 def save(instance: dict, verification: dict) -> dict:
-    out_path = Path("results") / instance["instance_id"] / "verification.json"
+    out_path = results_dir(instance["instance_id"]) / "verification.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(verification, indent=2))
     print(json.dumps(verification, indent=2))
 
@@ -95,7 +156,7 @@ def verify(bug_id: int, keep: bool = False) -> dict:
     instance = build_instance(bug)
     project = instance["project"]
 
-    diff_path = Path("results") / instance["instance_id"] / "patch.diff"
+    diff_path = results_dir(instance["instance_id"]) / "patch.diff"
     diff = diff_path.read_text() if diff_path.exists() else ""
 
     verification = {"instance_id": instance["instance_id"], "project": project}
@@ -113,7 +174,10 @@ def verify(bug_id: int, keep: bool = False) -> dict:
     )
 
     try:
-        apply_result = docker_exec(container, f"git -C /src/{project} apply -", input=diff, timeout=60)
+        apply_result = apply_patch(
+            lambda cmd, patch: docker_exec(container, cmd, input=patch, timeout=60),
+            project, diff,
+        )
         if apply_result.returncode != 0:
             verification["classification"] = "patch_apply_failed"
             verification["apply_output"] = apply_result.stdout + apply_result.stderr
@@ -122,7 +186,7 @@ def verify(bug_id: int, keep: bool = False) -> dict:
         # Cap ninja's parallelism: this host has more cores than RAM can support for a
         # full-parallel clang+ASan build, which previously crashed the WSL2 VM.
         docker_exec(container, "sed -i 's#/depot_tools/ninja -C#/depot_tools/ninja -j3 -C#g' /src/build.sh 2>/dev/null || true", timeout=30)
-        build_result = docker_exec(container, f"cd /src/{project} && compile", timeout=COMPILE_TIMEOUT)
+        build_result = docker_exec(container, f"cd /src/{project} && {env_prefix(compile_env(bug))} compile", timeout=COMPILE_TIMEOUT)
         build_output = build_result.stdout + build_result.stderr
         verification["build_output_tail"] = "\n".join(build_output.splitlines()[-50:])
         if build_result.returncode != 0:

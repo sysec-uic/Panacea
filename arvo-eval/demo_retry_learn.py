@@ -10,14 +10,15 @@ between attempts, and on success distills a contrastive lesson from attempt 1 vs
 
 Run:
     PYTHONPATH=. python3 demo_retry_learn.py
-With ANTHROPIC_API_KEY set it calls the model for real; otherwise a labelled stub is used.
+With an Anthropic credential set (ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN) it
+calls the model for real; otherwise a labelled stub is used.
 """
 import json
-import os
 from pathlib import Path
 
 from repair_loop import repair_with_retries
 from contrastive_extract import extract_contrastive_heuristic
+from llm import have_credentials
 
 PAIR_DIR = Path(__file__).resolve().parent.parent / "bug-runs" / "results" / "449429295"
 
@@ -81,15 +82,15 @@ def main():
         return
 
     rejected, accepted = pair
-    has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    has_cred = have_credentials()   # API key OR OAuth token -- same detection as the real client
     print("\n" + "=" * 78)
     print(f"LEARN FROM OWN ATTEMPTS  (rejected attempt {rejected['attempt']} vs accepted attempt {accepted['attempt']})")
-    print(f"LLM: {'REAL claude-opus-4-8' if has_key else 'STUB (no ANTHROPIC_API_KEY) — labelled output'}")
+    print(f"LLM: {'REAL claude-opus-4-8' if has_cred else 'STUB (no Anthropic credentials) — labelled output'}")
     print("=" * 78)
 
     kw = dict(bug=BUG, rejected_diff=rejected["diff"], accepted_diff=accepted["diff"],
               rejected_verdict=rejected["verdict"])
-    heuristic = extract_contrastive_heuristic(**kw) if has_key else extract_contrastive_heuristic(**kw, llm=_stub_llm)
+    heuristic = extract_contrastive_heuristic(**kw) if has_cred else extract_contrastive_heuristic(**kw, llm=_stub_llm)
     print("CONTRASTIVE LESSON (added to the playbook for future bugs):\n")
     print(json.dumps(heuristic, indent=2))
 
