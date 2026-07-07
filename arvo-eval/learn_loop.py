@@ -83,6 +83,7 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
         project_dir = Path(project_dir_for(bug_id))
         project_dir.mkdir(parents=True, exist_ok=True)
         last_run = {}
+        total_tokens: dict = {}
 
         def attempt_agent(attempt_no, feedback, _bug_id=bug_id, _project_dir=project_dir):
             # Render is holdout-filtered: only lessons from strictly-earlier bugs. Read at
@@ -94,6 +95,8 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
             run = agent(_bug_id, _project_dir, skip_build)
             last_run.clear()
             last_run.update(run)
+            for k, v in run.get("summary", {}).get("tokens", {}).items():
+                total_tokens[k] = total_tokens.get(k, 0) + v
             return {"diff": run.get("diff", ""), "trajectory_summary": run.get("trajectory_summary", "")}
 
         result = repair_with_retries(bug=bug, agent=attempt_agent, verify=verify,
@@ -118,7 +121,7 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
         # Once recorded, the `done` resume-set skips this bug on the next run.
         record = {"bug_id": bug_id, "pass": pass_name, "classification": final_verdict,
                   "n_attempts": len(result["attempts"]), "playbook_version": playbook_version_snap,
-                  **oracle_fields}
+                  **oracle_fields, **({"tokens": total_tokens} if total_tokens else {})}
         append_record(ledger_path, record)
         records.append({**record, **{k: last_run[k] for k in ("injected_seen",) if k in last_run}})
 
