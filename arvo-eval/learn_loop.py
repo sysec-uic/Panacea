@@ -125,7 +125,7 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
         # Learn only from solved, non-divergent bugs. Extraction (an LLM call) runs
         # AFTER the ledger write, so a failure here costs at most this bug's lesson --
         # never the completed repair, which is already durably recorded above.
-        if solved and verdict["label"] != "divergent":
+        if inject_enabled and solved and verdict["label"] != "divergent":
             accepted = result["accepted"]
             pair = result["contrastive_pair"]
             if pair:                      # failed-then-succeeded: contrastive lesson
