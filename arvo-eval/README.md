@@ -202,6 +202,34 @@ state is `playbook/playbook_state_<pass>.json`.
 point it at a local Anthropic-compatible endpoint without code changes. A local server
 that speaks the OpenAI API instead needs a small adapter client passed via `client=`.
 
+### Repair agent on a local model (OSS-CRS)
+
+The repair agent is the expensive side; it can run against a local
+OpenAI-compatible server (e.g. llama.cpp reached through an SSH tunnel on
+`localhost:8080`) instead of Claude:
+
+1. Make the tunnel reachable from Docker containers — add a second `-L`
+   binding on the docker bridge gateway (only containers can reach it):
+
+       ssh -L 8080:localhost:8080 -L 172.17.0.1:8080:localhost:8080 user@llm-server
+
+2. Install the configs into `~/oss-crs` and prepare once:
+
+       arvo-eval/oss-crs-local/install.sh
+       cd ~/oss-crs && uv run oss-crs prepare --compose-file example/crs-claude-code/compose-local.yaml
+
+3. Run as usual (`arvo_oss_crs.py`, `run_single.py`, ...) — the local compose is
+   now the default. Claude Code inside the CRS talks to OSS-CRS's LiteLLM proxy,
+   which rewrites the Claude model aliases to `openai/local` at
+   `http://172.17.0.1:8080/v1` (see `oss-crs-local/litellm-config-local.yaml`).
+
+To switch back to Claude via OAuth for a run:
+
+    export CLAUDE_CODE_OAUTH_TOKEN=...
+    OSS_CRS_COMPOSE_FILE=$HOME/oss-crs/example/crs-claude-code/compose-oauth.yaml python arvo_oss_crs.py
+
+The learning/extractor side (`llm.py`) is unaffected and stays on Claude.
+
 > **Note:** `results/` is git-ignored, so the ledger is a local artifact. The
 > `playbook/` directory is tracked — commit the resulting playbook if you want to
 > share what the system learned.
