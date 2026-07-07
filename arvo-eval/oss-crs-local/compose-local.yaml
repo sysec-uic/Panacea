@@ -1,0 +1,37 @@
+##############################################################################
+#                        CRS Compose Configuration                           #
+#   crs-claude-code driven by a LOCAL OpenAI-compatible model via LiteLLM    #
+##############################################################################
+# Same as compose-oauth.yaml EXCEPT:
+#   * CLAUDE_CODE_OAUTH_TOKEN is intentionally NOT set -> Claude Code routes
+#     through the OSS-CRS internal LiteLLM proxy instead of Anthropic.
+#   * llm_config points at litellm-config-local.yaml, which maps the Claude
+#     model aliases to the local server on the host (SSH tunnel).
+
+# --- General Settings -------------------------------------------------------
+run_env: local
+docker_registry: local
+
+# --- Infrastructure ---------------------------------------------------------
+oss_crs_infra:
+  cpuset: "0-1"
+  memory: "8G"
+
+# --- CRS (crs-claude-code) -------------------------------------------------
+crs-claude-code:
+  cpuset: "2-7"
+  memory: "16G"
+  llm_budget: 10
+  additional_env:
+    CRS_AGENT: claude_code
+    # An alias rewritten by LiteLLM (see litellm-config-local.yaml); nothing
+    # downstream changes relative to the OAuth setup.
+    ANTHROPIC_MODEL: claude-opus-4-8
+    # AGENT_TIMEOUT: "3600"                # Optional: seconds, 0 = no limit
+
+# --- LLM Configuration -----------------------------------------------------
+llm_config:
+  litellm:
+    mode: internal
+    internal:
+      config_path: ./example/crs-claude-code/litellm-config-local.yaml
