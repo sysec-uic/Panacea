@@ -9,8 +9,12 @@ Usage:
 
 Prerequisites:
     - ~/oss-crs cloned from https://github.com/ossf/oss-crs
-    - CLAUDE_CODE_OAUTH_TOKEN exported in your shell (or set in .env)
+    - arvo-eval/oss-crs-local/install.sh run once (installs compose-local.yaml +
+      litellm-config-local.yaml into ~/oss-crs); the SSH tunnel to the local model
+      must also listen on 172.17.0.1:8080 -- see arvo-eval/README.md
     - Run `uv run oss-crs prepare --compose-file <COMPOSE_FILE>` once first
+    - To use Claude via OAuth instead: export CLAUDE_CODE_OAUTH_TOKEN and
+      OSS_CRS_COMPOSE_FILE=$HOME/oss-crs/example/crs-claude-code/compose-oauth.yaml
 """
 
 import json
@@ -23,7 +27,15 @@ from pathlib import Path
 from build_instance import load_bug
 
 OSS_CRS_DIR = Path.home() / "oss-crs"
-COMPOSE_FILE = OSS_CRS_DIR / "example/crs-claude-code/compose-oauth.yaml"
+def _compose_file() -> Path:
+    """OSS_CRS_COMPOSE_FILE overrides (e.g. compose-oauth.yaml to use Claude
+    via OAuth); the default is the local-model compose."""
+    return Path(os.environ.get(
+        "OSS_CRS_COMPOSE_FILE",
+        str(OSS_CRS_DIR / "example/crs-claude-code/compose-local.yaml")))
+
+
+COMPOSE_FILE = _compose_file()
 PROJECTS_DIR = Path.home() / ".arvo-oss-crs"   # stable per-bug project dirs live here
 RESULTS_DIR = Path(__file__).parent / "results"
 
