@@ -99,35 +99,35 @@ ARVO images don't match OSS-Fuzz's expected project format, so `arvo_oss_crs.py`
 
 ### Token counts
 
-Claude Code saves its session as a JSONL file inside the run's `LOG_DIR`. To extract token
-usage after a run (file is root-owned, hence `sudo`):
+Token usage is captured automatically per bug in `results/learn/ledger.jsonl` (the `tokens`
+field). To view a summary across all runs:
 
 ```bash
-SESSION=$(find ~/oss-crs/.oss-crs-workdir -name "*.jsonl" -path "*/.claude/*" | xargs ls -t 2>/dev/null | head -1)
-sudo cat "$SESSION" | python3 -c "
+cat results/learn/ledger.jsonl | python3 -c "
 import json, sys
-inp = out = cache_r = cache_w = 0
+print(f'{'BUG_ID':<15} {'INPUT':>8} {'OUTPUT':>8} {'CACHE_READ':>12} {'CACHE_WRITE':>12}')
 for line in sys.stdin:
-    u = json.loads(line).get('message', {}).get('usage', {})
-    if u:
-        inp += u.get('input_tokens', 0); out += u.get('output_tokens', 0)
-        cache_r += u.get('cache_read_input_tokens', 0); cache_w += u.get('cache_creation_input_tokens', 0)
-print(f'Input: {inp:,}  Output: {out:,}  Cache-read: {cache_r:,}  Cache-write: {cache_w:,}')
+    r = json.loads(line)
+    t = r.get('tokens', {})
+    print(f\"{r['bug_id']:<15} {t.get('input_tokens',0):>8,} {t.get('output_tokens',0):>8,} {t.get('cache_read_tokens',0):>12,} {t.get('cache_write_tokens',0):>12,}\")
 "
 ```
 
 ### Cost
 
-Each run uses Claude Opus 4.8. Typical token usage for a successful patch (~300–700 s):
+Each run uses Claude Opus 4.8. Typical token usage for a successful patch (~300–700 s),
+measured across 8 mruby control bugs:
 
 | Metric | Typical range |
 |--------|--------------|
-| Input tokens | ~8K–11K |
-| Output tokens | ~30K–70K |
-| Cache-read tokens | ~2M–4M |
-| Cache-write tokens | ~100K–150K |
+| Input tokens | ~2.5K–9K |
+| Output tokens | ~500–1K |
+| Cache-read tokens | ~1M–3.5M |
+| Cache-write tokens | ~35K–90K |
 
-Cache-read dominates cost as the conversation grows across turns. Use `--skip-build` on reruns to avoid rebuilding the Docker snapshot.
+Output tokens are low because Claude Code works by making short tool calls rather than
+generating long text. Cache-read dominates cost as the conversation grows across turns.
+Use `--skip-build` on reruns to avoid rebuilding the Docker snapshot.
 
 ---
 
