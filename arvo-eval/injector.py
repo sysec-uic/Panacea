@@ -10,8 +10,10 @@ INJECT_FILENAME = "HEURISTICS.md"
 
 
 def inject(playbook_text: str, project_dir: Path) -> None:
-    if not playbook_text.strip():
-        return
     project_dir = Path(project_dir)
+    dest = project_dir / INJECT_FILENAME
+    if not playbook_text.strip():
+        dest.unlink(missing_ok=True)
+        return
     project_dir.mkdir(parents=True, exist_ok=True)
-    (project_dir / INJECT_FILENAME).write_text(playbook_text)
+    dest.write_text(playbook_text)
