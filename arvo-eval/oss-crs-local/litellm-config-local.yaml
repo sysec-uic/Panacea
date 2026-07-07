@@ -1,0 +1,28 @@
+# Routes the Claude model aliases crs-claude-code requests to a local
+# OpenAI-compatible server (llama.cpp behind an SSH tunnel).
+#
+# 172.17.0.1 is the HOST as seen from inside the LiteLLM container (docker0
+# bridge gateway). The SSH tunnel must also listen there:
+#   ssh -L 8080:localhost:8080 -L 172.17.0.1:8080:localhost:8080 user@llm-server
+#
+# All aliases map to the same backend; llama.cpp ignores the model id and key.
+# The haiku/sonnet aliases cover Claude Code's background + subagent calls.
+model_list:
+- model_name: claude-opus-4-8
+  litellm_params:
+    model: openai/local
+    api_base: http://172.17.0.1:8080/v1
+    api_key: sk-local-dummy
+- model_name: claude-sonnet-4-6
+  litellm_params:
+    model: openai/local
+    api_base: http://172.17.0.1:8080/v1
+    api_key: sk-local-dummy
+- model_name: claude-haiku-4-5-20251001
+  litellm_params:
+    model: openai/local
+    api_base: http://172.17.0.1:8080/v1
+    api_key: sk-local-dummy
+
+litellm_settings:
+  drop_params: true   # silently drop Anthropic-only params the local server rejects
