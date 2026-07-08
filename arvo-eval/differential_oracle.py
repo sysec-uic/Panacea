@@ -101,9 +101,10 @@ def grade(bug, agent_diff, *, probes=None, script_texts=None,
 
         divergences = []
         a, f = ops.run_poc(agent_c), ops.run_poc(fix_c)
-        kind = outputs_diverge(a, f)
-        if kind:
-            divergences.append({"probe": "poc", "kind": kind})
+        # PoC stdout contains fuzzer noise we can't fully normalize; only compare
+        # exit codes here. Stdout comparison is reserved for the probe scripts.
+        if a[0] != f[0]:
+            divergences.append({"probe": "poc", "kind": "exit"})
 
         if not poc_only:
             ops.check_mruby_binary(agent_c)   # raises OracleError if missing
