@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 
 from build_instance import build_instance
-from verify_fix import docker_exec, COMPILE_TIMEOUT, RUN_TIMEOUT
+from verify_fix import docker_exec, COMPILE_TIMEOUT, RUN_TIMEOUT, compile_env, env_prefix, apply_patch
 
 PROBE_DIR = Path(__file__).parent / "differential" / "mruby_probes"
 PROBE_RUN_TIMEOUT = 60
@@ -146,14 +146,15 @@ class DockerOps:
             ["docker", "run", "-d", "--name", container, instance["image_name"],
              "sleep", str(COMPILE_TIMEOUT + 600)], check=True, capture_output=True)
         try:
-            apply_res = docker_exec(container, f"git -C /src/{project} apply -",
-                                    input=diff, timeout=60)
+            exec_fn = lambda cmd, d=None: docker_exec(container, cmd, input=d, timeout=60)
+            apply_res = apply_patch(exec_fn, project, diff)
             if apply_res.returncode != 0:
                 raise OracleError(f"agent patch did not apply: {apply_res.stderr[:500]}")
             docker_exec(container,
                         "sed -i 's#/depot_tools/ninja -C#/depot_tools/ninja -j3 -C#g' "
                         "/src/build.sh 2>/dev/null || true", timeout=30)
-            build_res = docker_exec(container, f"cd /src/{project} && compile",
+            env = env_prefix(compile_env(bug))
+            build_res = docker_exec(container, f"cd /src/{project} && {env} compile",
                                     timeout=COMPILE_TIMEOUT)
             if build_res.returncode != 0:
                 raise OracleError("agent build failed under oracle")
