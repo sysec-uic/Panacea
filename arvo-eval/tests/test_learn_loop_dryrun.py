@@ -202,12 +202,13 @@ def test_confirmed_lesson_is_added_high_confidence(dryrun_kwargs):
     assert rec["oracle_label"] == "oracle_confirmed"
 
 
-def test_divergent_lesson_is_suppressed(dryrun_kwargs):
+def test_divergent_lesson_is_learned_tests_only(dryrun_kwargs):
     kw = dryrun_kwargs(solved=True)
     run_pass(**{**kw, "grade": _grade_stub("divergent")})
     from playbook_store import load_state
     state = load_state(kw["state_path"])
-    assert state["heuristics"] == []           # vetoed: nothing learned
+    assert len(state["heuristics"]) == 1
+    assert state["heuristics"][0]["oracle"] == "tests_only"
     from ledger import read_records
     rec = read_records(kw["ledger_path"])[-1]
     assert rec["oracle_label"] == "divergent"

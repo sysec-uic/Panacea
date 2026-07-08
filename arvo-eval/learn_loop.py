@@ -125,10 +125,10 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
         append_record(ledger_path, record)
         records.append({**record, **{k: last_run[k] for k in ("injected_seen",) if k in last_run}})
 
-        # Learn only from solved, non-divergent bugs. Extraction (an LLM call) runs
-        # AFTER the ledger write, so a failure here costs at most this bug's lesson --
-        # never the completed repair, which is already durably recorded above.
-        if inject_enabled and solved and verdict["label"] != "divergent":
+        # Learn from all solved bugs. Extraction (an LLM call) runs AFTER the ledger
+        # write, so a failure here costs at most this bug's lesson -- never the
+        # completed repair, which is already durably recorded above.
+        if inject_enabled and solved:
             accepted = result["accepted"]
             pair = result["contrastive_pair"]
             if pair:                      # failed-then-succeeded: contrastive lesson
@@ -141,7 +141,7 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
             if verdict["label"] == "oracle_confirmed":
                 lesson["oracle"] = "confirmed"
                 lesson["confidence"] = "high"
-            else:                         # no_fix_available | oracle_error
+            else:                         # divergent | no_fix_available | oracle_error
                 lesson["oracle"] = "tests_only"
             state = add_heuristic(state, lesson, source_bug=bug_id, after_bug=bug_id)
             save_state(state, state_path)
