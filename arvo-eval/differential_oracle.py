@@ -5,6 +5,7 @@ Runs ONLY in the learning path (learn_loop), after the agent has produced its
 accepted patch. Its output feeds the ledger and the add/suppress/confidence
 decision -- never agent feedback. The deployment-faithful -fix wall is preserved.
 """
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -13,6 +14,7 @@ from build_instance import build_instance
 from verify_fix import docker_exec, COMPILE_TIMEOUT, RUN_TIMEOUT, compile_env, env_prefix, apply_patch
 
 PROBE_DIR = Path(__file__).parent / "differential" / "mruby_probes"
+GOLDEN_DIR = Path(__file__).parent / "differential" / "golden"
 PROBE_RUN_TIMEOUT = 60
 
 
@@ -99,13 +101,18 @@ def grade(bug, agent_diff, *, probes=None, script_texts=None,
 
         divergences = []
         a, f = ops.run_poc(agent_c), ops.run_poc(fix_c)
-        kind = outputs_diverge(a, f)
-        if kind:
-            divergences.append({"probe": "poc", "kind": kind})
+        # PoC stdout contains fuzzer noise we can't fully normalize; only compare
+        # exit codes here. Stdout comparison is reserved for the probe scripts.
+        if a[0] != f[0]:
+            divergences.append({"probe": "poc", "kind": "exit"})
 
         if not poc_only:
+            ops.check_mruby_binary(agent_c)   # raises OracleError if missing
+            goldens = ops.get_probe_goldens(bug, local_id, script_texts, script_labels)
             for label, text in zip(script_labels, script_texts):
-                a, f = ops.run_script(agent_c, text), ops.run_script(fix_c, text)
+                a = ops.run_script(agent_c, text)
+                g = goldens[label]
+                f = (g["exit"], g["stdout"])
                 kind = outputs_diverge(a, f)
                 if kind:
                     divergences.append({"probe": label, "kind": kind})
@@ -164,6 +171,56 @@ class DockerOps:
             # container: grade()'s finally can't clean it since it never got the name.
             subprocess.run(["docker", "rm", "-f", container], capture_output=True)
             raise
+
+    def get_probe_goldens(self, bug: dict, local_id: int,
+                          script_texts: list[str], script_labels: list[str]) -> dict:
+        """Return cached probe goldens for this bug, building them if not yet stored.
+
+        Goldens are the expected (exit, stdout) for each probe script run against the
+        compiled -fix image. They're computed once and saved to differential/golden/
+        so future grades never rebuild the fix container for probes.
+        """
+        golden_path = GOLDEN_DIR / f"{local_id}.json"
+        if golden_path.exists():
+            return json.loads(golden_path.read_text())
+
+        # Build the fix container and compile so bin/mruby is available.
+        container = f"arvo-{local_id}-oracle-fix-build"
+        subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+        subprocess.run(
+            ["docker", "run", "-d", "--name", container, f"n132/arvo:{local_id}-fix",
+             "sleep", str(COMPILE_TIMEOUT + 600)], check=True, capture_output=True)
+        try:
+            docker_exec(container,
+                        "sed -i 's#/depot_tools/ninja -C#/depot_tools/ninja -j3 -C#g' "
+                        "/src/build.sh 2>/dev/null || true", timeout=30)
+            env = env_prefix(compile_env(bug))
+            build_res = docker_exec(container, "cd /src/mruby && {env} compile".format(env=env),
+                                    timeout=COMPILE_TIMEOUT)
+            if build_res.returncode != 0:
+                raise OracleError("fix container compile failed when building probe goldens")
+
+            # Sanity gate before running probes.
+            chk = docker_exec(container, "test -x /src/mruby/bin/mruby", timeout=10)
+            if chk.returncode != 0:
+                raise OracleError("fix container missing bin/mruby after compile")
+
+            goldens = {}
+            for label, text in zip(script_labels, script_texts):
+                r = self.run_script(container, text)
+                goldens[label] = {"exit": r[0], "stdout": r[1]}
+
+            GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
+            golden_path.write_text(json.dumps(goldens, indent=2))
+            return goldens
+        finally:
+            subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+
+    def check_mruby_binary(self, container: str) -> None:
+        """Raise OracleError if bin/mruby is missing — catches silent infra failures."""
+        r = docker_exec(container, "test -x /src/mruby/bin/mruby", timeout=10)
+        if r.returncode != 0:
+            raise OracleError(f"container {container} missing /src/mruby/bin/mruby after compile")
 
     def start_fix(self, local_id: int) -> str:
         container = f"arvo-{local_id}-oracle-fix"
