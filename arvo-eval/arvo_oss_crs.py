@@ -133,6 +133,27 @@ def copy_session_files(run_dir: Path, output_dir: Path) -> None:
         shutil.copy2(log, output_dir / "oss_crs_claude_stdout.log")
 
 
+def parse_token_counts(log_path: Path) -> dict:
+    """Sum token usage across all API calls in a claude_stdout.log."""
+    inp = out = cache_r = cache_w = 0
+    seen: set = set()
+    try:
+        for line in log_path.read_text().splitlines():
+            obj = json.loads(line)
+            u = obj.get("message", {}).get("usage", {})
+            req_id = obj.get("request_id")
+            if u and req_id and req_id not in seen:
+                seen.add(req_id)
+                inp += u.get("input_tokens", 0)
+                out += u.get("output_tokens", 0)
+                cache_r += u.get("cache_read_input_tokens", 0)
+                cache_w += u.get("cache_creation_input_tokens", 0)
+    except Exception:
+        pass
+    return {"input_tokens": inp, "output_tokens": out,
+            "cache_read_tokens": cache_r, "cache_write_tokens": cache_w}
+
+
 def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     """Run crs-claude-code on one ARVO bug. Returns a summary dict."""
     bug = load_bug(bug_id)
@@ -199,12 +220,14 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
         print(f"[{bug_id}] Saved session files to {output_dir}")
 
     n_patches = meta.get("totals", {}).get("artifacts", {}).get("patches", 0)
+    tokens = parse_token_counts(output_dir / "oss_crs_claude_stdout.log")
     summary = {
         "bug_id": bug_id,
         "project": bug["project"],
         "elapsed_seconds": round(run_elapsed),
         "patches": n_patches,
         "patch_files": [str(output_dir / f"oss_crs_patch_{i}.diff") for i in range(len(patches))],
+        "tokens": tokens,
         "meta": meta,
     }
 

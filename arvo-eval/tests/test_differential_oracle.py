@@ -114,6 +114,14 @@ class FakeOps:
         side = self._agent if container == "agent-c" else self._fix
         return side.get("poc", (0, ""))
 
+    def check_mruby_binary(self, container):
+        pass  # assume binary present in tests
+
+    def get_probe_goldens(self, bug, local_id, script_texts, script_labels):
+        return {label: {"exit": self._fix.get(text, (0, ""))[0],
+                        "stdout": self._fix.get(text, (0, ""))[1]}
+                for label, text in zip(script_labels, script_texts)}
+
     def run_script(self, container, script_text):
         side = self._agent if container == "agent-c" else self._fix
         return side.get(script_text, (0, ""))
