@@ -1,4 +1,5 @@
-"""Compose-file selection and local-model preflight reachability check."""
+"""Compose-file selection, preflight reachability, and token-count parsing."""
+import json
 from pathlib import Path
 
 import pytest
@@ -46,3 +47,56 @@ def test_reachability_raises_actionable_error_when_endpoint_down():
     msg = str(exc.value)
     assert "unreachable" in msg
     assert "172.17.0.1:8080:localhost:8080" in msg   # tells the user how to fix it
+
+
+def _write_log(tmp_path, records):
+    p = tmp_path / "claude_stdout.log"
+    p.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    return p
+
+
+def test_token_counts_keyed_on_message_id(tmp_path):
+    # Local model / Claude Code CLI: usage rides on assistant messages keyed by
+    # message.id, with NO top-level request_id. The same id repeats across stream
+    # events (partial then final usage), so we take the max per id then sum.
+    log = _write_log(tmp_path, [
+        # streaming start: input known, output partial
+        {"type": "assistant", "message": {"id": "resp_A",
+            "usage": {"input_tokens": 67020, "output_tokens": 2}}},
+        # streaming final for the SAME turn: full output — must not double-count input
+        {"type": "assistant", "message": {"id": "resp_A",
+            "usage": {"input_tokens": 67020, "output_tokens": 941}}},
+        # a pure content delta with zeroed usage — ignored
+        {"type": "assistant", "message": {"id": "resp_A",
+            "usage": {"input_tokens": 0, "output_tokens": 0}}},
+        # a second distinct turn
+        {"type": "assistant", "message": {"id": "resp_B",
+            "usage": {"input_tokens": 100, "output_tokens": 50,
+                      "cache_read_input_tokens": 30, "cache_creation_input_tokens": 10}}},
+    ])
+    assert arvo_oss_crs.parse_token_counts(log) == {
+        "input_tokens": 67020 + 100,
+        "output_tokens": 941 + 50,
+        "cache_read_tokens": 30,
+        "cache_write_tokens": 10,
+    }
+
+
+def test_token_counts_backward_compatible_with_request_id(tmp_path):
+    # Older logs keyed usage by top-level request_id — still supported.
+    log = _write_log(tmp_path, [
+        {"request_id": "req_1", "message": {"usage": {"input_tokens": 5, "output_tokens": 7}}},
+        {"request_id": "req_1", "message": {"usage": {"input_tokens": 5, "output_tokens": 7}}},
+        {"request_id": "req_2", "message": {"usage": {"input_tokens": 3, "output_tokens": 2}}},
+    ])
+    assert arvo_oss_crs.parse_token_counts(log) == {
+        "input_tokens": 8, "output_tokens": 9,
+        "cache_read_tokens": 0, "cache_write_tokens": 0,
+    }
+
+
+def test_token_counts_missing_file_is_zeroed(tmp_path):
+    assert arvo_oss_crs.parse_token_counts(tmp_path / "nope.log") == {
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_read_tokens": 0, "cache_write_tokens": 0,
+    }
