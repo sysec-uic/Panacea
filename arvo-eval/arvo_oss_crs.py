@@ -22,6 +22,7 @@ import os
 import shutil
 import subprocess
 import time
+import urllib.request
 from pathlib import Path
 
 from build_instance import load_bug
@@ -36,6 +37,38 @@ def _compose_file() -> Path:
 
 
 COMPOSE_FILE = _compose_file()
+
+# The docker-bridge address the LiteLLM container dials for the tunneled local
+# model; the host can reach it only when the SSH tunnel's second -L binding is up,
+# so probing it here is a faithful proxy for "the container will be able to connect."
+LOCAL_MODEL_HEALTHCHECK = os.environ.get(
+    "OSS_CRS_LOCAL_MODEL_HEALTHCHECK", "http://172.17.0.1:8080/v1/models")
+
+
+def _uses_local_model(compose_file: Path) -> bool:
+    """The local-model compose routes through LiteLLM to the tunneled server; the
+    OAuth compose talks to Anthropic directly and needs no local endpoint."""
+    return "oauth" not in compose_file.name
+
+
+def check_local_model_reachable(url: str = None, *, timeout: float = 4.0,
+                                opener=urllib.request.urlopen) -> None:
+    """Fail fast if the local model endpoint is unreachable. A dead SSH tunnel
+    otherwise wastes a full CRS spin-up and surfaces only as a buried LiteLLM 500
+    on the agent's first turn (num_turns=1, no patch)."""
+    url = url or LOCAL_MODEL_HEALTHCHECK
+    try:
+        opener(url, timeout=timeout)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Local model endpoint unreachable at {url}: {exc}. The repair agent "
+            f"runs on the tunneled local model, so this run would fail on its first "
+            f"turn with a LiteLLM 500. Restart the SSH tunnel WITH the docker-bridge "
+            f"binding:\n"
+            f"  ssh -L 8080:localhost:8080 -L 172.17.0.1:8080:localhost:8080 user@llm-server\n"
+            f"Or run against Claude via OAuth: export CLAUDE_CODE_OAUTH_TOKEN and set "
+            f"OSS_CRS_COMPOSE_FILE=$HOME/oss-crs/example/crs-claude-code/compose-oauth.yaml."
+        ) from exc
 PROJECTS_DIR = Path.home() / ".arvo-oss-crs"   # stable per-bug project dirs live here
 RESULTS_DIR = Path(__file__).parent / "results"
 
@@ -164,6 +197,10 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     _pass = os.environ.get("LEARN_PASS", "")
     output_dir = RESULTS_DIR / _pass / str(bug_id) if _pass else RESULTS_DIR / str(bug_id)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Preflight: don't spin up a whole CRS run against a dead tunnel.
+    if _uses_local_model(COMPOSE_FILE):
+        check_local_model_reachable()
 
     generate_fake_oss_fuzz_project(bug, project_dir)
 
