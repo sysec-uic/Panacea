@@ -1,7 +1,7 @@
 import json
 import pytest
 from llm import (call_llm, with_retries, _client_args, OAUTH_BETA,
-                 _select_backend, ClaudeCLIClient, have_credentials)
+                 _select_backend, ClaudeCLIClient, OpenAIClient, have_credentials)
 
 
 class Boom(Exception):
@@ -118,7 +118,8 @@ def test_raises_without_any_credential(monkeypatch):
 
 def _clear_backend(monkeypatch):
     _clear(monkeypatch)
-    monkeypatch.delenv("LLM_BACKEND", raising=False)
+    for k in ("LLM_BACKEND", "OPENAI_BASE_URL", "OPENAI_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
 
 
 def test_backend_explicit_env_wins(monkeypatch):
@@ -184,6 +185,79 @@ def test_cli_client_raises_on_error_payload(monkeypatch):
     with pytest.raises(RuntimeError, match="claude CLI reported an error"):
         ClaudeCLIClient().messages.create(model="m", max_tokens=1, system="",
                                           messages=[{"role": "user", "content": "x"}])
+
+
+# --- OpenAI-compatible backend (local llama.cpp / LiteLLM) -------------------
+
+def test_backend_openai_explicit(monkeypatch):
+    _clear_backend(monkeypatch)
+    monkeypatch.setenv("LLM_BACKEND", "openai")
+    assert _select_backend() == "openai"
+    assert have_credentials() is True  # local server needs no real key
+
+
+def test_backend_auto_openai_when_base_url_set(monkeypatch):
+    # No API key, no Anthropic endpoint — but an OpenAI-compatible base URL is
+    # configured (the llama.cpp SSH tunnel). Prefer it over the claude CLI.
+    _clear_backend(monkeypatch)
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:8080/v1")
+    monkeypatch.setattr("llm.shutil.which", lambda _: "/usr/bin/claude")
+    assert _select_backend() == "openai"
+
+
+def test_backend_api_key_beats_auto_openai(monkeypatch):
+    # An Anthropic API key wins over a stray OPENAI_BASE_URL (other tools export
+    # it globally); LLM_BACKEND=openai is the explicit override.
+    _clear_backend(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:8080/v1")
+    assert _select_backend() == "api"
+
+
+def test_openai_client_maps_anthropic_call_shape(monkeypatch):
+    seen = {}
+
+    class _Completions:
+        def create(self, **kw):
+            seen.update(kw)
+            msg = type("M", (), {"content": '{"root":"uaf"}'})()
+            choice = type("C", (), {"message": msg})()
+            return type("R", (), {"choices": [choice]})()
+
+    class _Chat:
+        completions = _Completions()
+
+    class _SDK:
+        chat = _Chat()
+
+    client = OpenAIClient(client=_SDK())
+    resp = client.messages.create(model="claude-opus-4-8", max_tokens=1024,
+                                  system="be terse",
+                                  messages=[{"role": "user", "content": "hi"}])
+    assert "".join(b.text for b in resp.content) == '{"root":"uaf"}'
+    assert seen["model"] == "claude-opus-4-8"
+    assert seen["max_tokens"] == 1024
+    # system prompt becomes the leading chat message; user turn follows
+    assert seen["messages"][0] == {"role": "system", "content": "be terse"}
+    assert seen["messages"][1] == {"role": "user", "content": "hi"}
+
+
+def test_openai_client_defaults_to_tunnel_endpoint(monkeypatch):
+    _clear_backend(monkeypatch)
+    from llm import _openai_args
+    args = _openai_args()
+    assert args["base_url"] == "http://localhost:8080/v1"
+    assert args["api_key"] == "sk-local-dummy"  # llama.cpp ignores the key
+
+
+def test_openai_client_honors_env_overrides(monkeypatch):
+    _clear_backend(monkeypatch)
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://172.17.0.1:4000/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-litellm")
+    from llm import _openai_args
+    args = _openai_args()
+    assert args["base_url"] == "http://172.17.0.1:4000/v1"
+    assert args["api_key"] == "sk-litellm"
 
 
 def test_cli_client_raises_on_nonzero_exit(monkeypatch):
