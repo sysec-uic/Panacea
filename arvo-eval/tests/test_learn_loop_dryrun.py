@@ -215,6 +215,43 @@ def test_divergent_lesson_is_learned_tests_only(dryrun_kwargs):
     assert rec["n_divergences"] == 1
 
 
+def test_oracle_error_detail_is_recorded_in_ledger(dryrun_kwargs):
+    # grade()'s error path returns an "error" string; the ledger must keep it or
+    # oracle_error records are undiagnosable after the fact (439237851).
+    def erroring_grade(bug, diff):
+        return {"label": "oracle_error", "fix_image_available": True,
+                "divergences": [], "error": "docker: golden probe timed out"}
+
+    kw = dryrun_kwargs(solved=True)
+    run_pass(**{**kw, "grade": erroring_grade})
+    from ledger import read_records
+    rec = read_records(kw["ledger_path"])[-1]
+    assert rec["oracle_label"] == "oracle_error"
+    assert rec["oracle_error"] == "docker: golden probe timed out"
+
+
+def test_default_verify_delegates_to_verify_fix(monkeypatch):
+    # _default_verify used to bless ANY non-empty diff as verified_correct, so the
+    # feedback/retry loop never fired in real runs. It must call verify_fix.verify.
+    import learn_loop
+    import verify_fix
+    calls = []
+
+    def fake_verify(bug_id):
+        calls.append(bug_id)
+        return {"classification": "still_crashes", "run_output_tail": "boom"}
+
+    monkeypatch.setattr(verify_fix, "verify", fake_verify)
+    out = learn_loop._default_verify(7, "--- a/x\n+++ b/x\n")
+    assert out["classification"] == "still_crashes"
+    assert calls == [7]
+
+
+def test_default_verify_empty_diff_needs_no_docker():
+    import learn_loop
+    assert learn_loop._default_verify(7, "   ")["classification"] == "no_changes"
+
+
 def test_no_fix_learns_as_tests_only(dryrun_kwargs):
     kw = dryrun_kwargs(solved=True)
     run_pass(**{**kw, "grade": _grade_stub("no_fix_available")})

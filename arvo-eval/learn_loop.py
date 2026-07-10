@@ -37,9 +37,13 @@ def _default_agent(bug_id, project_dir, skip_build):
 
 
 def _default_verify(bug_id, diff):
+    """Real verification: rebuild in a fresh -vul container, re-run the PoC, run the
+    correctness gate. verify_fix reads results/<pass>/<id>/patch.diff, which
+    _default_agent bridges from the OSS-CRS patch naming."""
     if not diff.strip():
         return {"classification": "no_changes"}
-    return {"classification": "verified_correct"}
+    import verify_fix
+    return verify_fix.verify(bug_id)
 
 
 def _default_extract(bug, diff, trajectory_summary, verdict):
@@ -114,7 +118,10 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
             verdict = grade(bug, result["accepted"]["diff"])
             oracle_fields = {"oracle_label": verdict["label"],
                              "fix_image_available": verdict["fix_image_available"],
-                             "n_divergences": len(verdict["divergences"])}
+                             "n_divergences": len(verdict["divergences"]),
+                             # Keep the grader's error string, or oracle_error
+                             # records are undiagnosable after the fact.
+                             **({"oracle_error": verdict["error"]} if "error" in verdict else {})}
 
         # Record the outcome BEFORE the fragile LLM extraction below. A solved bug's
         # repair is expensive; if the extractor rate-limits we must not discard it.

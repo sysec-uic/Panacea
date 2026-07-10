@@ -55,6 +55,13 @@ def test_exhausts_attempts_without_solving():
     assert len(result["attempts"]) == 3
 
 
+def test_feedback_for_harness_patch_redirects_to_project_code():
+    fb = describe_feedback({"classification": "patch_touches_harness"})
+    assert "harness" in fb.lower()
+    # It must steer the agent to the project source, not just say "rejected".
+    assert "project" in fb.lower()
+
+
 def test_feedback_never_references_the_fix_image():
     fb = describe_feedback({"classification": "fixed_tests_failed", "make_test_tail": "x"})
     assert "-fix" not in fb and "ground-truth" not in fb.lower()
