@@ -22,6 +22,7 @@ import os
 import shutil
 import subprocess
 import time
+import urllib.request
 from pathlib import Path
 
 from build_instance import load_bug
@@ -36,6 +37,38 @@ def _compose_file() -> Path:
 
 
 COMPOSE_FILE = _compose_file()
+
+# The docker-bridge address the LiteLLM container dials for the tunneled local
+# model; the host can reach it only when the SSH tunnel's second -L binding is up,
+# so probing it here is a faithful proxy for "the container will be able to connect."
+LOCAL_MODEL_HEALTHCHECK = os.environ.get(
+    "OSS_CRS_LOCAL_MODEL_HEALTHCHECK", "http://172.17.0.1:8080/v1/models")
+
+
+def _uses_local_model(compose_file: Path) -> bool:
+    """The local-model compose routes through LiteLLM to the tunneled server; the
+    OAuth compose talks to Anthropic directly and needs no local endpoint."""
+    return "oauth" not in compose_file.name
+
+
+def check_local_model_reachable(url: str = None, *, timeout: float = 4.0,
+                                opener=urllib.request.urlopen) -> None:
+    """Fail fast if the local model endpoint is unreachable. A dead SSH tunnel
+    otherwise wastes a full CRS spin-up and surfaces only as a buried LiteLLM 500
+    on the agent's first turn (num_turns=1, no patch)."""
+    url = url or LOCAL_MODEL_HEALTHCHECK
+    try:
+        opener(url, timeout=timeout)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Local model endpoint unreachable at {url}: {exc}. The repair agent "
+            f"runs on the tunneled local model, so this run would fail on its first "
+            f"turn with a LiteLLM 500. Restart the SSH tunnel WITH the docker-bridge "
+            f"binding:\n"
+            f"  ssh -L 8080:localhost:8080 -L 172.17.0.1:8080:localhost:8080 user@llm-server\n"
+            f"Or run against Claude via OAuth: export CLAUDE_CODE_OAUTH_TOKEN and set "
+            f"OSS_CRS_COMPOSE_FILE=$HOME/oss-crs/example/crs-claude-code/compose-oauth.yaml."
+        ) from exc
 PROJECTS_DIR = Path.home() / ".arvo-oss-crs"   # stable per-bug project dirs live here
 RESULTS_DIR = Path(__file__).parent / "results"
 
@@ -134,24 +167,37 @@ def copy_session_files(run_dir: Path, output_dir: Path) -> None:
 
 
 def parse_token_counts(log_path: Path) -> dict:
-    """Sum token usage across all API calls in a claude_stdout.log."""
-    inp = out = cache_r = cache_w = 0
-    seen: set = set()
+    """Sum token usage across all API calls in a claude_stdout.log.
+
+    Usage is deduplicated per response: older logs carry a top-level `request_id`,
+    but the Claude Code CLI driving the local model emits none -- it keys each
+    response by `message.id` and repeats that id across stream events (a partial
+    `output_tokens` at message start, the final count later). So we take the MAX
+    usage seen per id, then sum across distinct ids. Keying on request_id alone
+    (the old behavior) silently reported zero tokens for every local run.
+    """
+    per_id: dict = {}
     try:
         for line in log_path.read_text().splitlines():
             obj = json.loads(line)
-            u = obj.get("message", {}).get("usage", {})
-            req_id = obj.get("request_id")
-            if u and req_id and req_id not in seen:
-                seen.add(req_id)
-                inp += u.get("input_tokens", 0)
-                out += u.get("output_tokens", 0)
-                cache_r += u.get("cache_read_input_tokens", 0)
-                cache_w += u.get("cache_creation_input_tokens", 0)
+            msg = obj.get("message", {})
+            u = msg.get("usage") or {}
+            key = obj.get("request_id") or msg.get("id")
+            if not u or not key:
+                continue
+            d = per_id.setdefault(key, {"in": 0, "out": 0, "cr": 0, "cw": 0})
+            d["in"] = max(d["in"], u.get("input_tokens", 0))
+            d["out"] = max(d["out"], u.get("output_tokens", 0))
+            d["cr"] = max(d["cr"], u.get("cache_read_input_tokens", 0))
+            d["cw"] = max(d["cw"], u.get("cache_creation_input_tokens", 0))
     except Exception:
         pass
-    return {"input_tokens": inp, "output_tokens": out,
-            "cache_read_tokens": cache_r, "cache_write_tokens": cache_w}
+    return {
+        "input_tokens": sum(d["in"] for d in per_id.values()),
+        "output_tokens": sum(d["out"] for d in per_id.values()),
+        "cache_read_tokens": sum(d["cr"] for d in per_id.values()),
+        "cache_write_tokens": sum(d["cw"] for d in per_id.values()),
+    }
 
 
 def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
@@ -164,6 +210,10 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     _pass = os.environ.get("LEARN_PASS", "")
     output_dir = RESULTS_DIR / _pass / str(bug_id) if _pass else RESULTS_DIR / str(bug_id)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Preflight: don't spin up a whole CRS run against a dead tunnel.
+    if _uses_local_model(COMPOSE_FILE):
+        check_local_model_reachable()
 
     generate_fake_oss_fuzz_project(bug, project_dir)
 
@@ -232,7 +282,8 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     }
 
     (output_dir / "oss_crs_result.json").write_text(json.dumps(summary, indent=2))
-    print(f"[{bug_id}] Done. Patches: {n_patches}, elapsed: {run_elapsed:.0f}s")
+    print(f"[{bug_id}] Done. Patches: {n_patches}, elapsed: {run_elapsed:.0f}s, "
+          f"tokens: {tokens['input_tokens']} in / {tokens['output_tokens']} out")
     return summary
 
 
