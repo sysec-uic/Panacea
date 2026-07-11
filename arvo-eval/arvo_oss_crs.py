@@ -19,6 +19,7 @@ Prerequisites:
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -230,6 +231,55 @@ def parse_token_counts(log_path: Path) -> dict:
     }
 
 
+def _run_epoch(s: str) -> int:
+    """OSS-CRS embeds a 10-digit epoch in run/build ids (test-1783442751bt,
+    crs_compose_1783528430al-...); it orders disposables by age."""
+    m = re.search(r"(\d{10})", s)
+    return int(m.group(1)) if m else 0
+
+
+def stale_docker_images(images: list, *, keep: int = 2) -> list[str]:
+    """Pick per-run OSS-CRS disposables to delete: test-*/build-* snapshots beyond
+    the newest `keep` per kind, and crs_compose_<runid>-* image sets of every run
+    but the newest. content-* snapshots are the incremental-build cache and other
+    repos (ARVO images etc.) are not ours -- both stay untouched.
+    `images` is a list of (repository, tag) pairs."""
+    stale = []
+    snap_tags = [t for r, t in images if r == "oss-crs-snapshot"]
+    for kind in ("test-", "build-"):
+        tags = sorted((t for t in snap_tags if t.startswith(kind)),
+                      key=_run_epoch, reverse=True)
+        stale += [f"oss-crs-snapshot:{t}" for t in tags[keep:]]
+
+    compose = [(r, t) for r, t in images if r.startswith("crs_compose_")]
+    run_ids = sorted({r.split("-", 1)[0] for r, _ in compose},
+                     key=_run_epoch, reverse=True)
+    dead = set(run_ids[1:])
+    stale += [f"{r}:{t}" for r, t in compose if r.split("-", 1)[0] in dead]
+    return stale
+
+
+def cleanup_docker_images(*, keep: int = None, run=subprocess.run) -> list[str]:
+    """Delete stale per-run OSS-CRS docker images after each run; every run tags a
+    fresh ~9GB snapshot pair that otherwise accumulates forever. `docker rmi` is
+    used WITHOUT -f, so anything still referenced by a container survives.
+    OSS_CRS_DOCKER_CLEANUP=0 disables; OSS_CRS_DOCKER_KEEP overrides `keep`."""
+    if os.environ.get("OSS_CRS_DOCKER_CLEANUP", "1") == "0":
+        return []
+    keep = keep if keep is not None else int(os.environ.get("OSS_CRS_DOCKER_KEEP", "2"))
+    out = run(["docker", "images", "--format", "{{.Repository}} {{.Tag}}"],
+              capture_output=True, text=True)
+    images = [tuple(parts) for line in out.stdout.splitlines()
+              if len(parts := line.split()) == 2]
+    stale = stale_docker_images(images, keep=keep)
+    for ref in stale:
+        run(["docker", "rmi", ref], capture_output=True, text=True)
+    run(["docker", "image", "prune", "-f"], capture_output=True, text=True)
+    if stale:
+        print(f"[cleanup] removed {len(stale)} stale OSS-CRS images")
+    return stale
+
+
 def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     """Run crs-claude-code on one ARVO bug. Returns a summary dict."""
     bug = load_bug(bug_id)
@@ -312,6 +362,10 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
         "tokens": tokens,
         "meta": meta,
     }
+
+    # Each run tags fresh multi-GB snapshot/compose images; reap the stale ones
+    # now so a long campaign doesn't fill the disk.
+    cleanup_docker_images()
 
     (output_dir / "oss_crs_result.json").write_text(json.dumps(summary, indent=2))
     print(f"[{bug_id}] Done. Patches: {n_patches}, elapsed: {run_elapsed:.0f}s, "
