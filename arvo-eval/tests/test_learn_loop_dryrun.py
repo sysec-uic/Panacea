@@ -252,6 +252,41 @@ def test_default_verify_empty_diff_needs_no_docker():
     assert learn_loop._default_verify(7, "   ")["classification"] == "no_changes"
 
 
+def test_default_agent_ignores_stale_patch_from_previous_run(tmp_path, monkeypatch):
+    # 439237851 attempt-1 regression: the CRS run produced no patch, but a stale
+    # oss_crs_patch_0.diff from an OLD run was still in the results dir and got
+    # verified (and fed back) as if this attempt produced it. Only patches listed
+    # in THIS run's summary may count.
+    import learn_loop
+    import arvo_oss_crs
+    monkeypatch.setattr(learn_loop, "RESULTS_BASE", tmp_path)
+    monkeypatch.delenv("LEARN_PASS", raising=False)
+    d = tmp_path / "42"
+    d.mkdir()
+    (d / "oss_crs_patch_0.diff").write_text("STALE DIFF")
+    monkeypatch.setattr(arvo_oss_crs, "run_oss_crs",
+                        lambda bug_id, skip_build=False: {"patch_files": []})
+    run = learn_loop._default_agent(42, tmp_path / "proj", True)
+    assert run["diff"] == ""
+
+
+def test_default_agent_reads_patch_from_this_runs_summary(tmp_path, monkeypatch):
+    import learn_loop
+    import arvo_oss_crs
+    monkeypatch.setattr(learn_loop, "RESULTS_BASE", tmp_path)
+    monkeypatch.delenv("LEARN_PASS", raising=False)
+    d = tmp_path / "42"
+    d.mkdir()
+    fresh = d / "oss_crs_patch_0.diff"
+    fresh.write_text("FRESH DIFF")
+    monkeypatch.setattr(arvo_oss_crs, "run_oss_crs",
+                        lambda bug_id, skip_build=False: {"patch_files": [str(fresh)]})
+    run = learn_loop._default_agent(42, tmp_path / "proj", True)
+    assert run["diff"] == "FRESH DIFF"
+    # The verify bridge is refreshed from the fresh patch.
+    assert (d / "patch.diff").read_text() == "FRESH DIFF"
+
+
 def test_no_fix_learns_as_tests_only(dryrun_kwargs):
     kw = dryrun_kwargs(solved=True)
     run_pass(**{**kw, "grade": _grade_stub("no_fix_available")})
