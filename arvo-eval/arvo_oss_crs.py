@@ -69,6 +69,36 @@ def check_local_model_reachable(url: str = None, *, timeout: float = 4.0,
             f"Or run against Claude via OAuth: export CLAUDE_CODE_OAUTH_TOKEN and set "
             f"OSS_CRS_COMPOSE_FILE=$HOME/oss-crs/example/crs-claude-code/compose-oauth.yaml."
         ) from exc
+
+
+def wait_for_local_model(url: str = None, *, poll_seconds: float = 15.0,
+                         timeout: float = 4.0, opener=urllib.request.urlopen,
+                         sleep=time.sleep) -> None:
+    """Block until the local model endpoint answers, polling every `poll_seconds`.
+
+    The SSH tunnel to the model server sometimes drops mid-campaign; raising there
+    (check_local_model_reachable) kills a multi-hour learn_loop run that would resume
+    fine once the tunnel is restarted. So the run-level preflight waits instead of
+    failing: print the actionable restart instructions once, then poll quietly until
+    the tunnel is back.
+    """
+    url = url or LOCAL_MODEL_HEALTHCHECK
+    waited = 0.0
+    while True:
+        try:
+            check_local_model_reachable(url, timeout=timeout, opener=opener)
+            if waited:
+                print(f"[preflight] Local model endpoint reachable again after ~{waited:.0f}s; resuming.")
+            return
+        except RuntimeError as exc:
+            if not waited:
+                print(f"[preflight] {exc}")
+                print(f"[preflight] Waiting for the tunnel instead of failing; "
+                      f"re-probing every {poll_seconds:.0f}s...")
+            sleep(poll_seconds)
+            waited += poll_seconds
+
+
 PROJECTS_DIR = Path.home() / ".arvo-oss-crs"   # stable per-bug project dirs live here
 RESULTS_DIR = Path(__file__).parent / "results"
 
@@ -211,9 +241,11 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     output_dir = RESULTS_DIR / _pass / str(bug_id) if _pass else RESULTS_DIR / str(bug_id)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Preflight: don't spin up a whole CRS run against a dead tunnel.
+    # Preflight: don't spin up a whole CRS run against a dead tunnel. Runs before
+    # every attempt, so it also blocks (rather than crashes the campaign) when the
+    # tunnel dies mid-run -- the next attempt waits for it to come back.
     if _uses_local_model(COMPOSE_FILE):
-        check_local_model_reachable()
+        wait_for_local_model()
 
     generate_fake_oss_fuzz_project(bug, project_dir)
 

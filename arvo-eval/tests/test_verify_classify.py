@@ -48,6 +48,68 @@ def test_verified_correct():
     ) == "verified_correct"
 
 
+HARNESS_DIFF = (
+    "diff --git a/mruby/oss-fuzz/proto_to_ruby.cpp b/mruby/oss-fuzz/proto_to_ruby.cpp\n"
+    "--- a/mruby/oss-fuzz/proto_to_ruby.cpp\n"
+    "+++ b/mruby/oss-fuzz/proto_to_ruby.cpp\n"
+    "@@ -1 +1 @@\n-x\n+y\n"
+)
+
+
+def test_changed_paths_parses_git_diff():
+    assert verify_fix.changed_paths(HARNESS_DIFF) == ["mruby/oss-fuzz/proto_to_ruby.cpp"]
+
+
+def test_changed_paths_includes_deleted_files():
+    diff = ("diff --git a/mruby/oss-fuzz/mruby_fuzzer.c b/mruby/oss-fuzz/mruby_fuzzer.c\n"
+            "--- a/mruby/oss-fuzz/mruby_fuzzer.c\n"
+            "+++ /dev/null\n")
+    assert verify_fix.changed_paths(diff) == ["mruby/oss-fuzz/mruby_fuzzer.c"]
+
+
+def test_touches_harness_by_oss_fuzz_dir():
+    assert verify_fix.touches_harness(HARNESS_DIFF) is True
+
+
+def test_touches_harness_by_fuzzer_basename():
+    diff = "--- a/src/mruby_fuzzer.c\n+++ b/src/mruby_fuzzer.c\n"
+    assert verify_fix.touches_harness(diff) is True
+
+
+def test_touches_harness_false_for_project_source():
+    diff = ("--- a/mruby/src/array.c\n+++ b/mruby/src/array.c\n"
+            "--- a/mrbgems/mruby-set/src/set.c\n+++ b/mrbgems/mruby-set/src/set.c\n")
+    assert verify_fix.touches_harness(diff) is False
+
+
+def test_classify_harness_patch_rejected_even_when_everything_passes():
+    # 439237851 regression: a harness rewrite dodges the PoC and passes `rake test`,
+    # so no downstream signal catches it -- the path check is the only gate.
+    assert classify_run(
+        sanitizer="asan", diff=HARNESS_DIFF, apply_ok=True, build_ok=True,
+        run_output="ok", run_returncode=0, make_test_ok=True,
+    ) == "patch_touches_harness"
+
+
+def test_verify_rejects_harness_patch_before_any_docker(tmp_path, monkeypatch):
+    # The guard must short-circuit before a container is ever started.
+    monkeypatch.setattr(verify_fix, "RESULTS_DIR", tmp_path)
+    monkeypatch.delenv("LEARN_PASS", raising=False)
+    monkeypatch.setattr(verify_fix, "load_bug", lambda bug_id: {"localId": bug_id})
+    monkeypatch.setattr(verify_fix, "build_instance",
+                        lambda bug: {"instance_id": bug["localId"], "project": "mruby",
+                                     "image_name": "unused"})
+
+    def no_docker(*args, **kwargs):
+        raise AssertionError("Docker must not be touched for a harness patch")
+    monkeypatch.setattr(verify_fix.subprocess, "run", no_docker)
+
+    d = tmp_path / "7"
+    d.mkdir()
+    (d / "patch.diff").write_text(HARNESS_DIFF)
+    assert verify_fix.verify(7)["classification"] == "patch_touches_harness"
+
+
 def test_results_dir_respects_learn_pass(tmp_path, monkeypatch):
     # Under LEARN_PASS, verify must read/write the same namespaced dir the agent
     # writes to (results/<pass>/<bug_id>/), or it never finds the patch.

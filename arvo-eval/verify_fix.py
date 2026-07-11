@@ -6,6 +6,7 @@ input to classify the outcome.
 
 Classifications:
 - no_changes: the agent's diff was empty, nothing to verify
+- patch_touches_harness: the diff modifies fuzz-harness scaffolding, not the project
 - patch_apply_failed: the diff didn't apply cleanly to a fresh checkout
 - build_failed: `compile` failed after applying the patch
 - still_crashes: the rebuilt fuzz target still crashes on /tmp/poc
@@ -61,6 +62,34 @@ SANITIZER_SIGNATURES = {
 }
 
 
+def changed_paths(diff: str) -> list[str]:
+    """Paths a git diff touches, in order, deduped. Reads both `--- a/` and
+    `+++ b/` headers so deleted files (whose new side is /dev/null) still count."""
+    paths = []
+    for line in diff.splitlines():
+        for prefix in ("--- a/", "+++ b/"):
+            if line.startswith(prefix):
+                p = line[len(prefix):].strip()
+                if p and p not in paths:
+                    paths.append(p)
+    return paths
+
+
+def touches_harness(diff: str) -> bool:
+    """True if the diff modifies fuzz-harness scaffolding rather than the project.
+
+    A harness rewrite can dodge the PoC AND pass the project's test suite AND show
+    no divergence to the differential oracle (none of them exercise the harness), so
+    this path check is the only gate that catches it. Deployed harnesses can't
+    change, so such a patch is never a fix.
+    """
+    for path in changed_paths(diff):
+        parts = path.split("/")
+        if "oss-fuzz" in parts or "fuzz" in parts[-1].lower():
+            return True
+    return False
+
+
 def crashed(sanitizer: str, run_output: str) -> bool:
     sigs = SANITIZER_SIGNATURES.get(sanitizer.lower(), ("ERROR: AddressSanitizer",))
     return any(sig in run_output for sig in sigs)
@@ -78,11 +107,14 @@ def classify_run(
 ) -> str:
     """Pure classification of a verification run. No Docker, fully testable.
 
-    Returns one of: no_changes, patch_apply_failed, build_failed, still_crashes,
-    unexpected_exit, fixed_tests_failed, verified_correct.
+    Returns one of: no_changes, patch_touches_harness, patch_apply_failed,
+    build_failed, still_crashes, unexpected_exit, fixed_tests_failed,
+    verified_correct.
     """
     if not diff.strip():
         return "no_changes"
+    if touches_harness(diff):
+        return "patch_touches_harness"
     if not apply_ok:
         return "patch_apply_failed"
     if not build_ok:
@@ -163,6 +195,11 @@ def verify(bug_id: int, keep: bool = False) -> dict:
 
     if not diff.strip():
         verification["classification"] = "no_changes"
+        return save(instance, verification)
+
+    if touches_harness(diff):
+        verification["classification"] = "patch_touches_harness"
+        verification["harness_paths"] = changed_paths(diff)
         return save(instance, verification)
 
     container = f"arvo-{instance['instance_id']}-verify"

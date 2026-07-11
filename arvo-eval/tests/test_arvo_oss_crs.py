@@ -49,6 +49,37 @@ def test_reachability_raises_actionable_error_when_endpoint_down():
     assert "172.17.0.1:8080:localhost:8080" in msg   # tells the user how to fix it
 
 
+def test_wait_returns_immediately_when_endpoint_up():
+    sleeps = []
+    arvo_oss_crs.wait_for_local_model(
+        "http://172.17.0.1:8080/v1/models",
+        opener=lambda url, timeout: None,
+        sleep=sleeps.append)
+    assert sleeps == []
+
+
+def test_wait_blocks_until_tunnel_comes_back(capsys):
+    # Tunnel is down for the first two probes, then recovers. The wait must
+    # survive the outage (no exception), sleeping between probes, and return
+    # once the endpoint answers.
+    attempts = []
+
+    def flaky(url, timeout):
+        attempts.append(url)
+        if len(attempts) <= 2:
+            raise OSError("Connection refused")
+
+    sleeps = []
+    arvo_oss_crs.wait_for_local_model(
+        "http://172.17.0.1:8080/v1/models",
+        poll_seconds=7, opener=flaky, sleep=sleeps.append)
+    assert len(attempts) == 3
+    assert sleeps == [7, 7]
+    out = capsys.readouterr().out
+    assert "172.17.0.1:8080:localhost:8080" in out   # tells the user how to restart the tunnel
+    assert "reachable again" in out                  # announces recovery
+
+
 def _write_log(tmp_path, records):
     p = tmp_path / "claude_stdout.log"
     p.write_text("\n".join(json.dumps(r) for r in records) + "\n")
