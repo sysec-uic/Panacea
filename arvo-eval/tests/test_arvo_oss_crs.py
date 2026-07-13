@@ -246,6 +246,30 @@ def test_find_shared_dir_none_when_no_run(tmp_path, monkeypatch):
     assert arvo_oss_crs.find_shared_dir("asan") is None
 
 
+def test_find_shared_dir_ignores_dirs_older_than_reference(tmp_path, monkeypatch):
+    # Race guard: a SHARED_DIR left by a PRIOR/killed campaign must not be latched.
+    # Only accept the current run's dir, i.e. created after the service started.
+    import os as _os, time as _time
+    monkeypatch.setattr(arvo_oss_crs, "OSS_CRS_DIR", tmp_path)
+    base = tmp_path / ".oss-crs-workdir" / "crs_compose"
+
+    def mk(run):
+        p = (base / "c1" / "address" / "runs" / run / "crs" / "crs-claude-code"
+             / "tgt" / "SHARED_DIR" / "mruby_proto_fuzzer")
+        p.mkdir(parents=True)
+        return p
+
+    stale = mk("old")
+    _os.utime(stale, (1000, 1000))          # long in the past
+    ref = 2000
+    # Only a stale dir exists and it predates the reference -> nothing to latch.
+    assert arvo_oss_crs.find_shared_dir("asan", newer_than=ref) is None
+    # Once the current run's dir appears (newer than ref), it's selected over the stale one.
+    current = mk("new")
+    _os.utime(current, (3000, 3000))
+    assert arvo_oss_crs.find_shared_dir("asan", newer_than=ref) == current
+
+
 def _write_log(tmp_path, records):
     p = tmp_path / "claude_stdout.log"
     p.write_text("\n".join(json.dumps(r) for r in records) + "\n")

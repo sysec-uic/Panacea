@@ -174,13 +174,18 @@ def find_target_source_dir(sanitizer: str) -> Path | None:
     return max(dirs, key=lambda p: p.stat().st_mtime)
 
 
-def find_shared_dir(sanitizer: str) -> Path | None:
+def find_shared_dir(sanitizer: str, newer_than: float | None = None) -> Path | None:
     """Host path backing the agent's /OSS_CRS_SHARED_DIR rw bind mount -- the live
     agent<->host channel for the in-turn check-patch tool. Structure mirrors oss-crs
-    get_shared_dir: <sanitizer>/runs/<run_id>/crs/<crs_name>/<target>/SHARED_DIR/<harness>."""
+    get_shared_dir: <sanitizer>/runs/<run_id>/crs/<crs_name>/<target>/SHARED_DIR/<harness>.
+
+    `newer_than` (epoch seconds) rejects SHARED_DIRs from prior/killed runs: pass the
+    time the current run's service started, so a stale dir can never win the newest-by-
+    mtime race and make the responder latch a dead channel."""
     base = OSS_CRS_DIR / ".oss-crs-workdir" / "crs_compose"
     sanitizer_dir = SANITIZER_DIR.get(sanitizer.lower(), sanitizer.lower())
-    dirs = list(base.glob(f"*/{sanitizer_dir}/runs/*/crs/*/*/SHARED_DIR/*"))
+    dirs = [d for d in base.glob(f"*/{sanitizer_dir}/runs/*/crs/*/*/SHARED_DIR/*")
+            if newer_than is None or d.stat().st_mtime > newer_than]
     if not dirs:
         return None
     return max(dirs, key=lambda p: p.stat().st_mtime)
@@ -416,10 +421,15 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
         import check_server
         from build_instance import build_instance
         check_stop = threading.Event()
+        # Only latch a SHARED_DIR created after now, so a stale dir from a prior/killed
+        # run can't win the newest-by-mtime race (observed live: the responder attached
+        # to a dead campaign's channel and the agent got no working check-patch).
+        svc_start = time.time()
         check_thread = threading.Thread(
             target=check_server.run_service,
             args=(bug, build_instance(bug), bug["project"]),
-            kwargs={"find_dir": lambda: find_shared_dir(sanitizer), "stop": check_stop.is_set},
+            kwargs={"find_dir": lambda: find_shared_dir(sanitizer, newer_than=svc_start),
+                    "stop": check_stop.is_set},
             daemon=True)
         check_thread.start()
         print(f"[{bug_id}] check-patch self-check service running (OSS_CRS_CHECK_PATCH=1)")
