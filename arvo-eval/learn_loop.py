@@ -47,7 +47,8 @@ def _default_agent(bug_id, project_dir, skip_build):
     if diff:
         results_dir.mkdir(parents=True, exist_ok=True)
         (results_dir / "patch.diff").write_text(diff)
-    return {"diff": diff, "trajectory_summary": trajectory, "summary": summary}
+    return {"diff": diff, "trajectory_summary": trajectory, "summary": summary,
+            "timed_out": summary.get("timed_out", False)}
 
 
 def _default_verify(bug_id, diff):
@@ -115,7 +116,8 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
             last_run.update(run)
             for k, v in run.get("summary", {}).get("tokens", {}).items():
                 total_tokens[k] = total_tokens.get(k, 0) + v
-            return {"diff": run.get("diff", ""), "trajectory_summary": run.get("trajectory_summary", "")}
+            return {"diff": run.get("diff", ""), "trajectory_summary": run.get("trajectory_summary", ""),
+                    "timed_out": run.get("timed_out", False)}
 
         result = repair_with_retries(bug=bug, agent=attempt_agent, verify=verify,
                                      max_attempts=max_attempts)

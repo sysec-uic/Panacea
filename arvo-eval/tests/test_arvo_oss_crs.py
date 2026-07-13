@@ -146,6 +146,82 @@ def test_cleanup_docker_images_disabled_by_env(monkeypatch):
     assert arvo_oss_crs.cleanup_docker_images(run=fail_run) == []
 
 
+def test_run_timeout_unset_is_none(monkeypatch):
+    monkeypatch.delenv("OSS_CRS_RUN_TIMEOUT", raising=False)
+    assert arvo_oss_crs._run_timeout() is None
+
+
+def test_run_timeout_env_parsed_as_seconds(monkeypatch):
+    monkeypatch.setenv("OSS_CRS_RUN_TIMEOUT", "7200")
+    assert arvo_oss_crs._run_timeout() == 7200.0
+
+
+def test_agent_runs_to_completion_without_timeout():
+    # No cap: run once, no teardown, and report the run did NOT time out.
+    calls = []
+    teardowns = []
+
+    def fake_run(cmd, **kw):
+        calls.append(kw.get("timeout", "MISSING"))
+
+    timed_out = arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
+        run=fake_run, teardown=lambda: teardowns.append(True))
+    assert timed_out is False
+    assert calls == [None]          # the cap is threaded through to subprocess.run
+    assert teardowns == []          # nothing to tear down on a clean finish
+
+
+def test_agent_timeout_tears_down_containers_and_reports_timed_out():
+    # A run that blows the cap: subprocess.run raises TimeoutExpired (it SIGKILLs the
+    # oss-crs process), but the orphaned compose containers survive -- so we must tear
+    # them down and tell the caller this was a no-patch, timed-out attempt.
+    import subprocess
+    teardowns = []
+
+    def slow_run(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+
+    timed_out = arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=1.0,
+        run=slow_run, teardown=lambda: teardowns.append(True))
+    assert timed_out is True
+    assert teardowns == [True]
+
+
+def test_terminate_crs_run_force_removes_live_containers():
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        class R:
+            stdout = "abc123\ndef456\n" if cmd[:2] == ["docker", "ps"] else ""
+            returncode = 0
+        return R()
+
+    removed = arvo_oss_crs.terminate_crs_run(run=fake_run)
+    assert removed == ["abc123", "def456"]
+    # Filtered to our compose containers by name prefix, then force-removed.
+    ps = next(c for c in calls if c[:2] == ["docker", "ps"])
+    assert "name=crs_compose" in ps
+    assert ["docker", "rm", "-f", "abc123", "def456"] in calls
+
+
+def test_terminate_crs_run_noop_when_nothing_running():
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        class R:
+            stdout = ""
+            returncode = 0
+        return R()
+
+    assert arvo_oss_crs.terminate_crs_run(run=fake_run) == []
+    # No containers => no destructive `docker rm` is issued.
+    assert not any(c[:3] == ["docker", "rm", "-f"] for c in calls)
+
+
 def _write_log(tmp_path, records):
     p = tmp_path / "claude_stdout.log"
     p.write_text("\n".join(json.dumps(r) for r in records) + "\n")
