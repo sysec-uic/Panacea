@@ -65,3 +65,32 @@ def test_feedback_for_harness_patch_redirects_to_project_code():
 def test_feedback_never_references_the_fix_image():
     fb = describe_feedback({"classification": "fixed_tests_failed", "make_test_tail": "x"})
     assert "-fix" not in fb and "ground-truth" not in fb.lower()
+
+
+def test_feedback_for_timeout_tells_agent_to_commit_to_a_fix():
+    fb = describe_feedback({"classification": "timed_out"})
+    assert "time" in fb.lower()
+    # It must push the agent to stop exploring and actually submit a patch.
+    assert "patch" in fb.lower()
+
+
+def test_timed_out_no_patch_attempt_is_classified_and_fed_back():
+    # A run that hit the wall-clock cap returns no diff but flags timed_out. The loop
+    # must classify it as timed_out (not a generic no_changes) and feed a real
+    # message forward so the next attempt is steered, not left guessing.
+    seen = []
+
+    def agent(attempt_no, feedback):
+        seen.append(feedback)
+        if attempt_no == 1:
+            return {"diff": "", "trajectory_summary": "ran out of time", "timed_out": True}
+        return {"diff": "GOOD", "trajectory_summary": "fixed"}
+
+    def verify(bug_id, diff):
+        return {"classification": "verified_correct"}
+
+    result = repair_with_retries(bug=BUG, agent=agent, verify=verify, max_attempts=5)
+    assert result["attempts"][0]["verdict"] == "timed_out"
+    assert result["status"] == "solved"
+    # Attempt 2 was told, in words, that attempt 1 ran out of time.
+    assert "time" in seen[1].lower()

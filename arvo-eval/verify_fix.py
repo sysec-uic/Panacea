@@ -171,6 +171,93 @@ def apply_patch(exec_fn, project: str, diff: str):
     return result
 
 
+def run_check(bug, diff, exec_fn, *, project, run_tests=True) -> dict:
+    """Apply `diff` and classify the outcome, driving an ALREADY-PREPARED container
+    through `exec_fn(command, input=None, timeout=...) -> CompletedProcess`.
+
+    Container lifecycle is the caller's job, so an agent can hand in one warm `-vul`
+    container and call this repeatedly for fast in-turn self-checks (incremental
+    rebuilds) instead of paying a cold build each time. `verify()` uses it against a
+    throwaway container; the agent `check-patch` tool uses it against a kept one.
+    Returns the same verification dict shape `verify()` produces.
+    """
+    v: dict = {}
+    if not diff.strip():
+        v["classification"] = "no_changes"
+        return v
+    if touches_harness(diff):
+        v["classification"] = "patch_touches_harness"
+        v["harness_paths"] = changed_paths(diff)
+        return v
+
+    apply_result = apply_patch(
+        lambda cmd, patch: exec_fn(cmd, input=patch, timeout=60), project, diff)
+    if apply_result.returncode != 0:
+        v["classification"] = "patch_apply_failed"
+        v["apply_output"] = apply_result.stdout + apply_result.stderr
+        return v
+
+    # Cap ninja parallelism (see verify() note): guards the build VM from OOM.
+    exec_fn("sed -i 's#/depot_tools/ninja -C#/depot_tools/ninja -j3 -C#g' /src/build.sh 2>/dev/null || true",
+            timeout=30)
+    build_result = exec_fn(f"cd /src/{project} && {env_prefix(compile_env(bug))} compile",
+                           timeout=COMPILE_TIMEOUT)
+    build_output = build_result.stdout + build_result.stderr
+    v["build_output_tail"] = "\n".join(build_output.splitlines()[-50:])
+    if build_result.returncode != 0:
+        v["classification"] = "build_failed"
+        return v
+
+    run_result = exec_fn("arvo", timeout=RUN_TIMEOUT)
+    run_output = run_result.stdout + run_result.stderr
+    v["run_output_tail"] = "\n".join(run_output.splitlines()[-30:])
+    v["run_returncode"] = run_result.returncode
+
+    sanitizer = bug["sanitizer"].lower()
+    make_test_ok = None
+    if run_tests and not crashed(sanitizer, run_output) and run_result.returncode == 0 and project == "mruby":
+        test_result = exec_fn(MRUBY_TEST_CMD, timeout=TEST_TIMEOUT)
+        make_test_ok = test_result.returncode == 0
+        v["make_test_ok"] = make_test_ok
+        v["make_test_tail"] = "\n".join(
+            (test_result.stdout + test_result.stderr).splitlines()[-30:])
+
+    v["classification"] = classify_run(
+        sanitizer=sanitizer, diff=diff, apply_ok=True, build_ok=True,
+        run_output=run_output, run_returncode=run_result.returncode, make_test_ok=make_test_ok)
+    return v
+
+
+def check_feedback(verification: dict) -> str:
+    """Agent-facing verdict for an in-turn self-check. Unlike repair_loop's
+    between-attempt feedback (rejections only), this also states a clear PASS so the
+    agent knows when to submit. Deployment-faithful: never references the -fix image."""
+    cls = verification.get("classification", "")
+    if cls == "verified_correct":
+        return ("PASS: the crash is gone and `rake test` passes. This patch is a valid "
+                "fix -- submit it.")
+    if cls == "no_changes":
+        return "No changes detected yet -- edit the project source, then re-check."
+    if cls == "patch_touches_harness":
+        return ("FAIL: your patch changes the fuzz harness (test scaffolding), which can't "
+                "change in deployment. Fix the defect in the project's own source instead.")
+    if cls == "patch_apply_failed":
+        return "FAIL: the patch did not apply to a fresh checkout. Re-emit it against the current source."
+    if cls == "build_failed":
+        return ("FAIL: the project did not compile with your patch:\n"
+                f"{verification.get('build_output_tail','')}\nFix the build error.")
+    if cls == "still_crashes":
+        return ("FAIL: the target still crashes on the PoC:\n"
+                f"{verification.get('run_output_tail','')}\nYour patch did not fix the root cause.")
+    if cls == "fixed_tests_failed":
+        return ("FAIL: the crash is gone but `rake test` now fails, so the behavior is wrong:\n"
+                f"{verification.get('make_test_tail','')}\nYou likely silenced the symptom or "
+                "broke valid behavior -- trace the bad data to its source.")
+    if cls == "unexpected_exit":
+        return "FAIL: the crash is gone but the target exited abnormally. Investigate the new exit path."
+    return f"FAIL: self-check returned {cls}."
+
+
 def save(instance: dict, verification: dict) -> dict:
     out_path = results_dir(instance["instance_id"]) / "verification.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -211,49 +298,11 @@ def verify(bug_id: int, keep: bool = False) -> dict:
     )
 
     try:
-        apply_result = apply_patch(
-            lambda cmd, patch: docker_exec(container, cmd, input=patch, timeout=60),
-            project, diff,
-        )
-        if apply_result.returncode != 0:
-            verification["classification"] = "patch_apply_failed"
-            verification["apply_output"] = apply_result.stdout + apply_result.stderr
-            return save(instance, verification)
-
-        # Cap ninja's parallelism: this host has more cores than RAM can support for a
-        # full-parallel clang+ASan build, which previously crashed the WSL2 VM.
-        docker_exec(container, "sed -i 's#/depot_tools/ninja -C#/depot_tools/ninja -j3 -C#g' /src/build.sh 2>/dev/null || true", timeout=30)
-        build_result = docker_exec(container, f"cd /src/{project} && {env_prefix(compile_env(bug))} compile", timeout=COMPILE_TIMEOUT)
-        build_output = build_result.stdout + build_result.stderr
-        verification["build_output_tail"] = "\n".join(build_output.splitlines()[-50:])
-        if build_result.returncode != 0:
-            verification["classification"] = "build_failed"
-            return save(instance, verification)
-
-        run_result = docker_exec(container, "arvo", timeout=RUN_TIMEOUT)
-        run_output = run_result.stdout + run_result.stderr
-        verification["run_output_tail"] = "\n".join(run_output.splitlines()[-30:])
-        verification["run_returncode"] = run_result.returncode
-
-        sanitizer = bug["sanitizer"].lower()
-        make_test_ok = None
-        if not crashed(sanitizer, run_output) and run_result.returncode == 0 and project == "mruby":
-            test_result = docker_exec(container, MRUBY_TEST_CMD, timeout=TEST_TIMEOUT)
-            make_test_ok = test_result.returncode == 0
-            verification["make_test_ok"] = make_test_ok
-            verification["make_test_tail"] = "\n".join(
-                (test_result.stdout + test_result.stderr).splitlines()[-30:]
-            )
-
-        verification["classification"] = classify_run(
-            sanitizer=sanitizer,
-            diff=diff,
-            apply_ok=True,
-            build_ok=True,
-            run_output=run_output,
-            run_returncode=run_result.returncode,
-            make_test_ok=make_test_ok,
-        )
+        # The container is prepared (running the -vul image); the check body is shared
+        # with the agent's in-turn `check-patch` tool via run_check.
+        exec_fn = lambda cmd, input=None, timeout=60: docker_exec(
+            container, cmd, input=input, timeout=timeout)
+        verification.update(run_check(bug, diff, exec_fn, project=project))
         return save(instance, verification)
     finally:
         if keep:

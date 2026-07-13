@@ -33,6 +33,11 @@ def describe_feedback(verification: dict) -> str:
                 "cannot be changed in deployment, so this can never be the fix. The defect "
                 "is in the project's own source code. Use the crash trace to find the "
                 "project code that misbehaves and fix it there.")
+    if cls == "timed_out":
+        return ("Your previous attempt ran out of time before submitting a patch. Stop "
+                "exploring: use the crash trace to locate the faulting project source, make "
+                "the smallest correct change that fixes the root cause, and write the patch "
+                "out now. Do not re-read files you have already seen.")
     if cls == "build_failed":
         return "Your patch did not compile. Fix the build error and try again."
     if cls == "patch_apply_failed":
@@ -60,7 +65,12 @@ def repair_with_retries(*, bug, agent, verify, max_attempts=5):
     for n in range(1, max_attempts + 1):
         run = agent(n, feedback)
         diff = run.get("diff", "")
-        verification = verify(bug_id, diff) if diff.strip() else {"classification": "no_changes"}
+        if diff.strip():
+            verification = verify(bug_id, diff)
+        else:
+            # No patch. A run that hit the wall-clock cap is a distinct, actionable
+            # failure -- feed that back rather than a generic "no changes".
+            verification = {"classification": "timed_out" if run.get("timed_out") else "no_changes"}
         verdict = verification.get("classification", "no_changes")
         record = {"attempt": n, "diff": diff, "verdict": verdict,
                   "trajectory_summary": run.get("trajectory_summary", "")}

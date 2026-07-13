@@ -15,10 +15,17 @@ Prerequisites:
     - Run `uv run oss-crs prepare --compose-file <COMPOSE_FILE>` once first
     - To use Claude via OAuth instead: export CLAUDE_CODE_OAUTH_TOKEN and
       OSS_CRS_COMPOSE_FILE=$HOME/oss-crs/example/crs-claude-code/compose-oauth.yaml
+
+Env knobs:
+    - OSS_CRS_RUN_TIMEOUT   wall-clock cap (seconds) for one agent run; unset = no cap.
+                            On timeout the run's compose containers are torn down and
+                            the result is a no-patch, timed_out attempt.
+    - OSS_CRS_DOCKER_CLEANUP / OSS_CRS_DOCKER_KEEP   stale-image reaping after each run.
 """
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -230,6 +237,97 @@ def parse_token_counts(log_path: Path) -> dict:
     }
 
 
+def _run_epoch(s: str) -> int:
+    """OSS-CRS embeds a 10-digit epoch in run/build ids (test-1783442751bt,
+    crs_compose_1783528430al-...); it orders disposables by age."""
+    m = re.search(r"(\d{10})", s)
+    return int(m.group(1)) if m else 0
+
+
+def stale_docker_images(images: list, *, keep: int = 2) -> list[str]:
+    """Pick per-run OSS-CRS disposables to delete: test-*/build-* snapshots beyond
+    the newest `keep` per kind, and crs_compose_<runid>-* image sets of every run
+    but the newest. content-* snapshots are the incremental-build cache and other
+    repos (ARVO images etc.) are not ours -- both stay untouched.
+    `images` is a list of (repository, tag) pairs."""
+    stale = []
+    snap_tags = [t for r, t in images if r == "oss-crs-snapshot"]
+    for kind in ("test-", "build-"):
+        tags = sorted((t for t in snap_tags if t.startswith(kind)),
+                      key=_run_epoch, reverse=True)
+        stale += [f"oss-crs-snapshot:{t}" for t in tags[keep:]]
+
+    compose = [(r, t) for r, t in images if r.startswith("crs_compose_")]
+    run_ids = sorted({r.split("-", 1)[0] for r, _ in compose},
+                     key=_run_epoch, reverse=True)
+    dead = set(run_ids[1:])
+    stale += [f"{r}:{t}" for r, t in compose if r.split("-", 1)[0] in dead]
+    return stale
+
+
+def cleanup_docker_images(*, keep: int = None, run=subprocess.run) -> list[str]:
+    """Delete stale per-run OSS-CRS docker images after each run; every run tags a
+    fresh ~9GB snapshot pair that otherwise accumulates forever. `docker rmi` is
+    used WITHOUT -f, so anything still referenced by a container survives.
+    OSS_CRS_DOCKER_CLEANUP=0 disables; OSS_CRS_DOCKER_KEEP overrides `keep`."""
+    if os.environ.get("OSS_CRS_DOCKER_CLEANUP", "1") == "0":
+        return []
+    keep = keep if keep is not None else int(os.environ.get("OSS_CRS_DOCKER_KEEP", "2"))
+    out = run(["docker", "images", "--format", "{{.Repository}} {{.Tag}}"],
+              capture_output=True, text=True)
+    images = [tuple(parts) for line in out.stdout.splitlines()
+              if len(parts := line.split()) == 2]
+    stale = stale_docker_images(images, keep=keep)
+    for ref in stale:
+        run(["docker", "rmi", ref], capture_output=True, text=True)
+    run(["docker", "image", "prune", "-f"], capture_output=True, text=True)
+    if stale:
+        print(f"[cleanup] removed {len(stale)} stale OSS-CRS images")
+    return stale
+
+
+def _run_timeout() -> float | None:
+    """Wall-clock cap (seconds) for a single agent run, from OSS_CRS_RUN_TIMEOUT.
+    Unset -> no cap (unchanged behavior). A campaign sets e.g. 7200 so a flailing
+    attempt can never eat 36h again (see the Jul 13 campaign postmortem)."""
+    v = os.environ.get("OSS_CRS_RUN_TIMEOUT")
+    return float(v) if v else None
+
+
+def terminate_crs_run(*, run=subprocess.run) -> list[str]:
+    """Force-remove any live OSS-CRS compose containers.
+
+    Killing the `uv run oss-crs` process on timeout only reaps that process --
+    docker-compose leaves its services running, and on the local-model box those
+    keep the GPU pegged. The compose project is named `crs_compose_<runid>` (see
+    oss-crs utils.py), so its containers all carry that name prefix; match and
+    remove them. Only invoked on the timeout path, so a serial campaign has at most
+    the one dead run to clean up."""
+    out = run(["docker", "ps", "-q", "--filter", "name=crs_compose"],
+              capture_output=True, text=True)
+    ids = out.stdout.split()
+    if ids:
+        run(["docker", "rm", "-f", *ids], capture_output=True, text=True)
+        print(f"[timeout] force-removed {len(ids)} live OSS-CRS containers")
+    return ids
+
+
+def _run_agent_with_timeout(cmd, *, cwd, timeout, run=subprocess.run,
+                            teardown=None) -> bool:
+    """Run the CRS agent subprocess under `timeout`. Returns whether it timed out.
+
+    On timeout, subprocess.run SIGKILLs the oss-crs process but its docker
+    containers survive, so tear them down before reporting. A clean finish (or no
+    cap) reports False and tears down nothing."""
+    teardown = teardown or terminate_crs_run
+    try:
+        run(cmd, cwd=cwd, check=False, timeout=timeout)
+        return False
+    except subprocess.TimeoutExpired:
+        teardown()
+        return True
+
+
 def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     """Run crs-claude-code on one ARVO bug. Returns a summary dict."""
     bug = load_bug(bug_id)
@@ -273,17 +371,24 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     inject_heuristics(project_dir, sanitizer, bug_id)
 
     print(f"[{bug_id}] Running agent (harness: {bug['fuzz_target']})...")
+    timeout = _run_timeout()
+    if timeout:
+        print(f"[{bug_id}] Wall-clock cap OSS_CRS_RUN_TIMEOUT={timeout:.0f}s in effect.")
     run_start = time.time()
-    subprocess.run(
+    timed_out = _run_agent_with_timeout(
         [*base, "run", *compose_args,
          "--fuzz-proj-path", str(project_dir),
          "--target-harness", bug["fuzz_target"],
          "--pov", str(pov_path),
          "--incremental-build"],
         cwd=OSS_CRS_DIR,
-        check=False,
+        timeout=timeout,
     )
     run_elapsed = time.time() - run_start
+    if timed_out:
+        print(f"[{bug_id}] Agent run hit the {timeout:.0f}s cap after {run_elapsed:.0f}s; "
+              f"treating as a no-patch attempt. Any patch written before the cap is "
+              f"still collected below.")
     run_dir = find_latest_run_dir(sanitizer)
     meta = {}
     patches = []
@@ -307,11 +412,16 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
         "bug_id": bug_id,
         "project": bug["project"],
         "elapsed_seconds": round(run_elapsed),
+        "timed_out": timed_out,
         "patches": n_patches,
         "patch_files": [str(output_dir / f"oss_crs_patch_{i}.diff") for i in range(len(patches))],
         "tokens": tokens,
         "meta": meta,
     }
+
+    # Each run tags fresh multi-GB snapshot/compose images; reap the stale ones
+    # now so a long campaign doesn't fill the disk.
+    cleanup_docker_images()
 
     (output_dir / "oss_crs_result.json").write_text(json.dumps(summary, indent=2))
     print(f"[{bug_id}] Done. Patches: {n_patches}, elapsed: {run_elapsed:.0f}s, "

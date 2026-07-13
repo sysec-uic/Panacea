@@ -20,20 +20,35 @@ from mruby_bugs import mruby_bug_ids
 from repair_loop import repair_with_retries
 
 
-def _default_agent(bug_id, project_dir, skip_build):
-    """Real agent: drive OSS-CRS, then return the chosen patch + trajectory tail."""
-    from arvo_oss_crs import run_oss_crs
-    summary = run_oss_crs(bug_id, skip_build=skip_build)
+RESULTS_BASE = Path(__file__).parent / "results"
+
+
+def _agent_results_dir(bug_id):
     _pass = os.environ.get("LEARN_PASS", "")
-    results_dir = Path(__file__).parent / "results" / _pass / str(bug_id) if _pass else Path(__file__).parent / "results" / str(bug_id)
-    patch = results_dir / "oss_crs_patch_0.diff"
-    diff = patch.read_text() if patch.exists() else ""
+    return RESULTS_BASE / _pass / str(bug_id) if _pass else RESULTS_BASE / str(bug_id)
+
+
+def _default_agent(bug_id, project_dir, skip_build):
+    """Real agent: drive OSS-CRS, then return the chosen patch + trajectory tail.
+
+    Only patches listed in THIS run's summary count. Globbing the results dir
+    resurrected stale oss_crs_patch_*.diff files from earlier runs whenever the
+    agent produced nothing, so a dead run got verified (and fed back on) as if it
+    had emitted the old patch.
+    """
+    import arvo_oss_crs
+    summary = arvo_oss_crs.run_oss_crs(bug_id, skip_build=skip_build)
+    results_dir = _agent_results_dir(bug_id)
+    patch_files = [Path(p) for p in summary.get("patch_files") or []]
+    diff = patch_files[0].read_text() if patch_files and patch_files[0].exists() else ""
     log = results_dir / "oss_crs_claude_stdout.log"
     trajectory = "\n".join(log.read_text().splitlines()[-80:]) if log.exists() else ""
     # verify_fix reads results/<id>/patch.diff; bridge the OSS-CRS naming.
     if diff:
+        results_dir.mkdir(parents=True, exist_ok=True)
         (results_dir / "patch.diff").write_text(diff)
-    return {"diff": diff, "trajectory_summary": trajectory, "summary": summary}
+    return {"diff": diff, "trajectory_summary": trajectory, "summary": summary,
+            "timed_out": summary.get("timed_out", False)}
 
 
 def _default_verify(bug_id, diff):
@@ -101,7 +116,8 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
             last_run.update(run)
             for k, v in run.get("summary", {}).get("tokens", {}).items():
                 total_tokens[k] = total_tokens.get(k, 0) + v
-            return {"diff": run.get("diff", ""), "trajectory_summary": run.get("trajectory_summary", "")}
+            return {"diff": run.get("diff", ""), "trajectory_summary": run.get("trajectory_summary", ""),
+                    "timed_out": run.get("timed_out", False)}
 
         result = repair_with_retries(bug=bug, agent=attempt_agent, verify=verify,
                                      max_attempts=max_attempts)

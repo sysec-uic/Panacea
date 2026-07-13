@@ -182,6 +182,13 @@ that have no known fix). A lesson is learned only from solved bugs:
 The ledger records `n_attempts` per bug — watch it trend down on later bugs if the
 playbook is helping. See `demo_retry_learn.py` for a stub-driven walk-through.
 
+Set `OSS_CRS_RUN_TIMEOUT=<seconds>` to cap the wall-clock time of a single agent run
+(unset = no cap). On a timeout the orphaned OSS-CRS compose containers are torn down
+and the attempt is recorded as a no-patch, `timed_out` attempt — the next attempt gets
+feedback telling the agent to commit to a fix. This stops one flailing attempt from
+eating many hours (the local-model campaign had a single attempt run 36h; see
+`docs/2026-07-13-learn-loop-local-model-campaign.md`).
+
 ### Running the experiment
 
 Two passes over the same chronological ordering — a control (no playbook injected)
