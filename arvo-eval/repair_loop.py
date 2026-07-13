@@ -33,6 +33,10 @@ def describe_feedback(verification: dict) -> str:
                 "cannot be changed in deployment, so this can never be the fix. The defect "
                 "is in the project's own source code. Use the crash trace to find the "
                 "project code that misbehaves and fix it there.")
+    if cls == "unchecked":
+        return ("You submitted a patch without validating it. You have a `check-patch` tool: "
+                "run it from your source tree and iterate on your fix until it prints PASS, "
+                "then submit that patch. Do not submit again until check-patch passes.")
     if cls == "timed_out":
         return ("Your previous attempt ran out of time before submitting a patch. Stop "
                 "exploring: use the crash trace to locate the faulting project source, make "
@@ -65,12 +69,19 @@ def repair_with_retries(*, bug, agent, verify, max_attempts=5):
     for n in range(1, max_attempts + 1):
         run = agent(n, feedback)
         diff = run.get("diff", "")
-        if diff.strip():
-            verification = verify(bug_id, diff)
-        else:
+        if not diff.strip():
             # No patch. A run that hit the wall-clock cap is a distinct, actionable
             # failure -- feed that back rather than a generic "no changes".
             verification = {"classification": "timed_out" if run.get("timed_out") else "no_changes"}
+        elif run.get("check_required") and not run.get("check_passed"):
+            # Enforcement (OSS_CRS_CHECK_PATCH): the agent must self-validate with
+            # check-patch before submitting. Reject an unchecked patch outright -- don't
+            # even pay for a verify build -- and steer it to the tool. check-patch runs
+            # the same build+PoC+test as verify, so a truly-correct patch loses only one
+            # round; the point is to make the agent converge in-run instead of guessing.
+            verification = {"classification": "unchecked"}
+        else:
+            verification = verify(bug_id, diff)
         verdict = verification.get("classification", "no_changes")
         record = {"attempt": n, "diff": diff, "verdict": verdict,
                   "trajectory_summary": run.get("trajectory_summary", "")}

@@ -66,6 +66,24 @@ def test_prepare_channel_drops_executable_client_and_returns_paths(tmp_path):
     assert resp == tmp_path / ".check_response.txt"
 
 
+def test_serve_one_writes_pass_marker_on_verified_correct(tmp_path):
+    req, resp, marker = tmp_path / "req.diff", tmp_path / "resp.txt", tmp_path / ".check_passed"
+    req.write_text("DIFF")
+    check_server.serve_one(req, resp, bug=BUG, project="mruby", exec_fn=None,
+                           run_check=lambda *a, **k: {"classification": "verified_correct"},
+                           marker_path=marker)
+    assert marker.exists()   # a PASS is recorded so the loop can require it before accepting
+
+
+def test_serve_one_no_marker_on_failing_check(tmp_path):
+    req, resp, marker = tmp_path / "req.diff", tmp_path / "resp.txt", tmp_path / ".check_passed"
+    req.write_text("DIFF")
+    check_server.serve_one(req, resp, bug=BUG, project="mruby", exec_fn=None,
+                           run_check=lambda *a, **k: {"classification": "still_crashes"},
+                           marker_path=marker)
+    assert not marker.exists()
+
+
 def test_run_service_waits_for_channel_prepares_it_and_tears_down(tmp_path):
     # find_dir returns None once (channel not up yet), then the dir; stop() then ends
     # the serve loop. Asserts it drops the client and always removes the container.

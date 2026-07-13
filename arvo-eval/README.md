@@ -189,7 +189,15 @@ PoC, and runs the test suite — returning PASS/FAIL so the agent converges inst
 editing blind. It rides the agent's `/OSS_CRS_SHARED_DIR` rw bind mount (no Docker in the
 agent, no OSS-CRS template changes) and reuses `verify_fix.run_check`. Same
 deployment-faithful signal as the outer loop, never the `-fix` image. Default **off**;
-enable it per campaign. (End-to-end behavior is validated on a live run.)
+enable it per campaign.
+
+**Enforcement:** when the flag is on, the repair loop *rejects a submission the agent
+never validated* — if no check-patch PASS was recorded that run, the attempt is
+classified `unchecked` (no verify build) and the agent is told to run check-patch until
+it passes, then submit. This exists because a live run showed the agent ignoring the
+tool when it was only *suggested* (a HEURISTICS.md note); enforcement makes self-check a
+gate, not advice. Since check-patch runs the same build+PoC+test as verify, a
+truly-correct patch loses at most one round.
 
 Set `OSS_CRS_RUN_TIMEOUT=<seconds>` to cap the wall-clock time of a single agent run
 (unset = no cap). On a timeout the orphaned OSS-CRS compose containers are torn down

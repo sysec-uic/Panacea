@@ -415,11 +415,14 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     # In-turn self-check service (OSS_CRS_CHECK_PATCH=1): a background thread serves
     # the agent's check-patch requests against a warm -vul container for the duration
     # of this run. Best-effort and daemon, so it can never wedge or fail the run.
+    check_marker = output_dir / ".check_passed"
     check_stop = check_thread = None
     if _check_patch_enabled():
         import threading
         import check_server
         from build_instance import build_instance
+        # Fresh marker per run: only a PASS from THIS run should let a submission through.
+        check_marker.unlink(missing_ok=True)
         check_stop = threading.Event()
         # Only latch a SHARED_DIR created after now, so a stale dir from a prior/killed
         # run can't win the newest-by-mtime race (observed live: the responder attached
@@ -429,7 +432,7 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
             target=check_server.run_service,
             args=(bug, build_instance(bug), bug["project"]),
             kwargs={"find_dir": lambda: find_shared_dir(sanitizer, newer_than=svc_start),
-                    "stop": check_stop.is_set},
+                    "stop": check_stop.is_set, "marker_path": check_marker},
             daemon=True)
         check_thread.start()
         print(f"[{bug_id}] check-patch self-check service running (OSS_CRS_CHECK_PATCH=1)")
@@ -478,6 +481,10 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
         "project": bug["project"],
         "elapsed_seconds": round(run_elapsed),
         "timed_out": timed_out,
+        # check_required: enforcement is on; check_passed: the agent got a check-patch
+        # PASS this run. The repair loop rejects a submission that is required-but-unchecked.
+        "check_required": _check_patch_enabled(),
+        "check_passed": check_marker.exists(),
         "patches": n_patches,
         "patch_files": [str(output_dir / f"oss_crs_patch_{i}.diff") for i in range(len(patches))],
         "tokens": tokens,
