@@ -20,7 +20,7 @@ from repair_loop import repair_with_retries
 from contrastive_extract import extract_contrastive_heuristic
 from llm import have_credentials
 
-PAIR_DIR = Path(__file__).resolve().parent.parent / "bug-runs" / "results" / "449429295"
+PAIR_DIR = Path(__file__).resolve().parent.parent / "early-investigations" / "results" / "449429295"
 
 BUG = {
     "localId": 449429295,
