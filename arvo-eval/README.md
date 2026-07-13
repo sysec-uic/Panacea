@@ -182,6 +182,15 @@ that have no known fix). A lesson is learned only from solved bugs:
 The ledger records `n_attempts` per bug — watch it trend down on later bugs if the
 playbook is helping. See `demo_retry_learn.py` for a stub-driven walk-through.
 
+Set `OSS_CRS_CHECK_PATCH=1` to give the agent an **in-turn self-check**: a background
+responder (`check_server.py`) serves a `check-patch` tool the agent runs before
+submitting, which builds its current patch against a fresh `-vul` container, re-runs the
+PoC, and runs the test suite — returning PASS/FAIL so the agent converges instead of
+editing blind. It rides the agent's `/OSS_CRS_SHARED_DIR` rw bind mount (no Docker in the
+agent, no OSS-CRS template changes) and reuses `verify_fix.run_check`. Same
+deployment-faithful signal as the outer loop, never the `-fix` image. Default **off**;
+enable it per campaign. (End-to-end behavior is validated on a live run.)
+
 Set `OSS_CRS_RUN_TIMEOUT=<seconds>` to cap the wall-clock time of a single agent run
 (unset = no cap). On a timeout the orphaned OSS-CRS compose containers are torn down
 and the attempt is recorded as a no-patch, `timed_out` attempt — the next attempt gets

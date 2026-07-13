@@ -174,21 +174,53 @@ def find_target_source_dir(sanitizer: str) -> Path | None:
     return max(dirs, key=lambda p: p.stat().st_mtime)
 
 
-def inject_heuristics(project_dir: Path, sanitizer: str, bug_id: int) -> None:
-    """Copy HEURISTICS.md from project_dir into the agent's source directory.
+def find_shared_dir(sanitizer: str) -> Path | None:
+    """Host path backing the agent's /OSS_CRS_SHARED_DIR rw bind mount -- the live
+    agent<->host channel for the in-turn check-patch tool. Structure mirrors oss-crs
+    get_shared_dir: <sanitizer>/runs/<run_id>/crs/<crs_name>/<target>/SHARED_DIR/<harness>."""
+    base = OSS_CRS_DIR / ".oss-crs-workdir" / "crs_compose"
+    sanitizer_dir = SANITIZER_DIR.get(sanitizer.lower(), sanitizer.lower())
+    dirs = list(base.glob(f"*/{sanitizer_dir}/runs/*/crs/*/*/SHARED_DIR/*"))
+    if not dirs:
+        return None
+    return max(dirs, key=lambda p: p.stat().st_mtime)
 
-    HEURISTICS.md is written to the fake OSS-Fuzz project dir by injector.py
-    but that dir never reaches the agent.  This bridges the gap by copying it
-    directly into the extracted target-source dir where the agent runs.
+
+CHECK_PATCH_INSTRUCTION = (
+    "\n\n## Validate your patch before submitting\n"
+    "You have a `check-patch` tool. Before you submit, run it from your source tree:\n"
+    "    bash \"$OSS_CRS_SHARED_DIR/check-patch\"\n"
+    "It builds the sanitizer target with your current changes, re-runs the crashing "
+    "input, and runs the test suite, then prints PASS (the crash is gone and tests "
+    "pass -- submit it) or FAIL with exactly what is still wrong. Use it to converge; "
+    "do not submit a patch until check-patch says PASS.\n"
+)
+
+
+def _check_patch_enabled() -> bool:
+    return os.environ.get("OSS_CRS_CHECK_PATCH") == "1"
+
+
+def inject_heuristics(project_dir: Path, sanitizer: str, bug_id: int) -> None:
+    """Deliver the playbook (and, when enabled, the check-patch instruction) into the
+    agent's source directory.
+
+    HEURISTICS.md is written to the fake OSS-Fuzz project dir by injector.py but that
+    dir never reaches the agent; this bridges the gap by writing into the extracted
+    target-source dir where the agent runs. The check-patch instruction is appended
+    even when the playbook is empty, so the agent always learns the tool exists.
     """
-    src = project_dir / "HEURISTICS.md"
-    if not src.exists():
-        return
     target_source = find_target_source_dir(sanitizer)
     if target_source is None:
         print(f"[{bug_id}] Warning: could not find target-source dir, skipping heuristics injection")
         return
-    shutil.copy2(src, target_source / "HEURISTICS.md")
+    src = project_dir / "HEURISTICS.md"
+    text = src.read_text() if src.exists() else ""
+    if _check_patch_enabled():
+        text += CHECK_PATCH_INSTRUCTION
+    if not text.strip():
+        return
+    (target_source / "HEURISTICS.md").write_text(text)
     print(f"[{bug_id}] Injected HEURISTICS.md into {target_source}")
 
 
@@ -374,16 +406,39 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     timeout = _run_timeout()
     if timeout:
         print(f"[{bug_id}] Wall-clock cap OSS_CRS_RUN_TIMEOUT={timeout:.0f}s in effect.")
+
+    # In-turn self-check service (OSS_CRS_CHECK_PATCH=1): a background thread serves
+    # the agent's check-patch requests against a warm -vul container for the duration
+    # of this run. Best-effort and daemon, so it can never wedge or fail the run.
+    check_stop = check_thread = None
+    if _check_patch_enabled():
+        import threading
+        import check_server
+        from build_instance import build_instance
+        check_stop = threading.Event()
+        check_thread = threading.Thread(
+            target=check_server.run_service,
+            args=(bug, build_instance(bug), bug["project"]),
+            kwargs={"find_dir": lambda: find_shared_dir(sanitizer), "stop": check_stop.is_set},
+            daemon=True)
+        check_thread.start()
+        print(f"[{bug_id}] check-patch self-check service running (OSS_CRS_CHECK_PATCH=1)")
+
     run_start = time.time()
-    timed_out = _run_agent_with_timeout(
-        [*base, "run", *compose_args,
-         "--fuzz-proj-path", str(project_dir),
-         "--target-harness", bug["fuzz_target"],
-         "--pov", str(pov_path),
-         "--incremental-build"],
-        cwd=OSS_CRS_DIR,
-        timeout=timeout,
-    )
+    try:
+        timed_out = _run_agent_with_timeout(
+            [*base, "run", *compose_args,
+             "--fuzz-proj-path", str(project_dir),
+             "--target-harness", bug["fuzz_target"],
+             "--pov", str(pov_path),
+             "--incremental-build"],
+            cwd=OSS_CRS_DIR,
+            timeout=timeout,
+        )
+    finally:
+        if check_stop is not None:
+            check_stop.set()
+            check_thread.join(timeout=30)
     run_elapsed = time.time() - run_start
     if timed_out:
         print(f"[{bug_id}] Agent run hit the {timeout:.0f}s cap after {run_elapsed:.0f}s; "

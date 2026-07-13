@@ -19,7 +19,7 @@ work this session:
 | Repair + learning pipeline | ✅ Built and hardened (real verification, harness-patch rejection, stale-file guards, docker cleanup) |
 | Per-run wall-clock cap | ✅ Shipped & validated live — one attempt can no longer run 36h (`OSS_CRS_RUN_TIMEOUT`) |
 | Local-LLM serving speed | ✅ Tuned (flash-attention + KV-quant + 2 slots). Early result: **~1.5 min/cycle vs the old ~25 min**. High-context (>100k) confirmation in progress via the running campaign |
-| In-turn self-check (`check-patch`) | 🚧 Engine + host responder built & tested; final wiring pending live validation |
+| In-turn self-check (`check-patch`) | 🚧 Built & wired (behind `OSS_CRS_CHECK_PATCH=1`); end-to-end validation on the next campaign |
 | Differential `-fix` oracle | ✅ Implemented (post-hoc lesson-quality gate) |
 | Cross-project transfer experiment | 📋 Designed, not yet run |
 

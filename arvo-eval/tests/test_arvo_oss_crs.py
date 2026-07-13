@@ -222,6 +222,30 @@ def test_terminate_crs_run_noop_when_nothing_running():
     assert not any(c[:3] == ["docker", "rm", "-f"] for c in calls)
 
 
+def test_find_shared_dir_returns_newest_run(tmp_path, monkeypatch):
+    # SHARED_DIR is the rw bind mount backing the agent's /OSS_CRS_SHARED_DIR -- the
+    # live channel for check-patch. Path mirrors oss-crs get_shared_dir.
+    import os as _os, time as _time
+    monkeypatch.setattr(arvo_oss_crs, "OSS_CRS_DIR", tmp_path)
+    base = tmp_path / ".oss-crs-workdir" / "crs_compose"
+
+    def mk(run):
+        p = (base / "c1" / "address" / "runs" / run / "crs" / "crs-claude-code"
+             / "tgt" / "SHARED_DIR" / "mruby_proto_fuzzer")
+        p.mkdir(parents=True)
+        return p
+
+    mk("100")
+    newest = mk("200")
+    _os.utime(newest, (_time.time() + 100, _time.time() + 100))
+    assert arvo_oss_crs.find_shared_dir("asan") == newest
+
+
+def test_find_shared_dir_none_when_no_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(arvo_oss_crs, "OSS_CRS_DIR", tmp_path)
+    assert arvo_oss_crs.find_shared_dir("asan") is None
+
+
 def _write_log(tmp_path, records):
     p = tmp_path / "claude_stdout.log"
     p.write_text("\n".join(json.dumps(r) for r in records) + "\n")

@@ -23,6 +23,20 @@ from pathlib import Path
 import verify_fix
 
 COMPILE_TIMEOUT = verify_fix.COMPILE_TIMEOUT
+CLIENT_SCRIPT = Path(__file__).parent / "oss-crs-local" / "check-patch"
+REQUEST_NAME = ".check_request.diff"
+RESPONSE_NAME = ".check_response.txt"
+
+
+def prepare_channel(shared_dir, *, client_src=CLIENT_SCRIPT):
+    """Drop the `check-patch` client into the agent's SHARED_DIR and return the
+    (request, response) paths the responder watches. The agent runs the client from
+    its source tree; it writes requests here and reads verdicts back."""
+    shared_dir = Path(shared_dir)
+    dest = shared_dir / "check-patch"
+    dest.write_text(Path(client_src).read_text())
+    dest.chmod(0o755)
+    return shared_dir / REQUEST_NAME, shared_dir / RESPONSE_NAME
 
 
 def warm_container(instance: dict, *, run=subprocess.run) -> str:
@@ -60,3 +74,31 @@ def serve_loop(req_path: Path, resp_path: Path, *, bug, project, exec_fn, stop,
     while not stop():
         serve_one(req_path, resp_path, bug=bug, project=project, exec_fn=exec_fn)
         sleep(poll_seconds)
+
+
+def run_service(bug, instance, project, *, find_dir, stop, poll=2.0, sleep=time.sleep,
+                warm=warm_container, remove=None):
+    """Serve in-turn check-patch requests for the duration of one agent run.
+
+    The agent's SHARED_DIR only appears once OSS-CRS renders the run compose mid-launch,
+    so wait for it, then drop the client, warm one -vul container (reused across checks),
+    and serve until stop(). Best-effort: gated by OSS_CRS_CHECK_PATCH and wrapped so any
+    failure here can never break the agent run. End-to-end behavior is validated on a
+    live campaign; the unit tests cover channel prep + teardown."""
+    shared = None
+    while not stop() and shared is None:
+        shared = find_dir()
+        if shared is None:
+            sleep(poll)
+    if shared is None:
+        return
+    req, resp = prepare_channel(shared)
+    container = warm(instance)
+    remove = remove or (lambda c: subprocess.run(["docker", "rm", "-f", c], capture_output=True))
+    try:
+        exec_fn = lambda cmd, input=None, timeout=60: verify_fix.docker_exec(
+            container, cmd, input=input, timeout=timeout)
+        serve_loop(req, resp, bug=bug, project=project, exec_fn=exec_fn, stop=stop,
+                   poll_seconds=poll, sleep=sleep)
+    finally:
+        remove(container)
