@@ -20,17 +20,28 @@ Backend selection (LLM_BACKEND, else auto):
   api         - the raw Anthropic API via the anthropic SDK (needs an API key,
                 OAuth token, or LLM_BASE_URL). Default when an API key or a
                 custom LLM_BASE_URL is set.
+  openai      - an OpenAI-compatible server (llama.cpp behind the SSH tunnel, or
+                the OSS-CRS LiteLLM proxy) via the openai SDK. Auto-selected when
+                OPENAI_BASE_URL is set (and no Anthropic API key / endpoint); set
+                LLM_BACKEND=openai to force it. This is the same local-model
+                setup the repair agent uses via litellm-config-local.yaml.
   claude_cli  - drive the Claude Code CLI (`claude -p`) instead of the API, so a
                 Pro/Max SUBSCRIPTION runs the extractor with NO API key, on the
                 same sanctioned path as the OSS-CRS repair agent. Auto-selected
                 when no API key and no LLM_BASE_URL are set and `claude` is on PATH.
 
-  LLM_MODEL    - model id           (default: claude-opus-4-8)
-  LLM_BASE_URL - override endpoint   (e.g. a local Anthropic-compatible server)
+  LLM_MODEL       - model id          (default: claude-opus-4-8; llama.cpp ignores
+                    it, and the LiteLLM configs alias the Claude ids to the local
+                    model, so the default works everywhere)
+  LLM_BASE_URL    - Anthropic-compatible endpoint override (api backend)
+  OPENAI_BASE_URL - OpenAI-compatible endpoint (openai backend;
+                    default http://localhost:8080/v1 — the llama.cpp SSH tunnel)
+  OPENAI_API_KEY  - key for the openai backend (default sk-local-dummy; local
+                    llama.cpp ignores it, matching litellm-config-local.yaml)
 
-A local server that speaks the OpenAI API instead needs a small adapter client
-with the same `.messages.create(...)` shape — pass it via the `client=` arg
-(ClaudeCLIClient is exactly such an adapter). See the NETWORK LLM CALL SITE
+Any other server shape needs a small adapter client with the same
+`.messages.create(...)` contract — pass it via the `client=` arg (ClaudeCLIClient
+and OpenAIClient are exactly such adapters). See the NETWORK LLM CALL SITE
 marker in call_llm() for the exact seam to swap.
 """
 import json
@@ -116,10 +127,10 @@ def have_credentials() -> bool:
     choose real-vs-stub the SAME way `_default_client` picks a backend, without
     constructing a client or catching its RuntimeError.
 
-    Counts an API key, an OAuth token, OR the Claude Code CLI backend (its own login),
-    matching `_select_backend`.
+    Counts an API key, an OAuth token, the Claude Code CLI backend (its own login),
+    OR a local OpenAI-compatible server (needs no real key), matching `_select_backend`.
     """
-    if _select_backend() == "claude_cli":
+    if _select_backend() in ("claude_cli", "openai"):
         return True
     return bool(os.environ.get("ANTHROPIC_API_KEY")
                 or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
@@ -206,24 +217,66 @@ class ClaudeCLIClient:
         return _CLIResponse(data.get("result", ""))
 
 
+DEFAULT_OPENAI_BASE_URL = "http://localhost:8080/v1"   # llama.cpp SSH tunnel
+DEFAULT_OPENAI_API_KEY = "sk-local-dummy"               # local servers ignore it
+
+
+def _openai_args() -> dict:
+    """base_url/api_key for the OpenAI-compatible backend. Defaults target the
+    llama.cpp SSH tunnel on the host — the same server litellm-config-local.yaml
+    routes the repair agent to (from containers it's 172.17.0.1 instead)."""
+    return {
+        "base_url": os.environ.get("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
+        "api_key": os.environ.get("OPENAI_API_KEY", DEFAULT_OPENAI_API_KEY),
+    }
+
+
+class OpenAIClient:
+    """Adapter putting an OpenAI-compatible /v1/chat/completions server behind the
+    anthropic `.messages.create(...)` shape call_llm expects. Covers llama.cpp
+    (direct or via the SSH tunnel) and the OSS-CRS LiteLLM proxy alike.
+
+    The wrapped SDK client is injectable for tests.
+    """
+
+    def __init__(self, *, client=None):
+        if client is None:
+            import openai
+            client = openai.OpenAI(**_openai_args())
+        self._client = client
+        self.messages = self          # so `client.messages.create(...)` resolves here
+
+    def create(self, *, model, max_tokens, system, messages):
+        chat_messages = ([{"role": "system", "content": system}] if system else []) + messages
+        resp = self._client.chat.completions.create(
+            model=model, max_tokens=max_tokens, messages=chat_messages)
+        return _CLIResponse(resp.choices[0].message.content or "")
+
+
 def _select_backend() -> str:
-    """'api' or 'claude_cli'. Explicit LLM_BACKEND wins. Otherwise fall back to the
-    Claude Code CLI whenever there's no API key and no custom endpoint: the raw-API
+    """'api', 'openai', or 'claude_cli'. Explicit LLM_BACKEND wins. An Anthropic API
+    key or endpoint keeps the raw-API path. Otherwise prefer a configured local
+    OpenAI-compatible server (OPENAI_BASE_URL), then the Claude Code CLI: the raw-API
     path can't work on a bare subscription (OAuth tokens 429 on /v1/messages), but the
     CLI authenticates via its own login and runs on the subscription like the agent."""
     explicit = os.environ.get("LLM_BACKEND")
     if explicit:
         return explicit
     if (not os.environ.get("ANTHROPIC_API_KEY")
-            and not os.environ.get("LLM_BASE_URL")
-            and shutil.which("claude")):
-        return "claude_cli"
+            and not os.environ.get("LLM_BASE_URL")):
+        if os.environ.get("OPENAI_BASE_URL"):
+            return "openai"
+        if shutil.which("claude"):
+            return "claude_cli"
     return "api"
 
 
 def _default_client():
-    if _select_backend() == "claude_cli":
+    backend = _select_backend()
+    if backend == "claude_cli":
         return ClaudeCLIClient()
+    if backend == "openai":
+        return OpenAIClient()
     import anthropic
     return anthropic.Anthropic(**_client_args())
 

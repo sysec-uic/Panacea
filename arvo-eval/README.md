@@ -156,8 +156,11 @@ Plan:   `docs/superpowers/plans/2026-06-29-mruby-heuristic-learning-loop.md`
   - *API key:* set `ANTHROPIC_API_KEY` to bill the extractor to the API instead. You may
     export it alongside the OAuth token — `llm.py` prefers the key and only ever sends one
     credential per request, so there's no dual-auth rejection.
-  - *Local model:* set `LLM_BASE_URL` (Anthropic-compatible) or pass a custom `client=`.
-  - Force a backend explicitly with `LLM_BACKEND=api|claude_cli`.
+  - *Local model:* set `LLM_BACKEND=openai` (or just export `OPENAI_BASE_URL`) to use an
+    OpenAI-compatible server — defaults to `http://localhost:8080/v1`, the llama.cpp SSH
+    tunnel the repair agent's local-model setup uses. For an Anthropic-compatible server
+    set `LLM_BASE_URL` instead.
+  - Force a backend explicitly with `LLM_BACKEND=api|openai|claude_cli`.
 - The mruby correctness gate runs `cd /src/mruby && rake test`
   (see `MRUBY_TEST_CMD` in `verify_fix.py`).
 - The playbook is injected as `HEURISTICS.md` written by `injector.py` into the
@@ -199,8 +202,11 @@ Per-run records accumulate in `results/learn/ledger.jsonl`. The accumulated play
 state is `playbook/playbook_state_<pass>.json`.
 
 **Local model:** `llm.py` reads `LLM_MODEL` and `LLM_BASE_URL` from the environment, so
-point it at a local Anthropic-compatible endpoint without code changes. A local server
-that speaks the OpenAI API instead needs a small adapter client passed via `client=`.
+point it at a local Anthropic-compatible endpoint without code changes. For an
+OpenAI-compatible server (llama.cpp via the SSH tunnel, or a LiteLLM proxy) set
+`LLM_BACKEND=openai` — it defaults to `http://localhost:8080/v1` with a dummy key,
+matching the repair agent's `litellm-config-local.yaml`; override with
+`OPENAI_BASE_URL`/`OPENAI_API_KEY`.
 
 ### Repair agent on a local model (OSS-CRS)
 

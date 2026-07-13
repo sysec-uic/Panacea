@@ -28,6 +28,11 @@ def describe_feedback(verification: dict) -> str:
                 "so the behavior is wrong:\n"
                 f"{tail}\nYou likely silenced the symptom while leaving the real bug (or broke "
                 "valid behavior). Trace the bad data back to where it was produced.")
+    if cls == "patch_touches_harness":
+        return ("Your patch modifies the fuzz harness, which is test scaffolding -- it "
+                "cannot be changed in deployment, so this can never be the fix. The defect "
+                "is in the project's own source code. Use the crash trace to find the "
+                "project code that misbehaves and fix it there.")
     if cls == "build_failed":
         return "Your patch did not compile. Fix the build error and try again."
     if cls == "patch_apply_failed":
