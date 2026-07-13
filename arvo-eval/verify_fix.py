@@ -36,22 +36,35 @@ def results_dir(instance_id) -> Path:
 
 COMPILE_TIMEOUT = 2400  # seconds - some projects take a long time to rebuild
 RUN_TIMEOUT = 60
-# The correctness gate rebuilds mrbtest, which links libmruby.a — but `compile`
-# built that library with ASan + SanitizerCoverage instrumentation. A plain
-# `rake test` links mrbtest without those flags and fails on undefined __asan_* /
-# __sanitizer_cov_* symbols. Thread the container's own sanitizer + coverage flags
-# (the same ones `compile` uses: CFLAGS="$CFLAGS $SANITIZER_FLAGS $COVERAGE_FLAGS")
-# into the test build so mrbtest links against the runtime. Referencing the
-# container's SANITIZER_FLAGS_${SANITIZER}/COVERAGE_FLAGS keeps this correct across
-# sanitizers instead of hardcoding asan.
-MRUBY_TEST_CMD = (
-    'cd /src/mruby && '
-    'sf="SANITIZER_FLAGS_${SANITIZER}" && '
-    'flags="${!sf-} ${COVERAGE_FLAGS-}" && '
-    'export CFLAGS="$CFLAGS $flags" CXXFLAGS="$CXXFLAGS $flags" LDFLAGS="$LDFLAGS $flags" && '
-    'rake test'
-)
 TEST_TIMEOUT = 1800
+
+# `compile` rebuilds libmruby.a with whatever FUZZING_ENGINE/SANITIZER the bug
+# needs (afl-clang-fast for AFL, -fsanitize=memory for MSan, etc). A plain
+# `rake test` reuses that same libmruby.a for mrbtest -- a binary that carries no
+# fuzzing driver -- so anything AFL- or coverage-instrumented leaves mrbtest with
+# undefined __afl_area_ptr / __sanitizer_cov_* references at link time. Fixing
+# this by threading the fuzzing-engine flags into the test build (as a previous
+# version tried) only chases those symbols deeper (libAFLDriver.a needs its own
+# __afl_fuzz_ptr/__afl_persistent_loop/... runtime, which needs afl-clang-fast to
+# provide, and so on). The correctness gate doesn't need any of that: it just
+# needs libmruby.a rebuilt CLEAN, with plain clang and only the sanitizer that
+# matters for catching real regressions -- no fuzzing engine, no coverage
+# instrumentation. Confirmed empirically against both an AFL bug (441405357) and
+# an MSan bug (439291659): this reproduces the same clean pass as the untouched
+# libfuzzer+asan bugs (1657/1666, 0 crashes).
+MEMORY_TRACK_ORIGINS = " -fsanitize-memory-track-origins"
+
+
+def mruby_test_cmd(bug: dict) -> str:
+    sanitizer = SANITIZER_ENV.get((bug.get("sanitizer") or "").lower(), "address")
+    extra = MEMORY_TRACK_ORIGINS if sanitizer == "memory" else ""
+    flags = f"-fsanitize={sanitizer}{extra}"
+    return (
+        'cd /src/mruby && rake clean && '
+        'export CC=clang CXX=clang++ '
+        f'CFLAGS="-O1 {flags}" CXXFLAGS="-O1 {flags} -stdlib=libc++" LDFLAGS="{flags}" && '
+        'rake test'
+    )
 
 # Crash signatures keyed by sanitizer. A rebuilt target "still crashes" if any
 # of its sanitizer's signatures appears in the rerun output.
@@ -238,7 +251,7 @@ def verify(bug_id: int, keep: bool = False) -> dict:
         sanitizer = bug["sanitizer"].lower()
         make_test_ok = None
         if not crashed(sanitizer, run_output) and run_result.returncode == 0 and project == "mruby":
-            test_result = docker_exec(container, MRUBY_TEST_CMD, timeout=TEST_TIMEOUT)
+            test_result = docker_exec(container, mruby_test_cmd(bug), timeout=TEST_TIMEOUT)
             make_test_ok = test_result.returncode == 0
             verification["make_test_ok"] = make_test_ok
             verification["make_test_tail"] = "\n".join(
