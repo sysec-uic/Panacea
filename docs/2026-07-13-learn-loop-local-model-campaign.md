@@ -1,8 +1,8 @@
 # Learn-loop local-model campaign — postmortem & next steps (Jul 10–13, 2026)
 
 Campaign: `learn_loop.py --limit 3` (treatment pass) on mruby ARVO bugs, agent =
-OSS-CRS crs-claude-code driving Qwen3-Coder-30B (llama.cpp on cc@192.5.86.157,
-reached through an SSH tunnel). Killed Jul 13 ~00:40 after ~57.6 h on the first bug
+OSS-CRS crs-claude-code driving Qwen3-Coder-30B (llama.cpp on a remote GPU
+server, reached through an SSH tunnel). Killed Jul 13 ~00:40 after ~57.6 h on the first bug
 (439237851) with zero ledger entries. The pipeline itself ended the campaign in
 much better shape than it started; the blocker is model serving speed, not the
 loop design.
@@ -63,9 +63,9 @@ no drop killed an agent run.
 ### Model server measurements (Jul 12, mid-attempt-4)
 
 - 2-token completion round-trip: **13.0 s** (queueing behind agent work; single slot)
-- GPU: Quadro RTX 6000, **100% util**, 23.2 / 24.6 GB VRAM
+- GPU: single 24 GB card, **100% util**, 23.2 / 24.6 GB VRAM
 - llama-server: single slot, `-c 128000`, `-t 1`, no flash attention
-- idle `ollama` snap co-resident on the box (VRAM risk)
+- an idle secondary model runtime (ollama) co-resident on the server (VRAM risk)
 
 ### Docker cleanup (Jul 11, one-off sweep with the new reaper)
 
@@ -114,15 +114,15 @@ pace decayed from ~14 min/turn to ~80 min/turn as context grew. Attempt 4 ran
 work into "very defensive fix" flailing — it cannot build/test in its container
 (no make/rake toolchain), so it second-guesses endlessly.
 
-Current llama-server invocation (from `ps` on the cloud box):
+Current llama-server invocation (from `ps` on the GPU server):
 
 ```
 ./llama-server -m .../Qwen3-Coder-30B-A3B-Instruct-IQ4_NL.gguf \
   --host 127.0.0.1 --port 8080 -c 128000 --no-mmap -ngl -1 -t 1
 ```
 
-GPU: Quadro RTX 6000 24 GB, pegged at 100%, 23.1 GB used. An idle **ollama snap
-also runs on the box** — a VRAM landmine if anything loads a model through it.
+GPU: 24 GB, pegged at 100%, 23.1 GB used. An idle **ollama install also runs on
+the server** — a VRAM landmine if anything loads a model through it.
 
 **The SSH tunnel resets every few hours** (7 drops Jul 10–13, all
 `Read from remote host: Connection reset by peer` — server side). Restarts were
@@ -131,18 +131,18 @@ background task and relaunches on exit). Tunnel command with faster death
 detection:
 
 ```
-ssh -i ~/.ssh/cloud -N -o BatchMode=yes -o ExitOnForwardFailure=yes \
+ssh -i <key> -N -o BatchMode=yes -o ExitOnForwardFailure=yes \
   -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ConnectTimeout=10 \
-  -L 8080:localhost:8080 -L 172.17.0.1:8080:localhost:8080 cc@192.5.86.157
+  -L 8080:localhost:8080 -L 172.17.0.1:8080:localhost:8080 <user>@<gpu-host>
 ```
 
 ## Next steps (agreed / pending)
 
 1. **Tune llama-server** (deferred to next session, over ssh): add `-fa` (flash
    attention), `--cache-reuse 256`, more than `-t 1` threads; consider
-   `--parallel 2` trade-offs; stop the idle ollama snap. Re-measure turn latency
+   `--parallel 2` trade-offs; stop the idle ollama service. Re-measure turn latency
    at long context before relaunching a campaign.
-2. **Investigate the periodic connection resets** on the cloud box (sshd logs,
+2. **Investigate the periodic connection resets** on the GPU server (sshd logs,
    dmesg) — plausibly related to whatever else is unstable there.
 3. **Add a wall-clock cap per CRS run** (`OSS_CRS_RUN_TIMEOUT`; timed-out run =
    no-patch attempt that gets feedback) so one attempt can never eat 36 h again.
@@ -153,7 +153,7 @@ ssh -i ~/.ssh/cloud -N -o BatchMode=yes -o ExitOnForwardFailure=yes \
    a fix" forward to the next attempt. Next campaign should set e.g. `7200`.
 4. Consider `LEARN_MAX_ATTEMPTS=3` for the next campaign.
 5. Strategic option: one campaign on the OAuth/Claude compose
-   (`OSS_CRS_COMPOSE_FILE=$HOME/oss-crs/example/crs-claude-code/compose-oauth.yaml`)
+   (`OSS_CRS_COMPOSE_FILE=<oss-crs checkout>/example/crs-claude-code/compose-oauth.yaml`)
    to validate the full learning loop in hours, keeping the local model for
    after the serving fixes.
 6. Bigger lift, known gap: the agent container has no build toolchain, so it
