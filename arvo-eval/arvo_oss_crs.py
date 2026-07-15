@@ -174,21 +174,64 @@ def find_target_source_dir(sanitizer: str) -> Path | None:
     return max(dirs, key=lambda p: p.stat().st_mtime)
 
 
-def inject_heuristics(project_dir: Path, sanitizer: str, bug_id: int) -> None:
-    """Copy HEURISTICS.md from project_dir into the agent's source directory.
+def find_shared_dir(sanitizer: str, newer_than: float | None = None) -> Path | None:
+    """Host path backing the agent's /OSS_CRS_SHARED_DIR rw bind mount -- the live
+    agent<->host channel for the in-turn check-patch tool. Structure mirrors oss-crs
+    get_shared_dir: <sanitizer>/runs/<run_id>/crs/<crs_name>/<target>/SHARED_DIR/<harness>.
 
-    HEURISTICS.md is written to the fake OSS-Fuzz project dir by injector.py
-    but that dir never reaches the agent.  This bridges the gap by copying it
-    directly into the extracted target-source dir where the agent runs.
+    `newer_than` (epoch seconds) rejects SHARED_DIRs from prior/killed runs: pass the
+    time the current run's service started, so a stale dir can never win the newest-by-
+    mtime race and make the responder latch a dead channel."""
+    base = OSS_CRS_DIR / ".oss-crs-workdir" / "crs_compose"
+    sanitizer_dir = SANITIZER_DIR.get(sanitizer.lower(), sanitizer.lower())
+    dirs = [d for d in base.glob(f"*/{sanitizer_dir}/runs/*/crs/*/*/SHARED_DIR/*")
+            if newer_than is None or d.stat().st_mtime > newer_than]
+    if not dirs:
+        return None
+    return max(dirs, key=lambda p: p.stat().st_mtime)
+
+
+CHECK_PATCH_INSTRUCTION = (
+    "\n\n## Your primary loop: edit -> check-patch -> iterate\n"
+    "You have a `check-patch` tool. It builds the sanitizer target with your current "
+    "changes, re-runs the crashing input, and runs the test suite, then prints PASS "
+    "(the crash is gone and tests pass) or FAIL with exactly what is still wrong. "
+    "Run it from your source tree:\n"
+    "    bash \"$OSS_CRS_SHARED_DIR/check-patch\"\n"
+    "Do NOT try to understand the whole codebase before editing. As soon as you have "
+    "a root-cause hypothesis, make your best edit and run check-patch; let its FAIL "
+    "output drive the next read or edit. Checks are cheap (incremental rebuild -- "
+    "seconds to a couple of minutes after the first), so expect and budget for "
+    "several edit -> check cycles. An early wrong edit that check-patch refutes "
+    "teaches you more than an hour of reading. Submit only after check-patch prints "
+    "PASS.\n"
+)
+
+
+def _check_patch_enabled() -> bool:
+    return os.environ.get("OSS_CRS_CHECK_PATCH") == "1"
+
+
+def inject_heuristics(project_dir: Path, sanitizer: str, bug_id: int) -> None:
+    """Deliver the playbook (and, when enabled, the check-patch instruction) into the
+    agent's source directory.
+
+    HEURISTICS.md is written to the fake OSS-Fuzz project dir by injector.py but that
+    dir never reaches the agent; this bridges the gap by writing into the extracted
+    target-source dir where the agent runs. The check-patch instruction is appended
+    even when the playbook is empty, so the agent always learns the tool exists.
     """
-    src = project_dir / "HEURISTICS.md"
-    if not src.exists():
-        return
     target_source = find_target_source_dir(sanitizer)
     if target_source is None:
         print(f"[{bug_id}] Warning: could not find target-source dir, skipping heuristics injection")
         return
-    shutil.copy2(src, target_source / "HEURISTICS.md")
+    src = project_dir / "HEURISTICS.md"
+    text = src.read_text() if src.exists() else ""
+    if _check_patch_enabled():
+        text += CHECK_PATCH_INSTRUCTION
+    if not text.strip():
+        return
+    (target_source / "HEURISTICS.md").write_text(text)
     print(f"[{bug_id}] Injected HEURISTICS.md into {target_source}")
 
 
@@ -374,16 +417,47 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     timeout = _run_timeout()
     if timeout:
         print(f"[{bug_id}] Wall-clock cap OSS_CRS_RUN_TIMEOUT={timeout:.0f}s in effect.")
+
+    # In-turn self-check service (OSS_CRS_CHECK_PATCH=1): a background thread serves
+    # the agent's check-patch requests against a warm -vul container for the duration
+    # of this run. Best-effort and daemon, so it can never wedge or fail the run.
+    check_marker = output_dir / ".check_passed"
+    check_stop = check_thread = None
+    if _check_patch_enabled():
+        import threading
+        import check_server
+        from build_instance import build_instance
+        # Fresh marker per run: only a PASS from THIS run should let a submission through.
+        check_marker.unlink(missing_ok=True)
+        check_stop = threading.Event()
+        # Only latch a SHARED_DIR created after now, so a stale dir from a prior/killed
+        # run can't win the newest-by-mtime race (observed live: the responder attached
+        # to a dead campaign's channel and the agent got no working check-patch).
+        svc_start = time.time()
+        check_thread = threading.Thread(
+            target=check_server.run_service,
+            args=(bug, build_instance(bug), bug["project"]),
+            kwargs={"find_dir": lambda: find_shared_dir(sanitizer, newer_than=svc_start),
+                    "stop": check_stop.is_set, "marker_path": check_marker},
+            daemon=True)
+        check_thread.start()
+        print(f"[{bug_id}] check-patch self-check service running (OSS_CRS_CHECK_PATCH=1)")
+
     run_start = time.time()
-    timed_out = _run_agent_with_timeout(
-        [*base, "run", *compose_args,
-         "--fuzz-proj-path", str(project_dir),
-         "--target-harness", bug["fuzz_target"],
-         "--pov", str(pov_path),
-         "--incremental-build"],
-        cwd=OSS_CRS_DIR,
-        timeout=timeout,
-    )
+    try:
+        timed_out = _run_agent_with_timeout(
+            [*base, "run", *compose_args,
+             "--fuzz-proj-path", str(project_dir),
+             "--target-harness", bug["fuzz_target"],
+             "--pov", str(pov_path),
+             "--incremental-build"],
+            cwd=OSS_CRS_DIR,
+            timeout=timeout,
+        )
+    finally:
+        if check_stop is not None:
+            check_stop.set()
+            check_thread.join(timeout=30)
     run_elapsed = time.time() - run_start
     if timed_out:
         print(f"[{bug_id}] Agent run hit the {timeout:.0f}s cap after {run_elapsed:.0f}s; "
@@ -413,6 +487,10 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
         "project": bug["project"],
         "elapsed_seconds": round(run_elapsed),
         "timed_out": timed_out,
+        # check_required: enforcement is on; check_passed: the agent got a check-patch
+        # PASS this run. The repair loop rejects a submission that is required-but-unchecked.
+        "check_required": _check_patch_enabled(),
+        "check_passed": check_marker.exists(),
         "patches": n_patches,
         "patch_files": [str(output_dir / f"oss_crs_patch_{i}.diff") for i in range(len(patches))],
         "tokens": tokens,

@@ -5,6 +5,8 @@ request file on a shared channel; this responder runs the real build+PoC+rake-te
 against a warm -vul container and writes the verdict back. serve_one is
 channel-agnostic (paths + exec_fn are parameters) so it is unit-testable without
 Docker and reusable whichever OSS-CRS dir turns out to be the live channel."""
+import os
+
 import check_server
 
 
@@ -53,6 +55,63 @@ def test_serve_one_consumes_request_so_it_runs_once(tmp_path):
     check_server.serve_one(req, resp, **kw)
     check_server.serve_one(req, resp, **kw)   # request gone now
     assert len(runs) == 1
+
+
+def test_prepare_channel_drops_executable_client_and_returns_paths(tmp_path):
+    req, resp = check_server.prepare_channel(tmp_path)
+    client = tmp_path / "check-patch"
+    assert client.exists() and os.access(client, os.X_OK)   # agent can execute it
+    assert "git diff" in client.read_text()                  # it captures the agent's patch
+    assert req == tmp_path / ".check_request.diff"
+    assert resp == tmp_path / ".check_response.txt"
+
+
+def test_serve_one_writes_pass_marker_on_verified_correct(tmp_path):
+    req, resp, marker = tmp_path / "req.diff", tmp_path / "resp.txt", tmp_path / ".check_passed"
+    req.write_text("DIFF")
+    check_server.serve_one(req, resp, bug=BUG, project="mruby", exec_fn=None,
+                           run_check=lambda *a, **k: {"classification": "verified_correct"},
+                           marker_path=marker)
+    assert marker.exists()   # a PASS is recorded so the loop can require it before accepting
+
+
+def test_serve_one_no_marker_on_failing_check(tmp_path):
+    req, resp, marker = tmp_path / "req.diff", tmp_path / "resp.txt", tmp_path / ".check_passed"
+    req.write_text("DIFF")
+    check_server.serve_one(req, resp, bug=BUG, project="mruby", exec_fn=None,
+                           run_check=lambda *a, **k: {"classification": "still_crashes"},
+                           marker_path=marker)
+    assert not marker.exists()
+
+
+def test_run_service_waits_for_channel_prepares_it_and_tears_down(tmp_path):
+    # find_dir returns None once (channel not up yet), then the dir; stop() then ends
+    # the serve loop. Asserts it drops the client and always removes the container.
+    dirs = iter([None, tmp_path])
+    stops = iter([False, False, True, True, True])
+    removed = []
+
+    check_server.run_service(
+        BUG, {"instance_id": "1", "image_name": "img"}, "mruby",
+        find_dir=lambda: next(dirs, tmp_path),
+        stop=lambda: next(stops, True),
+        warm=lambda inst: "cont",
+        remove=removed.append,
+        sleep=lambda s: None)
+
+    assert (tmp_path / "check-patch").exists()   # channel prepared once it appeared
+    assert removed == ["cont"]                   # warm container always cleaned up
+
+
+def test_run_service_gives_up_if_channel_never_appears(tmp_path):
+    # If the agent run ends before SHARED_DIR shows up, stop() flips true and we bail
+    # without warming a container (nothing to clean up).
+    warmed = []
+    check_server.run_service(
+        BUG, {"instance_id": "1", "image_name": "img"}, "mruby",
+        find_dir=lambda: None, stop=lambda: True,
+        warm=lambda inst: warmed.append(1), remove=warmed.append, sleep=lambda s: None)
+    assert warmed == []
 
 
 def test_warm_container_recreates_and_returns_name():

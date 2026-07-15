@@ -7,26 +7,47 @@ reproducible crashes from fuzzing (the [ARVO](https://github.com/n132/ARVO) data
 OSS-Fuzz bugs), drives an AI repair agent to fix each one, verifies the fix for real,
 and, as the research bet, **learns from each fix so it gets better at the next one**.
 
-## Current status (2026-07-13)
+## Current status (2026-07-15)
 
 Two parallel efforts are running the same experiment on different backends:
 
-- **Claude/OAuth pass (this session):** control 13/30 confirmed, treatment 3/30,
-  both 100% fix rate after independent re-verification. Two control bugs are being
-  re-run after a real correctness-gate bug (spurious failures on `afl`/`msan` bugs)
-  was found and fixed. See [`EVALUATION.md`](EVALUATION.md) for the full methodology
-  and current results.
-- **Local-model campaign:** a July 10-13 run was killed after ~57h having solved 0
-  of 3 bugs. The diagnosis was that the *model was too slow*, not that the loop was
-  wrong. That session hardened infrastructure both passes now share: a per-run
-  wall-clock cap (`OSS_CRS_RUN_TIMEOUT`) so one flailing attempt can't eat 36h, and
-  tuned local-LLM serving speed (~1.5 min/cycle vs. the old ~25 min). See
+- **Claude/OAuth pass:** control 13/30 confirmed, treatment 3/30, both 100% fix rate
+  after independent re-verification. Two control bugs are being re-run after a real
+  correctness-gate bug (spurious failures on `afl`/`msan` bugs) was found and fixed.
+  See [`EVALUATION.md`](EVALUATION.md) for the full methodology and current results.
+- **Local-model campaign:** the bottleneck has moved twice as each layer was fixed.
+  A July 10-13 run (0 of 3 bugs in ~57h) pointed at raw serving speed. Two Jul 14-15
+  runs pointed at agent behavior: the model stalled in read-only recon, once trapping
+  itself in plan mode for 26+ minutes, and never submitted a patch. A Jul 15 campaign
+  shipped countermeasures for that (see below) and surfaced the next layer: even when
+  the agent works productively, it is fixing blind. It receives the raw proof-of-crash
+  input but not the sanitizer trace, and it cannot rebuild the fuzzer in its own
+  container to reproduce the crash, so it guesses the wrong subsystem instead of
+  following the trace to the faulting frame. See the postmortems
   [`docs/2026-07-13-learn-loop-local-model-campaign.md`](docs/2026-07-13-learn-loop-local-model-campaign.md)
-  for the full postmortem.
+  and
+  [`docs/2026-07-15-check-patch-gate-live-validation.md`](docs/2026-07-15-check-patch-gate-live-validation.md).
 
-Also in progress: an in-turn self-check tool (`check-patch`) so the agent can test its
-own patch mid-session instead of only finding out at the end of a run. Engine and host
-responder are built and tested; final wiring is pending live validation.
+Infrastructure hardened along the way, shared by both passes:
+
+- **Per-run wall-clock cap** (`OSS_CRS_RUN_TIMEOUT`) so one flailing attempt cannot
+  eat 36h. Shipped and validated live.
+- **In-turn self-check** (`check-patch`, behind `OSS_CRS_CHECK_PATCH=1`): a host-side
+  responder builds the sanitizer target with the agent's current edits, re-runs the
+  crash input, and runs the test suite, giving the agent a PASS/FAIL signal mid-session
+  instead of only at the end of a run. Built, enforced, and validated live at the
+  infrastructure level (channel wiring, warm check container, stale-directory race fix).
+- **Agent-behavior fixes** (Jul 15): plan mode disabled at the tool level so a weak
+  model cannot stall in it, the `check-patch` guidance reframed as the primary
+  edit-then-check-then-iterate loop, and `HEURISTICS.md` made discoverable so the agent
+  reads its task guidance instead of overlooking it. The Jul 15 run confirmed all three
+  hold in practice. Turn latency is fast early (~1 min per turn under ~110 KB of
+  context) but still decays to ~6 min per turn as context grows past ~300 KB, so the
+  long-context serving slowdown seen in earlier runs is reduced at the start but not
+  eliminated.
+
+The open lever for the next run: hand the agent the sanitizer crash trace at startup
+(the harness already has it) rather than making it reproduce the crash blind.
 
 ## How it works
 
@@ -90,7 +111,7 @@ Notable files inside `arvo-eval/`:
 | `learn_loop.py` | The chronological repair-and-learn loop |
 | `arvo_oss_crs.py` | Drives the OSS-CRS repair agent on one bug (wall-clock cap, docker image cleanup) |
 | `verify_fix.py` | Real verification: build, re-run PoC, run tests, classify. Also the `run_check` engine shared with the in-turn self-check |
-| `check_server.py` | Host-side responder for the agent's in-turn self-check (in progress) |
+| `check_server.py` | Host-side responder for the agent's in-turn `check-patch` self-check |
 | `differential_oracle.py` | Post-hoc lesson-quality grader vs the `-fix` image |
 
 ## Running it

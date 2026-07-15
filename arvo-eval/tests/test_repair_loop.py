@@ -74,6 +74,58 @@ def test_feedback_for_timeout_tells_agent_to_commit_to_a_fix():
     assert "patch" in fb.lower()
 
 
+def test_feedback_unchecked_directs_agent_to_check_patch():
+    fb = describe_feedback({"classification": "unchecked"})
+    assert "check-patch" in fb and "PASS" in fb
+
+
+def test_unchecked_submission_rejected_without_verify_then_solved_when_checked():
+    # Enforcement: a submission with check_required but no check_passed is rejected as
+    # "unchecked" WITHOUT calling verify; the agent is told to run check-patch. Once it
+    # submits a checked patch, verify runs and it can be accepted.
+    seen = []
+    verified = []
+
+    def agent(n, feedback):
+        seen.append(feedback)
+        passed = n >= 2
+        return {"diff": f"PATCH{n}", "trajectory_summary": "",
+                "check_required": True, "check_passed": passed}
+
+    def verify(bug_id, diff):
+        verified.append(diff)
+        return {"classification": "verified_correct"}
+
+    result = repair_with_retries(bug=BUG, agent=agent, verify=verify, max_attempts=5)
+    assert result["attempts"][0]["verdict"] == "unchecked"
+    assert verified == ["PATCH2"]          # verify never ran on the unchecked attempt 1
+    assert result["status"] == "solved"
+    assert "check-patch" in seen[1]
+
+
+def test_checked_submission_is_verified_normally():
+    def agent(n, feedback):
+        return {"diff": "P", "check_required": True, "check_passed": True}
+
+    def verify(bug_id, diff):
+        return {"classification": "still_crashes", "run_output_tail": "boom"}
+
+    result = repair_with_retries(bug=BUG, agent=agent, verify=verify, max_attempts=1)
+    assert result["attempts"][0]["verdict"] == "still_crashes"   # gate passed, verify ran
+
+
+def test_no_check_gate_when_not_required_is_backcompat():
+    # Flag off (no check_required in the run dict): submissions verify as before.
+    def agent(n, feedback):
+        return {"diff": "P"}
+
+    def verify(bug_id, diff):
+        return {"classification": "verified_correct"}
+
+    result = repair_with_retries(bug=BUG, agent=agent, verify=verify, max_attempts=1)
+    assert result["attempts"][0]["verdict"] == "verified_correct"
+
+
 def test_timed_out_no_patch_attempt_is_classified_and_fed_back():
     # A run that hit the wall-clock cap returns no diff but flags timed_out. The loop
     # must classify it as timed_out (not a generic no_changes) and feed a real

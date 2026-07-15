@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# check-patch -- validate your CURRENT patch before submitting.
+#
+# Run this from your source tree. It captures your uncommitted changes (`git diff`)
+# and hands them to a host-side verifier that: builds the sanitizer target with your
+# patch, re-runs the exact crashing input, and runs the project's test suite. It then
+# prints a verdict:
+#   PASS  -> the crash is gone AND tests pass; this patch is a valid fix, submit it.
+#   FAIL  -> what's still wrong (build error / still crashes / tests fail / touches harness).
+#
+# This is the same signal the outer loop judges you on -- use it to converge instead
+# of guessing. It never reveals the upstream fix.
+set -u
+DIR="${OSS_CRS_SHARED_DIR:-/OSS_CRS_SHARED_DIR}"
+REQ="$DIR/.check_request.diff"
+RESP="$DIR/.check_response.txt"
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "check-patch: run me from inside your project's git source tree."
+  exit 2
+fi
+
+rm -f "$RESP"
+git diff > "$REQ.tmp" || { echo "check-patch: 'git diff' failed in $(pwd)"; exit 2; }
+mv "$REQ.tmp" "$REQ"
+
+echo "check-patch: building + re-running the PoC + tests (this can take a few minutes)..."
+for _ in $(seq 1 900); do          # up to ~30 min
+  if [ -f "$RESP" ]; then
+    cat "$RESP"
+    rm -f "$RESP"
+    exit 0
+  fi
+  sleep 2
+done
+echo "check-patch: timed out waiting for the verifier."
+exit 1
