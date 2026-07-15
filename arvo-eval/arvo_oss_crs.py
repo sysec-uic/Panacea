@@ -192,13 +192,19 @@ def find_shared_dir(sanitizer: str, newer_than: float | None = None) -> Path | N
 
 
 CHECK_PATCH_INSTRUCTION = (
-    "\n\n## Validate your patch before submitting\n"
-    "You have a `check-patch` tool. Before you submit, run it from your source tree:\n"
+    "\n\n## Your primary loop: edit -> check-patch -> iterate\n"
+    "You have a `check-patch` tool. It builds the sanitizer target with your current "
+    "changes, re-runs the crashing input, and runs the test suite, then prints PASS "
+    "(the crash is gone and tests pass) or FAIL with exactly what is still wrong. "
+    "Run it from your source tree:\n"
     "    bash \"$OSS_CRS_SHARED_DIR/check-patch\"\n"
-    "It builds the sanitizer target with your current changes, re-runs the crashing "
-    "input, and runs the test suite, then prints PASS (the crash is gone and tests "
-    "pass -- submit it) or FAIL with exactly what is still wrong. Use it to converge; "
-    "do not submit a patch until check-patch says PASS.\n"
+    "Do NOT try to understand the whole codebase before editing. As soon as you have "
+    "a root-cause hypothesis, make your best edit and run check-patch; let its FAIL "
+    "output drive the next read or edit. Checks are cheap (incremental rebuild -- "
+    "seconds to a couple of minutes after the first), so expect and budget for "
+    "several edit -> check cycles. An early wrong edit that check-patch refutes "
+    "teaches you more than an hour of reading. Submit only after check-patch prints "
+    "PASS.\n"
 )
 
 
