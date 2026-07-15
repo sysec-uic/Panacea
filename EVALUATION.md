@@ -42,22 +42,26 @@ every bug.
 | **`oracle_confirmed` rate** | An independent cross-check: the patch is also compared against the real `-fix` image's behavior (6 probe scripts + the original PoC), never shown to the agent. Confirms the fix isn't a false positive (e.g. a patch that silences the crash by weakening the test harness itself, rather than fixing the bug). |
 | **`n_attempts`** (solved bugs only) | Efficiency: how many of the 5 allowed attempts it took. Lower is better; watch whether treatment trends down relative to control as the playbook accumulates. |
 
-## Current results (in progress, 2026-07-13)
+## Current results (in progress, 2026-07-15)
 
 The full 30-bug pass isn't finished for either arm yet. Numbers below cover only
 bugs whose classification has been **independently re-verified** under a corrected
-verification gate (see "Verification integrity" below); two control bugs are
-still being (re-)run and are excluded until they finish:
+verification gate (see "Verification integrity" below):
 
 | | Bugs confirmed | Fix rate | `oracle_confirmed` |
 |---|---|---|---|
-| **Control** | 13 / 30 | 13 / 13 (100%) | 13 / 13 |
-| **Treatment** | 3 / 30 | 3 / 3 (100%) | 3 / 3 |
+| **Control** | 14 / 30 | 14 / 14 (100%) | 14 / 14 |
+| **Treatment** | 14 / 30 | 14 / 14 (100%) | 14 / 14 |
 
-Treatment's sample (3 bugs) is far too small to compare against control yet. Both
-arms need to reach a comparable number of completed bugs before the fix-rate and
-attempt-count columns mean anything as a control/treatment delta. This table will
-be updated as both passes progress, including the two in-flight control bugs.
+Both arms are still 100% fix rate with no failures recorded, so there's no
+fix-rate delta to report yet (a ceiling effect isn't surprising this early --
+these are individually well-scoped bugs). The more informative signal so far is
+efficiency: comparing the 4 bugs both arms have completed within the same
+chronological window (the last ~20 of the 30 bugs, where the playbook has had
+time to accumulate real content -- see `arvo-eval`'s CLAUDE.md), treatment
+solved all 4 on the first attempt, while control needed 2-3 attempts on two of
+them. That's directional, not conclusive, at n=4. This table and the efficiency
+comparison will be updated as both passes progress.
 
 ## Verification integrity
 

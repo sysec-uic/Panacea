@@ -1,71 +1,34 @@
-# SWE-Agent ARVO Repair Eval
+# arvo-eval
 
-## Data
+The active system: orchestrator, verifier, learning loop, oracle, tests. See the
+[root README](../README.md) for the big picture (what Panacea is, the research
+questions, how the pieces fit together). This file is the runbook.
 
-Currently using the existing ARVO database (`arvo.db`) for pipeline development and
-validation. The final evaluation will use the newer dataset being rebuilt once it's ready.
+## Repo layout
 
-`bug_ids.txt` contains 10 straightforward bugs from `arvo.db` (spanning curl, skia, mupdf,
-imagemagick, harfbuzz, libxml2, wget2, and ffmpeg) used as a proof-of-concept validation set.
-
----
-
-# Mini-SWE-Agent
-
-### Setup
-
-1. Create and activate a virtual environment:
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   ```
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Configure your model and API key (this writes to mini-SWE-agent's global config,
-   not this repo):
-   ```bash
-   mini-extra config setup
-   ```
-   You'll need an API key for whichever model you choose (e.g. `GEMINI_API_KEY` for
-   Gemini models, Google AI Studio offers a free tier).
-
-### Smoke test
-
-First, confirm `arvo.db` is in place and all bugs load correctly (no API key needed):
-```bash
-python3 build_instance.py
-```
-You should see a one-line summary for each of the 10 bugs in `bug_ids.txt`.
-
-Then confirm your model/API setup works with the built-in hello-world example:
-```bash
-python3 -m minisweagent.run.hello_world -m gemini/gemini-2.5-flash --task "Create a file called test.txt with the text 'it works' inside it"
-```
-
-### Running
-
-`run_single.py` runs mini-SWE-agent end-to-end on one ARVO bug: it pulls the bug's
-Docker image, lets the agent attempt a fix, and saves the full trajectory under
-`results/<bug_id>/trajectory.json`.
-
-```bash
-python3 run_single.py
-```
-
-By default it runs the bug ID hardcoded as `BUG_ID` in `run_single.py` using
-`gemini/gemini-2.5-flash`. Override the model with the `MSWEA_MODEL_NAME` env var:
-
-```bash
-MSWEA_MODEL_NAME=gemini/gemini-2.5-pro python3 run_single.py
-```
+| Path | What's there |
+|---|---|
+| `learn_loop.py` | The chronological control/treatment repair-and-learn loop (main entry point) |
+| `arvo_oss_crs.py` | Drives the OSS-CRS repair agent on one bug (wall-clock cap, docker image cleanup, `HEURISTICS.md` injection) |
+| `repair_loop.py` | Per-bug retry loop with deployment-faithful feedback between attempts |
+| `verify_fix.py` | Real verification: build, re-run PoC, run tests, classify |
+| `differential_oracle.py` | Post-hoc lesson-quality grader vs the `-fix` image |
+| `playbook_store.py` / `injector.py` | Playbook state (load/save/render) and `HEURISTICS.md` injection |
+| `extract_heuristic.py` / `contrastive_extract.py` | LLM calls that distill a solved bug into a reusable lesson |
+| `llm.py` | LLM backend used by the extractor/curator/grader (Claude Code CLI, API key, or local model) |
+| `check_server.py` | Host-side responder for the agent's in-turn self-check (in progress) |
+| `mruby_bugs.py` / `build_instance.py` | Bug ordering and per-bug ARVO instance loading |
+| `results/` | Git-ignored. Per-bug outputs and `results/learn/ledger.jsonl` |
+| `playbook/` | Tracked. Accumulated `playbook_state_<pass>.json` per pass |
+| `tests/` | Pure-logic unit tests, no Docker/network |
+| [`legacy/`](legacy/README.md) | Pre-`learn_loop.py` single-bug runner (mini-SWE-agent). Superseded; kept for reference |
+| [`transfer/`](transfer/README.md) | Paused cross-project heuristic-transfer experiment |
 
 ---
 
 # OSS-CRS Pipeline (crs-claude-code)
 
-Uses [OSS-CRS](https://github.com/ossf/oss-crs) with Claude Code as the patching agent. Won DARPA AIxCC. Generally more effective than mini-SWE-agent for C/C++ bugs due to better tooling and an incremental build loop.
+Uses [OSS-CRS](https://github.com/ossf/oss-crs) with Claude Code as the patching agent. Won DARPA AIxCC. This is the repair-agent mechanism underneath both the learning loop and the legacy single-bug runner.
 
 ### Prerequisites
 
@@ -231,7 +194,7 @@ OpenAI-compatible server (e.g. llama.cpp reached through an SSH tunnel on
        arvo-eval/oss-crs-local/install.sh
        cd ~/oss-crs && uv run oss-crs prepare --compose-file example/crs-claude-code/compose-local.yaml
 
-3. Run as usual (`arvo_oss_crs.py`, `run_single.py`, ...) — the local compose is
+3. Run as usual (`arvo_oss_crs.py`, ...) — the local compose is
    now the default. Claude Code inside the CRS talks to OSS-CRS's LiteLLM proxy,
    which rewrites the Claude model aliases to `openai/local` at
    `http://172.17.0.1:8080/v1` (see `oss-crs-local/litellm-config-local.yaml`).
@@ -265,12 +228,16 @@ for p in ('control','treatment'):
 ```
 
 N=30 (≈20 in the holdout tail) is a **pilot** — read the control/treatment delta as
-directional signal, not statistical proof.
+directional signal, not statistical proof. See [`../EVALUATION.md`](../EVALUATION.md)
+for current results.
 
-### Unit tests
+---
+
+## Unit tests
 
 The pure-logic pieces (store, ledger, injector, verifier classification, extractor,
-curator, orchestrator) are covered without Docker or network:
+curator, orchestrator, transfer filter/eval-set/analysis) are covered without Docker
+or network:
 
 ```bash
 PYTHONPATH=. python3 -m pytest tests -q
