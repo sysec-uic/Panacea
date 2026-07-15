@@ -41,8 +41,10 @@ Infrastructure hardened along the way, shared by both passes:
   model cannot stall in it, the `check-patch` guidance reframed as the primary
   edit-then-check-then-iterate loop, and `HEURISTICS.md` made discoverable so the agent
   reads its task guidance instead of overlooking it. The Jul 15 run confirmed all three
-  hold in practice, and that turn latency now stays flat (~2 to 4 min per turn) as
-  context grows past 250 KB, versus the old decay to ~6.5 min per turn.
+  hold in practice. Turn latency is fast early (~1 min per turn under ~110 KB of
+  context) but still decays to ~6 min per turn as context grows past ~300 KB, so the
+  long-context serving slowdown seen in earlier runs is reduced at the start but not
+  eliminated.
 
 The open lever for the next run: hand the agent the sanitizer crash trace at startup
 (the harness already has it) rather than making it reproduce the crash blind.
