@@ -4,3 +4,6 @@ __pycache__/
 arvo.db
 results/
 arvo_new.db
+differential/golden/
+playbook/playbook_state_control.json
+playbook/playbook_state_treatment.json

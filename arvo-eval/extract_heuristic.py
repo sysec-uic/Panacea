@@ -26,7 +26,7 @@ def build_prompt(bug: dict, diff: str, trajectory_summary: str, verdict: str) ->
 Verdict: {verdict}.
 
 Crash output:
-{bug.get('crash_output', '')[:3000]}
+{(bug.get('crash_output') or '')[:3000]}
 
 Accepted fix diff:
 {diff[:6000]}
