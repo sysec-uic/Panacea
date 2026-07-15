@@ -60,10 +60,14 @@ ARVO_DB_PATH=arvo_new.db LEARN_PASS=control .venv/bin/python3 learn_loop.py --bu
 
 ## Current experiment state (as of 2026-07-12)
 
-- **Control:** 11/30 done, all `oracle_confirmed`, 100% fix rate
-- **Treatment:** 3/30 done
-- **Skipping bug `444775186`** — triggers Anthropic cyber safeguards (agent tries to
-  analyze crash via truncated PoC inputs, gets blocked). Add it back at the end or omit.
+- **Control:** 13/30 done, all `oracle_confirmed`, 100% fix rate
+- **Treatment:** 10/30 done, all `oracle_confirmed`, 100% fix rate so far
+- Bug `444775186` — previously flagged as reliably triggering Anthropic cyber
+  safeguards (agent tries to analyze crash via truncated PoC inputs, gets blocked).
+  Retried on treatment 2026-07-14 with playbook_version=9 and came back
+  `verified_correct` on the first attempt, no safeguard block. No longer treating
+  this as a hard skip — worth also retrying on control. Note it's absent from
+  control's ledger too (never actually skipped-and-recorded, just never run).
 - **Skipping bug `448044860`** — reliably stalls. It's the same bigint pool-escape bug
   class as heuristic `h-439279102`, but the numerically-correct fix exposes a real
   infinite-loop regression in `mpz_mod`/`div_2exp`; the agent finds this, reverts, and
@@ -174,3 +178,43 @@ PYTHONPATH=. .venv/bin/python3 -m pytest tests -q
 - **Bug order matters** — always use chronological order (`mruby_bug_ids(db)`) so the
   holdout is valid; `--bugs` flag accepts a comma-separated list in any order but the
   loop processes them in the order returned by `mruby_bug_ids`
+- **`~/oss-crs/.oss-crs-workdir/` grows unbounded** — every `build-target`/`run`
+  invocation leaves a full `builds/<id>/` and `runs/<id>/` tree under
+  `crs_compose/<hash>/<sanitizer>/{builds,runs}/`, never cleaned up automatically.
+  This is what filled the WSL2 VHDX to 268GB and dropped the Windows C: drive to
+  172MB free on 2026-07-13 (see git history around that date). Much of the tree is
+  root-owned (containers bind-mount in as root), so a plain `rm -rf` silently leaves
+  most of it behind (1.4M+ files) with nothing louder than per-file "Permission
+  denied" lines. **Use OSS-CRS's own cleanup command instead of manual `rm`/`sudo`**
+  — it uses Docker itself to remove root-owned files, no sudo needed:
+  ```bash
+  cd ~/oss-crs
+  uv run oss-crs clean --compose-file example/crs-claude-code/compose-oauth.yaml --artifacts --yes
+  ```
+  (`--artifacts` is required to also remove the `builds/`/`runs/` directories, not
+  just leftover Docker images; omitting the subcommand after `clean` cleans all
+  phases — prepare, build-target, and run.) Check
+  `du -h --max-depth=1 ~/oss-crs/.oss-crs-workdir` periodically; nothing in
+  `arvo-eval/results/` depends on this directory persisting. Freeing space inside
+  WSL2 does NOT shrink the Windows-visible VHDX file by itself — that needs
+  `wsl --shutdown` + `diskpart` → `select vdisk file=...` → `compact vdisk` run from
+  a genuine Windows terminal afterward.
+- **After wiping Docker images (e.g. `docker system prune -a`, or the disk-space
+  recovery above), re-run `oss-crs prepare` before anything else** — `crs-claude-code`
+  depends on a locally-built `claude-code-base:latest` image that is NOT pulled from
+  a registry; if it's missing, every `build-target`/`run` invocation fails instantly
+  (~7s) with `pull access denied, repository does not exist` for
+  `docker.io/library/claude-code-base:latest`, and the loop burns all 5 retry
+  attempts on this identical failure with `n_attempts: 5`, `no_changes`, and every
+  token field at 0. That token/timing signature (near-zero elapsed, all-zero tokens,
+  `n_attempts` maxed out, no `oss_crs_claude_stdout.log` written at all) is the
+  tell that the agent never even started, same underlying category as the OAuth
+  gotcha above but a different root cause — check the actual log for `pull access
+  denied` before assuming the agent genuinely failed. Fix:
+  ```bash
+  cd ~/oss-crs
+  uv run oss-crs prepare --compose-file example/crs-claude-code/compose-oauth.yaml
+  ```
+  This happened on 2026-07-13 after the WSL2 disk-space recovery wiped all Docker
+  images; bug `439494108`'s first treatment-pass result was invalid because of this
+  and had to be deleted from the ledger and re-run.

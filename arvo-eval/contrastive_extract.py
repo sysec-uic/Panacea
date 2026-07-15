@@ -41,7 +41,7 @@ def build_contrastive_prompt(bug: dict, rejected_diff: str, accepted_diff: str,
     return f"""Bug {bug['localId']} ({bug['crash_type']}, {bug['sanitizer']}, target {bug['fuzz_target']}).
 
 Crash output:
-{bug.get('crash_output', '')[:2500]}
+{(bug.get('crash_output') or '')[:2500]}
 
 === REJECTED ATTEMPT (verdict: {rejected_verdict}) ===
 {rejected_diff[:5000]}
