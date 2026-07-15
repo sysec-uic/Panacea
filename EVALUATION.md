@@ -41,12 +41,14 @@ every bug.
 | **Fix rate** (`verified_correct` / total attempted) | The primary metric. A patch is `verified_correct` only if it applies cleanly to a fresh vulnerable container, rebuilds, makes the crash go away, and passes mruby's own correctness test suite (`rake test`), not just "the agent produced a diff." |
 | **`oracle_confirmed` rate** | An independent cross-check: the patch is also compared against the real `-fix` image's behavior (6 probe scripts + the original PoC), never shown to the agent. Confirms the fix isn't a false positive (e.g. a patch that silences the crash by weakening the test harness itself, rather than fixing the bug). |
 | **`n_attempts`** (solved bugs only) | Efficiency: how many of the 5 allowed attempts it took. Lower is better; watch whether treatment trends down relative to control as the playbook accumulates. |
+| **Token counts** (input, output, cache-read, cache-write) | Cost/effort proxy, recorded per bug in the ledger. Cache-read dominates and scales with conversation length (more tool calls, more retries), so it's a more sensitive efficiency signal than fix rate at this sample size. |
 
 ## Current results (in progress, 2026-07-15)
 
-The full 30-bug pass isn't finished for either arm yet. Numbers below cover only
-bugs whose classification has been **independently re-verified** under a corrected
-verification gate (see "Verification integrity" below):
+The full 30-bug pass isn't finished for either arm yet. Numbers below cover the
+14 bugs both arms have completed **identically** (matched pairs), each
+independently re-verified under a corrected verification gate (see
+"Verification methodology" below):
 
 | | Bugs confirmed | Fix rate | `oracle_confirmed` |
 |---|---|---|---|
@@ -55,35 +57,39 @@ verification gate (see "Verification integrity" below):
 
 Both arms are still 100% fix rate with no failures recorded, so there's no
 fix-rate delta to report yet (a ceiling effect isn't surprising this early --
-these are individually well-scoped bugs). The more informative signal so far is
-efficiency: comparing the 4 bugs both arms have completed within the same
-chronological window (the last ~20 of the 30 bugs, where the playbook has had
-time to accumulate real content -- see `arvo-eval`'s CLAUDE.md), treatment
-solved all 4 on the first attempt, while control needed 2-3 attempts on two of
-them. That's directional, not conclusive, at n=4. This table and the efficiency
-comparison will be updated as both passes progress.
+these are individually well-scoped bugs). The signal so far is in effort, not
+outcome:
 
-## Verification integrity
+| Metric (avg. per bug, matched pairs) | Control | Treatment |
+|---|---|---|
+| Attempts | 1.29 | 1.00 |
+| Input tokens | 3,765 | 3,295 |
+| Output tokens | 857 | 903 |
+| Cache-read tokens | 2,656,600 | 2,475,208 |
+| Wall-clock | 778s | 657s |
 
-Two real correctness-gate bugs were found and fixed while validating results, both
-worth understanding before trusting any fix-rate number from this pipeline:
+That gap isn't flat across the run -- it grows as the playbook accumulates
+content. Splitting the same 14 bugs at chronological position 10 (of 30):
+early on (positions 1-10, playbook has 0-9 heuristics) attempts go from 1.11
+to 1.00 and cache-read is essentially a wash (treatment is actually 1.3%
+*higher*, since the injected playbook adds fixed context weight before it's
+paid for itself). By position 11+ (playbook has 11+ heuristics), attempts go
+from 1.60 to 1.00 (-37%) and cache-read drops 15%. At n=5 for the late split,
+that trend is directional, not conclusive -- but it's the strongest evidence
+so far that the mechanism is doing something, not just adding noise.
 
-1. **The verification gate wasn't gating.** An earlier version of the pipeline
-   classified any non-empty diff as `verified_correct` without actually rebuilding
-   and re-testing it. Fixed upstream; every result reported above was independently
-   re-verified against a fresh vulnerable container (rebuild, PoC re-run, `rake test`)
-   after the fix landed.
-2. **The correctness gate itself had a bug specific to non-default sanitizers.**
-   `rake test` was reusing the fuzzer/sanitizer-instrumented `libmruby.a` from the
-   patch-rebuild step, so a plain test binary with no fuzzing driver failed to link
-   against it, spuriously flagging 6 genuinely-correct patches (every `afl`- or
-   `msan`-tagged bug) as failing. Fixed by rebuilding cleanly for the test step
-   with no fuzzing instrumentation; confirmed empirically against both an AFL and
-   an MSan bug. One of those 6 flagged bugs (`440058794`) turned out to be a
-   **real** regression even after the fix. This was confirmed by reproducing the same
-   failure with the patch applied but not against the unpatched baseline, and is
-   being re-run through the full repair loop rather than left as a single-shot
-   verdict.
+## Verification methodology
+
+Every classification above is independently re-verified against a fresh
+vulnerable container -- never taken on the agent's own say-so. For each
+accepted patch: apply the diff, rebuild clean (no fuzzing instrumentation for
+the correctness gate), re-run the original crash PoC, and run the project's
+own test suite (`rake test`). Only a patch that clears all of that is
+`verified_correct`. The differential oracle then re-grades it a second way,
+independently: rebuild the patch in isolation and compare its behavior
+against the real upstream `-fix` image (never shown to the agent) on the PoC
+plus 6 deterministic probe scripts, catching a patch that silences the crash
+without actually fixing the underlying bug.
 
 ## Why N=30 is a pilot, not proof
 
