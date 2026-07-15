@@ -9,29 +9,35 @@ OSS-Fuzz bugs), drives an AI repair agent to fix each one, verifies the fix for 
 
 ---
 
-## Current status (2026-07-13)
+## Current status (2026-07-15)
 
-**A live campaign is running** and the pipeline is in its best shape yet. The headline
-work this session:
+**The pipeline is done and verified; the local model's behavior is the open problem.**
+Two live validation runs (Jul 14–15) proved every piece of infrastructure green — and
+showed the agent never reaching any of it: the model spends its whole budget reading,
+never makes an edit, never submits a patch.
 
 | Area | State |
 |---|---|
 | Repair + learning pipeline | ✅ Built and hardened (real verification, harness-patch rejection, stale-file guards, docker cleanup) |
 | Per-run wall-clock cap | ✅ Shipped & validated live — one attempt can no longer run 36h (`OSS_CRS_RUN_TIMEOUT`) |
-| Local-LLM serving speed | ✅ Tuned (flash-attention + KV-quant + 2 slots). Early result: **~1.5 min/cycle vs the old ~25 min**. High-context (>100k) confirmation in progress via the running campaign |
-| In-turn self-check (`check-patch`) | 🚧 Built & wired (behind `OSS_CRS_CHECK_PATCH=1`); end-to-end validation on the next campaign |
+| In-turn self-check (`check-patch`) | ✅ Built, enforced (`OSS_CRS_CHECK_PATCH=1`), and infrastructure-validated live (channel wiring, warm check container, stale-dir race fix) — but **never exercised**: the agent has yet to submit a patch for it to gate |
+| Agent-behavior countermeasures | 🚧 Shipped Jul 15, awaiting a live run: plan mode disabled (it trapped the model in a 26-min read-only stall), check-patch reframed as the primary *edit → check → iterate* loop, and `HEURISTICS.md` made discoverable (previously nothing told the agent it existed) |
+| Local-LLM serving speed | ⚠️ Tuned (flash-attention + KV-quant + 2 slots), but long context still degrades turns ~1.5 → ~6.5 min as reads balloon; capability, not just speed, now looks binding |
 | Differential `-fix` oracle | ✅ Implemented (post-hoc lesson-quality gate) |
 | Cross-project transfer experiment | 📋 Designed, not yet run |
 
-**Why it matters:** a July 10–13 campaign on a local model was killed after ~57h having
-solved 0 of 3 bugs — but the diagnosis was that the *model was too slow*, not that the
-loop was wrong. This session attacked both remaining blockers: **runaway attempts**
-(fixed with the timeout cap) and **serving speed** (tuned, now being confirmed at long
-context). The next blocker in line is that the agent **can't test its own patches**, which
-the in-progress `check-patch` tool addresses.
+**Why it matters:** the Jul 10–13 campaign (0 of 3 bugs in ~57h) pointed at serving
+speed; the Jul 14–15 runs sharpened the diagnosis. Qwen3-Coder-30B operates in
+"understand everything, submit once" mode — the opposite of the edit → check → iterate
+loop the pipeline now rewards. The shipped countermeasures attack that directly; the next
+campaign (run under `systemd-inhibit`, one attempt ridden to the 2h cap to test the
+`timed_out` feedback) decides whether prompt/harness work can save this model or whether
+the planned upgrade to a stronger served model is the real gate.
 
-See [`docs/2026-07-13-learn-loop-local-model-campaign.md`](docs/2026-07-13-learn-loop-local-model-campaign.md)
-for the full postmortem and next steps.
+See the postmortems:
+[`docs/2026-07-13-learn-loop-local-model-campaign.md`](docs/2026-07-13-learn-loop-local-model-campaign.md)
+and
+[`docs/2026-07-15-check-patch-gate-live-validation.md`](docs/2026-07-15-check-patch-gate-live-validation.md).
 
 ---
 
@@ -91,7 +97,7 @@ Each has an approved design doc under [`docs/superpowers/specs/`](docs/superpowe
 | `arvo-eval/learn_loop.py` | The chronological repair-and-learn loop |
 | `arvo-eval/arvo_oss_crs.py` | Drives the OSS-CRS repair agent on one bug (timeout cap, docker cleanup live here) |
 | `arvo-eval/verify_fix.py` | Real verification: build ▸ re-run PoC ▸ run tests ▸ classify. Also the `run_check` engine |
-| `arvo-eval/check_server.py` | Host-side responder for the agent's in-turn self-check (in progress) |
+| `arvo-eval/check_server.py` | Host-side responder for the agent's in-turn `check-patch` self-check |
 | `arvo-eval/differential_oracle.py` | Post-hoc lesson-quality grader vs the `-fix` image |
 | `docs/` | The postmortem, design specs, and implementation plans |
 
