@@ -51,8 +51,20 @@ def describe_feedback(verification: dict) -> str:
     return f"Attempt rejected ({cls}). Try a different approach."
 
 
-def repair_with_retries(*, bug, agent, verify, max_attempts=5):
+def repair_with_retries(*, bug, agent, verify, max_attempts=5,
+                        resume_attempts=None, resume_feedback="", on_attempt=None):
     """Drive up to `max_attempts` repair attempts with feedback between them.
+
+    `resume_attempts` (already-completed attempt records from a prior, interrupted
+    run of this same bug) and `resume_feedback` (the feedback text for the next
+    attempt, as of the last resumed attempt) let a caller continue a bug mid-loop
+    instead of restarting at attempt 1 -- e.g. after a usage cap killed the process
+    partway through. Numbering picks up at `len(resume_attempts) + 1`.
+
+    `on_attempt`, if given, is called with each attempt's record right after it
+    completes (before the loop continues or returns) -- the durable-checkpoint hook,
+    so a caller can persist progress attempt-by-attempt without this function doing
+    any IO itself.
 
     Returns a dict:
       status: "solved" | "exhausted"
@@ -63,10 +75,11 @@ def repair_with_retries(*, bug, agent, verify, max_attempts=5):
                         i.e. there is something to learn from its own gap.
     """
     bug_id = bug["localId"]
-    attempts = []
-    feedback = ""
+    attempts = list(resume_attempts) if resume_attempts else []
+    feedback = resume_feedback
+    start = len(attempts) + 1
 
-    for n in range(1, max_attempts + 1):
+    for n in range(start, max_attempts + 1):
         run = agent(n, feedback)
         diff = run.get("diff", "")
         if not diff.strip():
@@ -85,14 +98,21 @@ def repair_with_retries(*, bug, agent, verify, max_attempts=5):
         verdict = verification.get("classification", "no_changes")
         record = {"attempt": n, "diff": diff, "verdict": verdict,
                   "trajectory_summary": run.get("trajectory_summary", "")}
-        attempts.append(record)
 
         if verdict == "verified_correct":
+            record["feedback_for_next"] = ""
+            attempts.append(record)
+            if on_attempt:
+                on_attempt(record)
             prior_rejected = next((a for a in reversed(attempts[:-1]) if a["verdict"] != "verified_correct"), None)
             pair = (prior_rejected, record) if prior_rejected else None
             return {"status": "solved", "attempts": attempts, "accepted": record,
                     "contrastive_pair": pair}
 
         feedback = describe_feedback(verification)
+        record["feedback_for_next"] = feedback
+        attempts.append(record)
+        if on_attempt:
+            on_attempt(record)
 
     return {"status": "exhausted", "attempts": attempts, "accepted": None, "contrastive_pair": None}

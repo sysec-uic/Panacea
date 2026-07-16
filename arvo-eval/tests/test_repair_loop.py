@@ -146,3 +146,71 @@ def test_timed_out_no_patch_attempt_is_classified_and_fed_back():
     assert result["status"] == "solved"
     # Attempt 2 was told, in words, that attempt 1 ran out of time.
     assert "time" in seen[1].lower()
+
+
+def test_resume_continues_numbering_and_feedback_from_checkpoint():
+    # Simulates a process killed after attempt 1 (e.g. a usage cap): the caller
+    # already has attempt 1's record on disk and re-enters with it as resume_attempts.
+    # The loop must NOT re-run attempt 1 -- it continues at attempt 2 using the
+    # feedback that was computed for attempt 1's rejection.
+    prior = {"attempt": 1, "diff": "GUARD_DIFF", "verdict": "fixed_tests_failed",
+             "trajectory_summary": "t1", "feedback_for_next": "PRIOR FEEDBACK TEXT"}
+
+    seen = []
+
+    def agent(attempt_no, feedback):
+        seen.append((attempt_no, feedback))
+        return {"diff": "FIX_DIFF"}
+
+    def verify(bug_id, diff):
+        return {"classification": "verified_correct"}
+
+    result = repair_with_retries(bug=BUG, agent=agent, verify=verify, max_attempts=5,
+                                 resume_attempts=[prior], resume_feedback=prior["feedback_for_next"])
+
+    assert seen == [(2, "PRIOR FEEDBACK TEXT")]     # numbering picked up at 2, not 1
+    assert result["status"] == "solved"
+    assert len(result["attempts"]) == 2             # the resumed attempt 1 + the new attempt 2
+    assert result["attempts"][0] is prior
+    # The contrastive pair still sees the resumed (pre-restart) rejected attempt.
+    rejected, accepted = result["contrastive_pair"]
+    assert rejected is prior and accepted["diff"] == "FIX_DIFF"
+
+
+def test_on_attempt_hook_fires_for_every_attempt_including_resumed_run():
+    recorded = []
+
+    def agent(attempt_no, feedback):
+        return {"diff": "A" if attempt_no == 1 else "B"}
+
+    def verify(bug_id, diff):
+        return {"classification": "still_crashes", "run_output_tail": "x"} if diff == "A" else \
+               {"classification": "verified_correct"}
+
+    result = repair_with_retries(bug=BUG, agent=agent, verify=verify, max_attempts=5,
+                                 resume_attempts=[], on_attempt=lambda r: recorded.append(r["attempt"]))
+    assert recorded == [1, 2]
+    assert result["status"] == "solved"
+
+
+def test_resuming_bug_that_hit_max_attempts_returns_exhausted_without_calling_agent():
+    # A checkpoint with max_attempts records means a prior run used up the whole
+    # budget before dying; resuming must not grant extra attempts.
+    prior_attempts = [
+        {"attempt": n, "diff": "X", "verdict": "still_crashes", "feedback_for_next": "fb"}
+        for n in range(1, 4)
+    ]
+    calls = []
+
+    def agent(attempt_no, feedback):
+        calls.append(attempt_no)
+        return {"diff": "X"}
+
+    def verify(bug_id, diff):
+        return {"classification": "still_crashes", "run_output_tail": "x"}
+
+    result = repair_with_retries(bug=BUG, agent=agent, verify=verify, max_attempts=3,
+                                 resume_attempts=prior_attempts)
+    assert calls == []
+    assert result["status"] == "exhausted"
+    assert len(result["attempts"]) == 3
