@@ -18,6 +18,7 @@ from curator import maybe_compress
 from ledger import append_record, read_records
 from mruby_bugs import mruby_bug_ids
 from repair_loop import repair_with_retries
+from attempt_checkpoint import read_checkpoint, append_checkpoint, clear_checkpoint
 
 
 RESULTS_BASE = Path(__file__).parent / "results"
@@ -82,13 +83,21 @@ def _default_grade(bug, diff):
 def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
              project_dir_for, agent=_default_agent, verify=_default_verify,
              extract=_default_extract, contrastive=_default_contrastive,
-             grade=_default_grade, max_attempts=5, skip_build=False):
+             grade=_default_grade, max_attempts=5, skip_build=False,
+             checkpoint_path_for=None):
     """Run one full pass over `bugs` (already in chronological order).
 
     Each bug gets up to `max_attempts` attempts; between them the agent is re-run with
     deployment-faithful feedback (delivered the same way as the playbook -- written into
     the agent's project dir). Both the playbook and the feedback reach the agent via
     `inject`, so the agent contract stays `agent(bug_id, project_dir, skip_build)`.
+
+    `checkpoint_path_for(bug_id) -> Path | None`, if given, enables attempt-level resume:
+    each attempt is durably checkpointed as it completes, so a run killed mid-bug (e.g. a
+    usage cap) picks back up at the next attempt on re-run instead of restarting the bug's
+    whole `max_attempts` budget. Bug-level resume (the `done` set below) already covers a
+    bug that's fully finished; this covers one still in progress. Off by default so
+    existing callers/tests are unaffected.
     """
     state = load_state(state_path)
     # Resume: a bug already recorded in the ledger for this pass is done -- its
@@ -105,6 +114,21 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
         project_dir.mkdir(parents=True, exist_ok=True)
         last_run = {}
         total_tokens: dict = {}
+
+        checkpoint_path = checkpoint_path_for(bug_id) if checkpoint_path_for else None
+        resume_attempts = read_checkpoint(checkpoint_path) if checkpoint_path else []
+        resume_feedback = resume_attempts[-1].get("feedback_for_next", "") if resume_attempts else ""
+        for prior in resume_attempts:
+            for k, v in prior.get("tokens", {}).items():
+                total_tokens[k] = total_tokens.get(k, 0) + v
+        if resume_attempts:
+            print(f"[{bug_id}] resuming pass={pass_name} at attempt {len(resume_attempts) + 1} "
+                  f"({len(resume_attempts)} attempt(s) already checkpointed)")
+
+        def on_attempt(record, _checkpoint_path=checkpoint_path):
+            if _checkpoint_path is not None:
+                tokens = dict(last_run.get("summary", {}).get("tokens", {}))
+                append_checkpoint(_checkpoint_path, {**record, "tokens": tokens})
 
         def attempt_agent(attempt_no, feedback, _bug_id=bug_id, _project_dir=project_dir):
             # Render is holdout-filtered: only lessons from strictly-earlier bugs. Read at
@@ -124,7 +148,10 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
                     "check_passed": run.get("check_passed", False)}
 
         result = repair_with_retries(bug=bug, agent=attempt_agent, verify=verify,
-                                     max_attempts=max_attempts)
+                                     max_attempts=max_attempts,
+                                     resume_attempts=resume_attempts,
+                                     resume_feedback=resume_feedback,
+                                     on_attempt=on_attempt)
         solved = result["status"] == "solved"
         final_verdict = "verified_correct" if solved else (
             result["attempts"][-1]["verdict"] if result["attempts"] else "no_changes")
@@ -150,6 +177,8 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
                   "n_attempts": len(result["attempts"]), "playbook_version": playbook_version_snap,
                   **oracle_fields, **({"tokens": total_tokens} if total_tokens else {})}
         append_record(ledger_path, record)
+        if checkpoint_path is not None:
+            clear_checkpoint(checkpoint_path)
         records.append({**record, **{k: last_run[k] for k in ("injected_seen",) if k in last_run}})
 
         # Learn from all solved bugs. Extraction (an LLM call) runs AFTER the ledger
@@ -210,6 +239,7 @@ def main():
     inject_enabled = pass_name == "treatment"
     print(f"[learn_loop] pass={pass_name} inject={inject_enabled} "
           f"bugs={len(bugs)} max_attempts={os.environ.get('LEARN_MAX_ATTEMPTS', '5')}")
+    checkpoint_path_for = lambda bid: RESULTS_BASE / pass_name / str(bid) / "attempts.jsonl"
     run_pass(
         bugs=bugs, pass_name=pass_name, inject_enabled=inject_enabled,
         state_path=pb_dir / f"playbook_state_{pass_name}.json",
@@ -217,6 +247,7 @@ def main():
         project_dir_for=project_dir_for,
         max_attempts=int(os.environ.get("LEARN_MAX_ATTEMPTS", "5")),
         skip_build="--skip-build" in sys.argv,
+        checkpoint_path_for=checkpoint_path_for,
     )
 
 

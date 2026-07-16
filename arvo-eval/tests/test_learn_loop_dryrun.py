@@ -185,6 +185,96 @@ def test_resume_is_scoped_to_pass_name(tmp_path):
     assert called == [100]   # different pass -> not skipped
 
 
+def test_attempt_level_resume_continues_after_simulated_crash(tmp_path):
+    # Simulates the real usage-cap scenario: attempt 1 fails and gets checkpointed,
+    # then the process dies (here: the agent raises) before attempt 2 ever runs. A
+    # second run_pass() call, same checkpoint/ledger/state paths, must pick up at
+    # attempt 2 -- not re-run attempt 1 -- and the final ledger record must reflect
+    # both attempts (count and summed tokens).
+    from attempt_checkpoint import read_checkpoint
+
+    ledger = tmp_path / "ledger.jsonl"
+    state_path = tmp_path / "state.json"
+    checkpoint_path_for = lambda bid: tmp_path / "checkpoints" / str(bid) / "attempts.jsonl"
+
+    class SimulatedCrash(Exception):
+        pass
+
+    calls = []
+
+    def dying_agent(bug_id, project_dir, skip_build):
+        calls.append(bug_id)
+        if len(calls) == 1:
+            return {"diff": "GUARD_DIFF", "trajectory_summary": "t1",
+                    "summary": {"tokens": {"input_tokens": 10}}}
+        raise SimulatedCrash("usage ran out")
+
+    def crash_verify(bug_id, diff):
+        return {"classification": "fixed_tests_failed", "make_test_tail": "boom"}
+
+    with pytest.raises(SimulatedCrash):
+        run_pass(
+            bugs=[_bug(100)], pass_name="treatment", inject_enabled=True,
+            state_path=state_path, ledger_path=ledger,
+            project_dir_for=lambda bid: tmp_path / f"proj-{bid}",
+            agent=dying_agent, verify=crash_verify, extract=stub_extract,
+            grade=_grade_stub("no_fix_available"),
+            checkpoint_path_for=checkpoint_path_for,
+        )
+
+    ckpt = checkpoint_path_for(100)
+    saved = read_checkpoint(ckpt)
+    assert len(saved) == 1
+    assert saved[0]["verdict"] == "fixed_tests_failed"
+    from ledger import read_records
+    assert read_records(ledger) == []   # never reached the ledger write
+
+    resumed_calls = []
+
+    def resuming_agent(bug_id, project_dir, skip_build):
+        resumed_calls.append(bug_id)
+        return {"diff": "FIX_DIFF", "trajectory_summary": "t2",
+                "summary": {"tokens": {"input_tokens": 5}}}
+
+    def resuming_verify(bug_id, diff):
+        return {"classification": "verified_correct", "make_test_ok": True}
+
+    result = run_pass(
+        bugs=[_bug(100)], pass_name="treatment", inject_enabled=True,
+        state_path=state_path, ledger_path=ledger,
+        project_dir_for=lambda bid: tmp_path / f"proj-{bid}",
+        agent=resuming_agent, verify=resuming_verify, extract=stub_extract,
+        grade=_grade_stub("no_fix_available"),
+        checkpoint_path_for=checkpoint_path_for,
+    )
+
+    assert len(resumed_calls) == 1                        # only the new attempt ran
+    assert result[0]["classification"] == "verified_correct"
+    assert result[0]["n_attempts"] == 2                    # 1 resumed + 1 new
+    assert result[0]["tokens"] == {"input_tokens": 15}     # 10 checkpointed + 5 new
+    assert read_checkpoint(ckpt) == []                     # cleared once fully recorded
+
+
+def test_checkpoint_path_for_none_disables_resume_entirely(tmp_path):
+    # Default behavior (no checkpoint_path_for) must be unaffected -- a bug that
+    # "crashes" simply propagates the exception with nothing persisted anywhere.
+    class SimulatedCrash(Exception):
+        pass
+
+    def dying_agent(bug_id, project_dir, skip_build):
+        raise SimulatedCrash
+
+    with pytest.raises(SimulatedCrash):
+        run_pass(
+            bugs=[_bug(100)], pass_name="treatment", inject_enabled=True,
+            state_path=tmp_path / "state.json", ledger_path=tmp_path / "ledger.jsonl",
+            project_dir_for=lambda bid: tmp_path / f"proj-{bid}",
+            agent=dying_agent, verify=stub_verify, extract=stub_extract,
+            grade=_grade_stub("no_fix_available"),
+        )
+    assert not (tmp_path / "checkpoints").exists()
+
+
 # ---------------------------------------------------------------------------
 # Oracle veto-and-promote tests
 # ---------------------------------------------------------------------------
