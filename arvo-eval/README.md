@@ -12,6 +12,7 @@ questions, how the pieces fit together). This file is the runbook.
 | `arvo_oss_crs.py` | Drives the OSS-CRS repair agent on one bug (wall-clock cap, docker image cleanup, `HEURISTICS.md` injection) |
 | `repair_loop.py` | Per-bug retry loop with deployment-faithful feedback between attempts |
 | `attempt_checkpoint.py` | Durable per-attempt checkpoints so a killed run resumes mid-bug |
+| `live_status.py` | Generic live terminal panel (`LEARN_LIVE_UI=1`) — phases, stats, tallies, q/Ctrl-C to abort |
 | `verify_fix.py` | Real verification: build, re-run PoC, run tests, classify |
 | `differential_oracle.py` | Post-hoc lesson-quality grader vs the `-fix` image |
 | `playbook_store.py` / `injector.py` | Playbook state (load/save/render) and `HEURISTICS.md` injection |
@@ -187,6 +188,33 @@ real attempts, so the next resume retries the *same* attempt number — and noth
 written to the ledger. Since the next bug would hit the identical cap within seconds,
 the whole pass stops there instead of grinding through the rest of `bugs`, and prints
 the reset time the CLI itself reports. Re-run the same command once usage resets.
+
+### Live status UI (optional)
+
+Set `LEARN_LIVE_UI=1` to replace the raw OSS-CRS log spam with a live terminal panel
+(`live_status.py`, generic/pipeline-agnostic — nothing in it knows about ARVO or mruby)
+showing real phase progress (prepare → build target → running agent), a playbook stat
+(treatment only) and control/treatment tallies straight from the ledger:
+
+```bash
+LEARN_LIVE_UI=1 ARVO_DB_PATH=arvo_new.db LEARN_PASS=control python3 learn_loop.py --bugs <id>
+```
+
+Needs a real interactive terminal (a backgrounded/non-tty run silently falls back to
+normal behavior). Keys:
+- `v` — reveal/hide the last ~20 lines of real, captured OSS-CRS output. The
+  build-target and run subprocesses are piped through `on_line` instead of inheriting
+  the terminal directly, so nothing prints outside the panel while it's up.
+- `q` or Ctrl-C — abort cleanly. Sends a real `SIGTERM` to whichever OSS-CRS subprocess
+  is currently live and relies on OSS-CRS's own graceful shutdown to tear down its
+  docker containers (verified against real runs, both during build-target and during
+  the agent phase). An aborted attempt is **not** checkpointed and **not** written to
+  the ledger — same zero-cost-attempt treatment as a usage-cap cutoff — so re-running
+  the same command resumes cleanly.
+
+Known gap: only the prepare/build/agent phases are tracked live; verify and the
+differential oracle (which run after `run_oss_crs` returns) still show as coarse/instant
+in the panel today.
 
 ### Running the experiment
 
