@@ -17,6 +17,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
+from typing import Callable
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -78,17 +79,20 @@ class LiveStatus:
         position: tuple[int, int] | None = None,
         console: Console | None = None,
         raw_maxlen: int = 500,
+        on_abort: Callable[[], None] | None = None,
     ):
         self.command = command
         self.subject = subject
         self.position = position
         self.console = console or Console()
+        self.on_abort = on_abort
         self._phases: list[Phase] = []
         self._stats: dict[str, str] = {}
         self._tallies: list[Tally] = []
         self._raw: deque[str] = deque(maxlen=raw_maxlen)
         self._show_raw = False
         self._spin_idx = 0
+        self._abort_requested = False
         self._lock = threading.Lock()
         self._live: Live | None = None
         self._stop_keys = threading.Event()
@@ -128,17 +132,33 @@ class LiveStatus:
         if self._live is not None:
             self._live.__exit__(*exc)
 
+    @property
+    def abort_requested(self) -> bool:
+        with self._lock:
+            return self._abort_requested
+
+    def _handle_key(self, ch: str) -> None:
+        if ch == "v":
+            with self._lock:
+                self._show_raw = not self._show_raw
+            self._refresh()
+        elif ch == "q":
+            with self._lock:
+                already = self._abort_requested
+                self._abort_requested = True
+            self._refresh()
+            # Only fire once -- the callback tears down docker, which is not
+            # idempotent-cheap to call repeatedly on repeated keypresses.
+            if not already and self.on_abort is not None:
+                self.on_abort()
+
     def _listen_keys(self) -> None:
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
         try:
             tty.setcbreak(fd)
             while not self._stop_keys.is_set():
-                ch = sys.stdin.read(1)
-                if ch == "v":
-                    with self._lock:
-                        self._show_raw = not self._show_raw
-                    self._refresh()
+                self._handle_key(sys.stdin.read(1))
         except Exception:
             pass
         finally:
@@ -159,6 +179,7 @@ class LiveStatus:
             tallies = list(self._tallies)
             raw = list(self._raw)
             show_raw = self._show_raw
+            aborting = self._abort_requested
 
         rows = []
         for p in phases:
@@ -191,7 +212,10 @@ class LiveStatus:
         if tally_line:
             items.append(Text(tally_line, style="grey50"))
 
-        items.append(Text("hide raw (v)" if show_raw else "show raw (v)", style="grey35", justify="right"))
+        if aborting:
+            items.append(Text("aborting -- tearing down containers...", style="red"))
+        controls = ("hide raw (v)" if show_raw else "show raw (v)") + "    abort (q)"
+        items.append(Text(controls, style="grey35", justify="right"))
 
         if show_raw:
             raw_body = "\n".join(raw[-20:]) if raw else "(no output yet)"
