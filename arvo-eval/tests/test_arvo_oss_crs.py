@@ -1,5 +1,6 @@
 """Compose-file selection, preflight reachability, and token-count parsing."""
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -159,13 +160,19 @@ def test_run_timeout_env_parsed_as_seconds(monkeypatch):
 class FakeProc:
     """Minimal Popen stand-in. `wait_results` is consumed in order across
     successive .wait() calls: an Exception instance is raised, an int is
-    returned (and stored as .returncode)."""
+    returned (and stored as .returncode). `stdout_lines`, if given, backs
+    .stdout with an io.StringIO so `iter(proc.stdout.readline, "")` (the real
+    drain loop in _run_agent_with_timeout) works exactly like it would against
+    a real Popen text-mode pipe."""
 
-    def __init__(self, wait_results):
+    def __init__(self, wait_results, stdout_lines=None):
         self._results = list(wait_results)
         self.returncode = None
         self.terminate_calls = 0
         self.kill_calls = 0
+        if stdout_lines is not None:
+            import io
+            self.stdout = io.StringIO("".join(l + "\n" for l in stdout_lines))
 
     def wait(self, timeout=None):
         result = self._results.pop(0)
@@ -313,6 +320,63 @@ def test_abort_controller_switches_registration_across_phases():
     controller.abort()
     assert run_proc.terminate_calls == 1
     assert build_proc.terminate_calls == 0
+
+
+def test_on_line_receives_every_line_from_the_subprocess():
+    proc = FakeProc([0], stdout_lines=["CC src/foo.c -> foo.o", "CC src/bar.c -> bar.o", "OK Build"])
+    received = []
+
+    timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
+        popen=lambda cmd, cwd, **kw: proc, on_line=received.append)
+
+    assert received == ["CC src/foo.c -> foo.o", "CC src/bar.c -> bar.o", "OK Build"]
+    assert timed_out is False
+    assert aborted is False
+
+
+def test_on_line_none_does_not_pipe_stdout_at_all():
+    # Default behavior (no live panel) must be byte-for-byte unaffected: the
+    # child's output inherits the terminal directly, exactly like before this
+    # feature existed -- confirmed here by checking NO stdout/stderr kwargs are
+    # passed to popen at all when on_line is absent.
+    seen_kwargs = {}
+
+    def fake_popen(cmd, cwd, **kw):
+        seen_kwargs.update(kw)
+        return FakeProc([0])
+
+    arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None, popen=fake_popen)
+    assert seen_kwargs == {}   # no stdout=PIPE, no stderr=STDOUT, no text=True
+
+
+def test_on_line_pipes_stdout_and_merges_stderr():
+    seen_kwargs = {}
+
+    def fake_popen(cmd, cwd, **kw):
+        seen_kwargs.update(kw)
+        return FakeProc([0], stdout_lines=[])
+
+    arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None, popen=fake_popen, on_line=lambda l: None)
+    assert seen_kwargs["stdout"] == subprocess.PIPE
+    assert seen_kwargs["stderr"] == subprocess.STDOUT
+    assert seen_kwargs["text"] is True
+
+
+def test_reader_thread_is_joined_before_returning():
+    # The finally block must wait for the drain loop to finish before
+    # _run_agent_with_timeout returns, so a caller never sees a partial read.
+    proc = FakeProc([0], stdout_lines=["a", "b", "c"])
+    received = []
+
+    arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
+        popen=lambda cmd, cwd, **kw: proc, on_line=received.append)
+    # By the time the call returns, every line must already be collected --
+    # not "eventually" on some still-running background thread.
+    assert received == ["a", "b", "c"]
 
 
 def test_terminate_crs_run_force_removes_live_containers():

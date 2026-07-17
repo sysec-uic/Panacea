@@ -446,7 +446,7 @@ def test_default_agent_ignores_stale_patch_from_previous_run(tmp_path, monkeypat
     d.mkdir()
     (d / "oss_crs_patch_0.diff").write_text("STALE DIFF")
     monkeypatch.setattr(arvo_oss_crs, "run_oss_crs",
-                        lambda bug_id, skip_build=False, abort_controller=None: {"patch_files": []})
+                        lambda bug_id, skip_build=False, abort_controller=None, on_phase=None, on_line=None: {"patch_files": []})
     run = learn_loop._default_agent(42, tmp_path / "proj", True)
     assert run["diff"] == ""
 
@@ -461,7 +461,7 @@ def test_default_agent_reads_patch_from_this_runs_summary(tmp_path, monkeypatch)
     fresh = d / "oss_crs_patch_0.diff"
     fresh.write_text("FRESH DIFF")
     monkeypatch.setattr(arvo_oss_crs, "run_oss_crs",
-                        lambda bug_id, skip_build=False, abort_controller=None: {"patch_files": [str(fresh)]})
+                        lambda bug_id, skip_build=False, abort_controller=None, on_phase=None, on_line=None: {"patch_files": [str(fresh)]})
     run = learn_loop._default_agent(42, tmp_path / "proj", True)
     assert run["diff"] == "FRESH DIFF"
     # The verify bridge is refreshed from the fresh patch.
@@ -478,3 +478,131 @@ def test_no_fix_learns_as_tests_only(dryrun_kwargs):
     from ledger import read_records
     rec = read_records(kw["ledger_path"])[-1]
     assert rec["fix_image_available"] is False
+
+
+# ---------------------------------------------------------------------------
+# Live-status wiring: PhaseTracker, pass_tallies, playbook_stat, _make_agent
+# ---------------------------------------------------------------------------
+
+class _FakeStatus:
+    """Records every set_phases/set_tallies/set_stats call for assertions,
+    without needing a real rich Console/terminal."""
+    def __init__(self):
+        self.phases_calls = []
+        self.tallies_calls = []
+        self.stats_calls = []
+        self.position = None
+        self.subject = None
+
+    def set_phases(self, phases):
+        self.phases_calls.append(list(phases))
+
+    def set_tallies(self, tallies):
+        self.tallies_calls.append(list(tallies))
+
+    def set_stats(self, stats):
+        self.stats_calls.append(dict(stats))
+
+
+def test_phase_tracker_resets_and_orders_phases_per_bug():
+    from learn_loop import PhaseTracker
+    status = _FakeStatus()
+    tracker = PhaseTracker(status)
+
+    n = tracker.reset_for_bug(100)
+    assert n == 1
+    labels = [p.label for p in status.phases_calls[-1]]
+    assert labels == ["prepare environment", "build target", "running agent"]
+    assert all(p.status.value == "pending" for p in status.phases_calls[-1])
+
+    n2 = tracker.reset_for_bug(100)   # a retry on the SAME bug -- attempt count grows
+    assert n2 == 2
+    n3 = tracker.reset_for_bug(200)   # a different bug starts its own count at 1
+    assert n3 == 1
+
+
+def test_phase_tracker_marks_active_then_done_with_elapsed():
+    from learn_loop import PhaseTracker
+    from live_status import PhaseStatus
+    status = _FakeStatus()
+    tracker = PhaseTracker(status)
+    tracker.reset_for_bug(100)
+
+    tracker.on_phase("build", "start")
+    build_phase = status.phases_calls[-1][1]   # index 1 == "build" in PHASE_ORDER
+    assert build_phase.status is PhaseStatus.ACTIVE
+    assert build_phase.elapsed is None
+
+    tracker.on_phase("build", "done")
+    build_phase = status.phases_calls[-1][1]
+    assert build_phase.status is PhaseStatus.DONE
+    assert build_phase.elapsed is not None and build_phase.elapsed.endswith("s")
+
+
+def test_phase_tracker_ignores_unknown_phase_keys():
+    from learn_loop import PhaseTracker
+    status = _FakeStatus()
+    tracker = PhaseTracker(status)
+    tracker.reset_for_bug(100)
+    calls_before = len(status.phases_calls)
+    tracker.on_phase("some_future_phase", "start")   # must not raise or update
+    assert len(status.phases_calls) == calls_before
+
+
+def test_pass_tallies_counts_verified_vs_total_per_pass(tmp_path):
+    from learn_loop import pass_tallies
+    from ledger import append_record
+    ledger = tmp_path / "ledger.jsonl"
+    append_record(ledger, {"bug_id": 1, "pass": "control", "classification": "verified_correct"})
+    append_record(ledger, {"bug_id": 2, "pass": "control", "classification": "still_crashes"})
+    append_record(ledger, {"bug_id": 3, "pass": "treatment", "classification": "verified_correct"})
+
+    tallies = {t.label: t for t in pass_tallies(ledger)}
+    assert tallies["control"].done == 1 and tallies["control"].total == 2
+    assert tallies["treatment"].done == 1 and tallies["treatment"].total == 1
+
+
+def test_pass_tallies_missing_ledger_is_zeroed(tmp_path):
+    from learn_loop import pass_tallies
+    tallies = {t.label: t for t in pass_tallies(tmp_path / "nope.jsonl")}
+    assert tallies["control"].done == 0 and tallies["control"].total == 0
+    assert tallies["treatment"].done == 0 and tallies["treatment"].total == 0
+
+
+def test_playbook_stat_reports_version_and_heuristic_count(tmp_path):
+    from learn_loop import playbook_stat
+    from playbook_store import load_state, save_state, add_heuristic
+    state_path = tmp_path / "state.json"
+    state = load_state(state_path)
+    state = add_heuristic(state, {"trigger": "t", "root_cause_lesson": "l", "how_to_apply": "a",
+                                  "tags": ["t"], "confidence": "high"}, source_bug=100, after_bug=100)
+    save_state(state, state_path)
+
+    stats = playbook_stat(state_path)
+    assert stats["playbook"] == f"v{state['version']} · 1 heuristics"
+
+
+def test_playbook_stat_missing_state_reports_a_fresh_empty_playbook(tmp_path):
+    # playbook_store.load_state gracefully returns a fresh state for a missing
+    # path (not an error) -- "v0 - 0 heuristics" is the correct, honest stat.
+    from learn_loop import playbook_stat
+    assert playbook_stat(tmp_path / "nope.json") == {"playbook": "v0 · 0 heuristics"}
+
+
+def test_make_agent_before_attempt_fires_once_per_agent_call():
+    from learn_loop import _make_agent
+    calls = []
+
+    def fake_default_agent(bug_id, project_dir, skip_build, abort_controller=None, on_phase=None, on_line=None):
+        return {"diff": "", "trajectory_summary": ""}
+
+    import learn_loop
+    orig = learn_loop._default_agent
+    learn_loop._default_agent = fake_default_agent
+    try:
+        agent = _make_agent(before_attempt=lambda bid: calls.append(bid))
+        agent(100, "/x", False)
+        agent(100, "/x", False)   # a retry -- before_attempt fires again
+        assert calls == [100, 100]
+    finally:
+        learn_loop._default_agent = orig
