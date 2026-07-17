@@ -11,6 +11,7 @@ questions, how the pieces fit together). This file is the runbook.
 | `learn_loop.py` | The chronological control/treatment repair-and-learn loop (main entry point) |
 | `arvo_oss_crs.py` | Drives the OSS-CRS repair agent on one bug (wall-clock cap, docker image cleanup, `HEURISTICS.md` injection) |
 | `repair_loop.py` | Per-bug retry loop with deployment-faithful feedback between attempts |
+| `attempt_checkpoint.py` | Durable per-attempt checkpoints so a killed run resumes mid-bug |
 | `verify_fix.py` | Real verification: build, re-run PoC, run tests, classify |
 | `differential_oracle.py` | Post-hoc lesson-quality grader vs the `-fix` image |
 | `playbook_store.py` / `injector.py` | Playbook state (load/save/render) and `HEURISTICS.md` injection |
@@ -168,6 +169,24 @@ and the attempt is recorded as a no-patch, `timed_out` attempt — the next atte
 feedback telling the agent to commit to a fix. This stops one flailing attempt from
 eating many hours (the local-model campaign had a single attempt run 36h; see
 `docs/2026-07-13-learn-loop-local-model-campaign.md`).
+
+**Attempt-level resume:** each attempt is checkpointed to
+`results/<pass>/<bug_id>/attempts.jsonl` (`attempt_checkpoint.py`) as it completes. If
+`learn_loop.py` is killed mid-bug for any reason, just re-run the exact same command —
+it reads the checkpoint and resumes at the next attempt number instead of restarting the
+bug's whole `LEARN_MAX_ATTEMPTS` budget. No flag needed. The checkpoint is cleared once
+the bug's outcome lands in the ledger. This sits one level below the existing bug-level
+resume (a bug already in the ledger is always skipped) — this one covers a bug still
+*in progress*.
+
+**Usage-cap handling:** a Claude Code usage-cap cutoff (a `rate_limit_event` with
+`status: rejected`, or a terminal `api_error_status: 429`) is detected directly from the
+CLI's own stream-json output (`arvo_oss_crs.detect_usage_limit`) and treated differently
+from a genuine failed attempt: it is **not** checkpointed — a usage cutoff costs zero
+real attempts, so the next resume retries the *same* attempt number — and nothing is
+written to the ledger. Since the next bug would hit the identical cap within seconds,
+the whole pass stops there instead of grinding through the rest of `bugs`, and prints
+the reset time the CLI itself reports. Re-run the same command once usage resets.
 
 ### Running the experiment
 
