@@ -321,3 +321,32 @@ def test_token_counts_missing_file_is_zeroed(tmp_path):
         "input_tokens": 0, "output_tokens": 0,
         "cache_read_tokens": 0, "cache_write_tokens": 0,
     }
+
+
+# --- check-patch auto-submit: promote the validated diff when the agent never submits ---
+
+def test_resolve_autosubmit_promotes_validated_diff_when_no_agent_patch():
+    # The attempt-1 loss mode: check-patch PASSed but the agent never wrote /patches/.
+    promoted = arvo_oss_crs.resolve_autosubmit_patch(
+        collected=[], check_passed=True, autosubmit_diff="DIFF that passed")
+    assert promoted == "DIFF that passed"
+
+
+def test_resolve_autosubmit_keeps_agent_patch_when_present():
+    # The agent's own submission always wins; auto-submit is only a fallback.
+    promoted = arvo_oss_crs.resolve_autosubmit_patch(
+        collected=[Path("oss_crs_patch_0.diff")], check_passed=True, autosubmit_diff="X")
+    assert promoted is None
+
+
+def test_resolve_autosubmit_none_without_a_pass():
+    # No check-patch PASS this run -> nothing validated to fall back on.
+    assert arvo_oss_crs.resolve_autosubmit_patch(
+        collected=[], check_passed=False, autosubmit_diff="X") is None
+
+
+def test_resolve_autosubmit_none_when_saved_diff_empty():
+    assert arvo_oss_crs.resolve_autosubmit_patch(
+        collected=[], check_passed=True, autosubmit_diff="") is None
+    assert arvo_oss_crs.resolve_autosubmit_patch(
+        collected=[], check_passed=True, autosubmit_diff="   \n") is None

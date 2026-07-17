@@ -52,20 +52,27 @@ def warm_container(instance: dict, *, run=subprocess.run) -> str:
 
 def serve_one(req_path: Path, resp_path: Path, *, bug, project, exec_fn,
               run_check=verify_fix.run_check, feedback=verify_fix.check_feedback,
-              marker_path=None):
+              marker_path=None, autosubmit_path=None):
     """Process one pending check request, if any. Returns the feedback string, or
     None when there is no request. The response is written atomically (temp + rename)
     and the request is consumed so it is never re-run.
 
-    On a PASS (verified_correct), touch `marker_path` if given: the repair loop reads it
-    to require the agent to have self-validated before accepting a submission."""
+    On a PASS (verified_correct): touch `marker_path` if given (the repair loop reads it
+    to require the agent to have self-validated before accepting a submission), and save
+    the passing diff to `autosubmit_path` if given, overwriting any earlier one so it
+    holds the latest validated fix. run_oss_crs promotes that saved diff as the
+    submission when the agent gets a PASS but never writes a patch to /patches/ -- the
+    loss mode where a validated fix was thrown away (see the Jul 17 postmortem)."""
     req_path, resp_path = Path(req_path), Path(resp_path)
     if not req_path.exists():
         return None
     diff = req_path.read_text()
     verification = run_check(bug, diff, exec_fn, project=project)
-    if marker_path is not None and verification.get("classification") == "verified_correct":
-        Path(marker_path).write_text("pass")
+    if verification.get("classification") == "verified_correct":
+        if marker_path is not None:
+            Path(marker_path).write_text("pass")
+        if autosubmit_path is not None:
+            Path(autosubmit_path).write_text(diff)
     fb = feedback(verification)
     tmp = resp_path.with_name(resp_path.name + ".tmp")
     tmp.write_text(fb)
@@ -75,17 +82,17 @@ def serve_one(req_path: Path, resp_path: Path, *, bug, project, exec_fn,
 
 
 def serve_loop(req_path: Path, resp_path: Path, *, bug, project, exec_fn, stop,
-               poll_seconds=2.0, sleep=time.sleep, marker_path=None):
+               poll_seconds=2.0, sleep=time.sleep, marker_path=None, autosubmit_path=None):
     """Poll the channel for check requests until `stop()` is true. Run in a background
     thread for the duration of an agent run; `stop` is typically a threading.Event.is_set."""
     while not stop():
         serve_one(req_path, resp_path, bug=bug, project=project, exec_fn=exec_fn,
-                  marker_path=marker_path)
+                  marker_path=marker_path, autosubmit_path=autosubmit_path)
         sleep(poll_seconds)
 
 
 def run_service(bug, instance, project, *, find_dir, stop, poll=2.0, sleep=time.sleep,
-                warm=warm_container, remove=None, marker_path=None):
+                warm=warm_container, remove=None, marker_path=None, autosubmit_path=None):
     """Serve in-turn check-patch requests for the duration of one agent run.
 
     The agent's SHARED_DIR only appears once OSS-CRS renders the run compose mid-launch,
@@ -107,6 +114,7 @@ def run_service(bug, instance, project, *, find_dir, stop, poll=2.0, sleep=time.
         exec_fn = lambda cmd, input=None, timeout=60: verify_fix.docker_exec(
             container, cmd, input=input, timeout=timeout)
         serve_loop(req, resp, bug=bug, project=project, exec_fn=exec_fn, stop=stop,
-                   poll_seconds=poll, sleep=sleep, marker_path=marker_path)
+                   poll_seconds=poll, sleep=sleep, marker_path=marker_path,
+                   autosubmit_path=autosubmit_path)
     finally:
         remove(container)

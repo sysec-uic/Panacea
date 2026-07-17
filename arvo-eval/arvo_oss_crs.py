@@ -240,6 +240,28 @@ def collect_patches(run_dir: Path) -> list[Path]:
     return list(run_dir.glob("**/SUBMIT_DIR/*/patches/*.diff"))
 
 
+def resolve_autosubmit_patch(*, collected: list, check_passed: bool,
+                             autosubmit_diff: str) -> str | None:
+    """Promote a check-patch-validated diff as the submission, or None to keep things
+    as-is. Returns the diff text to submit on the agent's behalf.
+
+    The agent sometimes earns a check-patch PASS but never writes the patch to
+    /patches/ before the run ends -- it overran the cap mid-validation, or drowned in
+    diff/git plumbing -- and a genuinely-fixed bug was recorded as a no-patch attempt
+    (Jul 17 postmortem, both attempts on 439279102). When that happens, submit the
+    exact diff that passed. The agent's own submission always wins (auto-submit is only
+    a fallback), and there must be a real PASS this run to fall back on -- the promoted
+    diff still goes through the authoritative fresh-container verify() downstream, so
+    this only rescues the submission step, never the correctness judgement."""
+    if collected:
+        return None
+    if not check_passed:
+        return None
+    if not (autosubmit_diff or "").strip():
+        return None
+    return autosubmit_diff
+
+
 def copy_session_files(run_dir: Path, output_dir: Path) -> None:
     """Copy claude_stdout.log to output_dir."""
     for log in run_dir.glob("crs/crs-claude-code/*/LOG_DIR/*/agent/claude_stdout.log"):
@@ -422,13 +444,18 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     # the agent's check-patch requests against a warm -vul container for the duration
     # of this run. Best-effort and daemon, so it can never wedge or fail the run.
     check_marker = output_dir / ".check_passed"
+    # Holds the exact diff of the latest check-patch PASS, so a validated fix the agent
+    # never wrote to /patches/ can still be submitted (see resolve_autosubmit_patch).
+    check_autosubmit = output_dir / ".check_passed.diff"
     check_stop = check_thread = None
     if _check_patch_enabled():
         import threading
         import check_server
         from build_instance import build_instance
-        # Fresh marker per run: only a PASS from THIS run should let a submission through.
+        # Fresh marker + saved diff per run: only a PASS from THIS run should let a
+        # submission through, and only THIS run's validated diff can be promoted.
         check_marker.unlink(missing_ok=True)
+        check_autosubmit.unlink(missing_ok=True)
         check_stop = threading.Event()
         # Only latch a SHARED_DIR created after now, so a stale dir from a prior/killed
         # run can't win the newest-by-mtime race (observed live: the responder attached
@@ -438,7 +465,8 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
             target=check_server.run_service,
             args=(bug, build_instance(bug), bug["project"]),
             kwargs={"find_dir": lambda: find_shared_dir(sanitizer, newer_than=svc_start),
-                    "stop": check_stop.is_set, "marker_path": check_marker},
+                    "stop": check_stop.is_set, "marker_path": check_marker,
+                    "autosubmit_path": check_autosubmit},
             daemon=True)
         check_thread.start()
         print(f"[{bug_id}] check-patch self-check service running (OSS_CRS_CHECK_PATCH=1)")
@@ -481,6 +509,23 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
         print(f"[{bug_id}] Saved session files to {output_dir}")
 
     n_patches = meta.get("totals", {}).get("artifacts", {}).get("patches", 0)
+    patch_files = [str(output_dir / f"oss_crs_patch_{i}.diff") for i in range(len(patches))]
+
+    # Auto-submit: if check-patch PASSed this run but the agent never wrote a patch,
+    # promote the validated diff so the fix reaches verify() instead of being lost.
+    auto_submitted = False
+    promoted = resolve_autosubmit_patch(
+        collected=patches, check_passed=check_marker.exists(),
+        autosubmit_diff=check_autosubmit.read_text() if check_autosubmit.exists() else "")
+    if promoted is not None:
+        dest = output_dir / "oss_crs_patch_0.diff"
+        dest.write_text(promoted)
+        patch_files = [str(dest)]
+        n_patches = max(n_patches, 1)
+        auto_submitted = True
+        print(f"[{bug_id}] check-patch PASSed but no patch was submitted; auto-submitting "
+              f"the validated diff ({dest}).")
+
     tokens = parse_token_counts(output_dir / "oss_crs_claude_stdout.log")
     summary = {
         "bug_id": bug_id,
@@ -491,8 +536,11 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
         # PASS this run. The repair loop rejects a submission that is required-but-unchecked.
         "check_required": _check_patch_enabled(),
         "check_passed": check_marker.exists(),
+        # auto_submitted: this run's patch is a check-patch-validated diff we promoted
+        # because the agent earned a PASS but never wrote one to /patches/.
+        "auto_submitted": auto_submitted,
         "patches": n_patches,
-        "patch_files": [str(output_dir / f"oss_crs_patch_{i}.diff") for i in range(len(patches))],
+        "patch_files": patch_files,
         "tokens": tokens,
         "meta": meta,
     }
