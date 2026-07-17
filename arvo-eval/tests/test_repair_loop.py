@@ -214,3 +214,54 @@ def test_resuming_bug_that_hit_max_attempts_returns_exhausted_without_calling_ag
     assert calls == []
     assert result["status"] == "exhausted"
     assert len(result["attempts"]) == 3
+
+
+def test_usage_limit_interrupts_without_checkpointing_or_calling_verify():
+    verify_calls = []
+    on_attempt_calls = []
+
+    def agent(attempt_no, feedback):
+        return {"diff": "SOME_DIFF", "usage_limit": {"resets_at": 999, "resets_at_human": "9:50pm (UTC)"}}
+
+    def verify(bug_id, diff):
+        verify_calls.append(diff)
+        return {"classification": "verified_correct"}
+
+    result = repair_with_retries(bug=BUG, agent=agent, verify=verify, max_attempts=5,
+                                 on_attempt=lambda r: on_attempt_calls.append(r))
+
+    assert result["status"] == "interrupted"
+    assert result["attempts"] == []                     # nothing checkpointed
+    assert result["usage_limit"] == {"resets_at": 999, "resets_at_human": "9:50pm (UTC)"}
+    assert verify_calls == []                            # never paid for a verify build
+    assert on_attempt_calls == []
+
+
+def test_usage_limit_after_a_real_prior_attempt_preserves_it():
+    prior = {"attempt": 1, "diff": "GUARD_DIFF", "verdict": "still_crashes",
+             "feedback_for_next": "keep going"}
+
+    def agent(attempt_no, feedback):
+        return {"diff": "X", "usage_limit": {"resets_at": 1}}
+
+    def verify(bug_id, diff):
+        return {"classification": "verified_correct"}
+
+    result = repair_with_retries(bug=BUG, agent=agent, verify=verify, max_attempts=5,
+                                 resume_attempts=[prior], resume_feedback="keep going")
+    assert result["status"] == "interrupted"
+    assert result["attempts"] == [prior]                 # attempt 1's real work is untouched
+
+
+def test_usage_limit_takes_priority_over_check_patch_gate():
+    # If both usage_limit and an unchecked patch are present, the usage cap wins --
+    # there's no point rejecting-and-nudging when the agent can't even respond.
+    def agent(attempt_no, feedback):
+        return {"diff": "X", "check_required": True, "check_passed": False,
+                "usage_limit": {"resets_at": 1}}
+
+    def verify(bug_id, diff):
+        raise AssertionError("verify should never be called")
+
+    result = repair_with_retries(bug=BUG, agent=agent, verify=verify, max_attempts=5)
+    assert result["status"] == "interrupted"

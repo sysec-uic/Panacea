@@ -67,12 +67,20 @@ def repair_with_retries(*, bug, agent, verify, max_attempts=5,
     any IO itself.
 
     Returns a dict:
-      status: "solved" | "exhausted"
+      status: "solved" | "exhausted" | "interrupted"
       attempts: [{"attempt": n, "diff": str, "verdict": str}, ...]
       accepted: the winning attempt record (if solved) else None
       contrastive_pair: (rejected_record, accepted_record) | None
                         — present only when the agent failed at least once then succeeded,
                         i.e. there is something to learn from its own gap.
+
+    "interrupted" means the agent got cut off by a usage cap, not a genuine
+    failure (see run["usage_limit"], set by arvo_oss_crs.detect_usage_limit).
+    That attempt is NOT appended to `attempts` and `on_attempt` is NOT called for
+    it -- a usage cutoff costs zero real attempts, unlike every other rejection.
+    `attempts` on this return is exactly what went in, so a caller resuming later
+    retries the SAME attempt number rather than advancing past it. `usage_limit`
+    is included in the result so the caller can report when to retry.
     """
     bug_id = bug["localId"]
     attempts = list(resume_attempts) if resume_attempts else []
@@ -81,6 +89,9 @@ def repair_with_retries(*, bug, agent, verify, max_attempts=5,
 
     for n in range(start, max_attempts + 1):
         run = agent(n, feedback)
+        if run.get("usage_limit"):
+            return {"status": "interrupted", "attempts": attempts, "accepted": None,
+                    "contrastive_pair": None, "usage_limit": run["usage_limit"]}
         diff = run.get("diff", "")
         if not diff.strip():
             # No patch. A run that hit the wall-clock cap is a distinct, actionable
