@@ -11,6 +11,7 @@ Run this file directly for a simulated demo:
 """
 from __future__ import annotations
 
+import select
 import sys
 import threading
 import time
@@ -129,6 +130,11 @@ class LiveStatus:
 
     def __exit__(self, *exc) -> None:
         self._stop_keys.set()
+        if self._key_thread is not None:
+            # Joined so the terminal is guaranteed restored (echo, canonical mode)
+            # before this returns -- without it, callers printing right after the
+            # `with` block would print into a still-raw terminal.
+            self._key_thread.join(timeout=1.0)
         if self._live is not None:
             self._live.__exit__(*exc)
 
@@ -157,8 +163,15 @@ class LiveStatus:
         old = termios.tcgetattr(fd)
         try:
             tty.setcbreak(fd)
+            # A blocking sys.stdin.read(1) would never notice _stop_keys being set
+            # until the NEXT keypress arrives, so the terminal-restoring finally
+            # block below could be skipped entirely on exit (leaving the terminal
+            # stuck without echo). Poll with a short timeout instead so the loop
+            # re-checks _stop_keys on its own every 0.2s even with no input.
             while not self._stop_keys.is_set():
-                self._handle_key(sys.stdin.read(1))
+                ready, _, _ = select.select([fd], [], [], 0.2)
+                if ready:
+                    self._handle_key(sys.stdin.read(1))
         except Exception:
             pass
         finally:

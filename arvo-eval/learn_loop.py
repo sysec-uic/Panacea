@@ -29,7 +29,8 @@ def _agent_results_dir(bug_id):
     return RESULTS_BASE / _pass / str(bug_id) if _pass else RESULTS_BASE / str(bug_id)
 
 
-def _default_agent(bug_id, project_dir, skip_build, abort_controller=None):
+def _default_agent(bug_id, project_dir, skip_build, abort_controller=None, on_phase=None,
+                   on_line=None):
     """Real agent: drive OSS-CRS, then return the chosen patch + trajectory tail.
 
     Only patches listed in THIS run's summary count. Globbing the results dir
@@ -37,11 +38,14 @@ def _default_agent(bug_id, project_dir, skip_build, abort_controller=None):
     agent produced nothing, so a dead run got verified (and fed back on) as if it
     had emitted the old patch.
 
-    `abort_controller`, if given, is passed straight through to run_oss_crs -- see
-    _make_agent, which binds a real one in for a live-status-panel run.
+    `abort_controller`, `on_phase`, and `on_line` are passed straight through to
+    run_oss_crs -- see _make_agent, which binds real ones in for a live-status-panel
+    run.
     """
     import arvo_oss_crs
-    summary = arvo_oss_crs.run_oss_crs(bug_id, skip_build=skip_build, abort_controller=abort_controller)
+    summary = arvo_oss_crs.run_oss_crs(bug_id, skip_build=skip_build,
+                                       abort_controller=abort_controller, on_phase=on_phase,
+                                       on_line=on_line)
     results_dir = _agent_results_dir(bug_id)
     patch_files = [Path(p) for p in summary.get("patch_files") or []]
     diff = patch_files[0].read_text() if patch_files and patch_files[0].exists() else ""
@@ -59,13 +63,96 @@ def _default_agent(bug_id, project_dir, skip_build, abort_controller=None):
             "aborted": summary.get("aborted", False)}
 
 
-def _make_agent(abort_controller=None):
-    """Bind an abort_controller into a fresh agent(bug_id, project_dir, skip_build)
-    callable, keeping that 3-arg contract stable for every existing caller/test
-    (run_pass's attempt_agent never needs to know about abort_controller at all)."""
+def _make_agent(abort_controller=None, on_phase=None, before_attempt=None, on_line=None):
+    """Bind abort_controller/on_phase/before_attempt/on_line into a fresh
+    agent(bug_id, project_dir, skip_build) callable, keeping that 3-arg contract
+    stable for every existing caller/test (run_pass's attempt_agent never needs to
+    know about any of these). `before_attempt(bug_id)`, if given, fires once per
+    agent() call -- each one is a fresh run_oss_crs invocation, so a PhaseTracker
+    resets here."""
     def agent(bug_id, project_dir, skip_build):
-        return _default_agent(bug_id, project_dir, skip_build, abort_controller=abort_controller)
+        if before_attempt is not None:
+            before_attempt(bug_id)
+        return _default_agent(bug_id, project_dir, skip_build,
+                              abort_controller=abort_controller, on_phase=on_phase,
+                              on_line=on_line)
     return agent
+
+
+PHASE_LABELS = {
+    "prepare": "prepare environment",
+    "build": "build target",
+    "agent": "running agent",
+}
+PHASE_ORDER = ["prepare", "build", "agent"]
+
+
+class PhaseTracker:
+    """Translates arvo_oss_crs's on_phase(key, event) callbacks into live_status
+    Phase updates for one LiveStatus panel. Call reset_for_bug(bug_id) at the start
+    of each attempt (each agent() call is one fresh run_oss_crs invocation, so
+    phases always restart), then pass .on_phase as the on_phase= callback.
+
+    Kept independent of live_status's Phase/PhaseStatus imports at module scope so
+    this stays easy to unit test without rich/terminal machinery -- imported lazily
+    inside the methods that need it.
+    """
+
+    def __init__(self, status):
+        self.status = status
+        self._phases = []
+        self._start_times = {}
+        self._attempt_counts = {}
+
+    def reset_for_bug(self, bug_id) -> int:
+        from live_status import Phase
+        n = self._attempt_counts.get(bug_id, 0) + 1
+        self._attempt_counts[bug_id] = n
+        self._phases = [Phase(PHASE_LABELS[k]) for k in PHASE_ORDER]
+        self._start_times = {}
+        self.status.set_phases(list(self._phases))
+        return n
+
+    def on_phase(self, key, event) -> None:
+        import time
+        from live_status import Phase, PhaseStatus
+        if key not in PHASE_ORDER:
+            return
+        idx = PHASE_ORDER.index(key)
+        if event == "start":
+            self._start_times[key] = time.time()
+            self._phases[idx] = Phase(PHASE_LABELS[key], PhaseStatus.ACTIVE)
+        elif event == "done":
+            elapsed = time.time() - self._start_times.get(key, time.time())
+            self._phases[idx] = Phase(PHASE_LABELS[key], PhaseStatus.DONE, f"{elapsed:.0f}s")
+        self.status.set_phases(list(self._phases))
+
+
+def pass_tallies(ledger_path):
+    """[Tally("control", verified, total), Tally("treatment", ...)] for the panel's
+    footer line, straight from the ledger -- no new bookkeeping, just counting."""
+    from live_status import Tally
+    try:
+        records = read_records(ledger_path)
+    except (OSError, ValueError):
+        records = []
+    tallies = []
+    for pass_name in ("control", "treatment"):
+        rows = [r for r in records if r.get("pass") == pass_name]
+        verified = sum(1 for r in rows if r.get("classification") == "verified_correct")
+        tallies.append(Tally(pass_name, verified, len(rows)))
+    return tallies
+
+
+def playbook_stat(state_path):
+    """{'playbook': 'v7 · 14 heuristics'} for the panel's stat line, or {} if
+    the pass doesn't inject (control) or the state can't be read."""
+    try:
+        state = load_state(state_path)
+    except (OSError, ValueError, KeyError):
+        return {}
+    heuristics = state.get("heuristics", [])
+    return {"playbook": f"v{state.get('version', 0)} · {len(heuristics)} heuristics"}
 
 
 def _default_verify(bug_id, diff):
@@ -268,22 +355,60 @@ def main():
     base = Path(__file__).parent
     pb_dir = base / "playbook"
     learn_dir = base / "results" / "learn"
+    ledger_path = learn_dir / "ledger.jsonl"
     project_dir_for = lambda bid: Path.home() / ".arvo-oss-crs" / str(bid) / "project"
 
     pass_name = os.environ.get("LEARN_PASS", "treatment")
     inject_enabled = pass_name == "treatment"
+    max_attempts = int(os.environ.get("LEARN_MAX_ATTEMPTS", "5"))
+    state_path = pb_dir / f"playbook_state_{pass_name}.json"
     print(f"[learn_loop] pass={pass_name} inject={inject_enabled} "
-          f"bugs={len(bugs)} max_attempts={os.environ.get('LEARN_MAX_ATTEMPTS', '5')}")
+          f"bugs={len(bugs)} max_attempts={max_attempts}")
     checkpoint_path_for = lambda bid: RESULTS_BASE / pass_name / str(bid) / "attempts.jsonl"
-    run_pass(
+
+    common_kwargs = dict(
         bugs=bugs, pass_name=pass_name, inject_enabled=inject_enabled,
-        state_path=pb_dir / f"playbook_state_{pass_name}.json",
-        ledger_path=learn_dir / "ledger.jsonl",
-        project_dir_for=project_dir_for,
-        max_attempts=int(os.environ.get("LEARN_MAX_ATTEMPTS", "5")),
+        state_path=state_path, ledger_path=ledger_path,
+        project_dir_for=project_dir_for, max_attempts=max_attempts,
         skip_build="--skip-build" in sys.argv,
         checkpoint_path_for=checkpoint_path_for,
     )
+
+    if os.environ.get("LEARN_LIVE_UI") != "1":
+        run_pass(agent=_default_agent, **common_kwargs)
+        return
+
+    # LEARN_LIVE_UI=1: replace raw OSS-CRS log spam with a live status panel.
+    # Ctrl-C is remapped to the SAME graceful stop as pressing q -- both just call
+    # controller.abort(), so nothing downstream cares which one fired. Only
+    # installed here, never at import time, so importing this module (e.g. for
+    # tests) never touches the process's real SIGINT handling.
+    import signal
+    import arvo_oss_crs
+    from live_status import LiveStatus
+
+    controller = arvo_oss_crs.AbortController()
+    status = LiveStatus(command=" ".join(sys.argv) or "learn_loop.py",
+                        subject=f"pass={pass_name}", on_abort=controller.abort)
+    tracker = PhaseTracker(status)
+
+    def before_attempt(bug_id):
+        n = tracker.reset_for_bug(bug_id)
+        idx = next((i for i, b in enumerate(bugs) if b["localId"] == bug_id), None)
+        status.position = (idx + 1, len(bugs_ids)) if idx is not None else None
+        status.subject = f"bug {bug_id} · {pass_name} · attempt {n}/{max_attempts}"
+        status.set_tallies(pass_tallies(ledger_path))
+        status.set_stats(playbook_stat(state_path) if inject_enabled else {})
+
+    agent = _make_agent(abort_controller=controller, on_phase=tracker.on_phase,
+                        before_attempt=before_attempt, on_line=status.feed_raw)
+
+    old_sigint = signal.signal(signal.SIGINT, lambda signum, frame: controller.abort())
+    try:
+        with status:
+            run_pass(agent=agent, **common_kwargs)
+    finally:
+        signal.signal(signal.SIGINT, old_sigint)
 
 
 if __name__ == "__main__":
