@@ -191,35 +191,54 @@ def find_shared_dir(sanitizer: str, newer_than: float | None = None) -> Path | N
     return max(dirs, key=lambda p: p.stat().st_mtime)
 
 
-CHECK_PATCH_INSTRUCTION = (
-    "\n\n## Your primary loop: edit -> check-patch -> iterate\n"
-    "You have a `check-patch` tool. It builds the sanitizer target with your current "
-    "changes, re-runs the crashing input, and runs the test suite, then prints PASS "
-    "(the crash is gone and tests pass) or FAIL with exactly what is still wrong. "
-    "Run it from your source tree:\n"
-    "    bash \"$OSS_CRS_SHARED_DIR/check-patch\"\n"
-    "Do NOT try to understand the whole codebase before editing. As soon as you have "
-    "a root-cause hypothesis, make your best edit and run check-patch; let its FAIL "
-    "output drive the next read or edit. Checks are cheap (incremental rebuild -- "
-    "seconds to a couple of minutes after the first), so expect and budget for "
-    "several edit -> check cycles. An early wrong edit that check-patch refutes "
-    "teaches you more than an hour of reading. Submit only after check-patch prints "
-    "PASS.\n"
-)
+def check_patch_instruction(project: str) -> str:
+    """The injected `check-patch` guidance. Two hard-won points (Jul 17 postmortem, bug
+    439279102): the model fixes the bug correctly but then loses the whole run to
+    submission plumbing, so this (1) points it straight at its editable git tree so it
+    never re-discovers the layout / downloads a second copy / git-inits the wrong dir,
+    and (2) makes a check-patch PASS the finish line -- because run_oss_crs now
+    auto-submits the validated diff -- so it never hand-writes a diff or hunts for
+    /patches/ path prefixes. check-patch is the ONE build+test+submit action."""
+    src = f"/src/{project}"
+    return (
+        "\n\n## Your ONE loop: edit -> check-patch -> repeat until PASS\n"
+        f"The project source is at `{src}`, already a git repository with the code "
+        "checked out. Edit those files directly.\n"
+        f"Do NOT download a separate copy of the source (`download-source`), do NOT run "
+        "`git init`, and do NOT use `apply-patch-build`/`apply-patch-test` or hand-write "
+        "a diff -- every one of those paths burns the session on git/path plumbing "
+        "instead of fixing the bug.\n"
+        "`check-patch` is your single tool for building, testing, AND submitting. Run it "
+        "from the project tree:\n"
+        f"    cd {src} && bash \"$OSS_CRS_SHARED_DIR/check-patch\"\n"
+        "It captures your current edits (`git diff`), builds the sanitizer target with "
+        "them, re-runs the crashing input, and runs the test suite, then prints PASS or "
+        "FAIL with exactly what is wrong.\n"
+        "When check-patch prints PASS, you are DONE: that validated patch is recorded and "
+        "submitted for you automatically. You do NOT need to write any patch file or "
+        "produce a diff yourself -- stop there.\n"
+        "Do not read the whole codebase first. As soon as you have a root-cause "
+        f"hypothesis, make your best edit in `{src}` and run check-patch; let its FAIL "
+        "output drive the next edit. Checks are cheap (incremental rebuild -- seconds to "
+        "a couple of minutes after the first), so budget for several edit -> check "
+        "cycles. An early wrong edit that check-patch refutes teaches you more than an "
+        "hour of reading.\n"
+    )
 
 
 def _check_patch_enabled() -> bool:
     return os.environ.get("OSS_CRS_CHECK_PATCH") == "1"
 
 
-def inject_heuristics(project_dir: Path, sanitizer: str, bug_id: int) -> None:
+def inject_heuristics(project_dir: Path, sanitizer: str, bug_id: int, project: str) -> None:
     """Deliver the playbook (and, when enabled, the check-patch instruction) into the
     agent's source directory.
 
     HEURISTICS.md is written to the fake OSS-Fuzz project dir by injector.py but that
     dir never reaches the agent; this bridges the gap by writing into the extracted
     target-source dir where the agent runs. The check-patch instruction is appended
-    even when the playbook is empty, so the agent always learns the tool exists.
+    even when the playbook is empty, so the agent always learns the tool exists, and it
+    names the project's own source tree (/src/<project>) so the agent edits in place.
     """
     target_source = find_target_source_dir(sanitizer)
     if target_source is None:
@@ -228,7 +247,7 @@ def inject_heuristics(project_dir: Path, sanitizer: str, bug_id: int) -> None:
     src = project_dir / "HEURISTICS.md"
     text = src.read_text() if src.exists() else ""
     if _check_patch_enabled():
-        text += CHECK_PATCH_INSTRUCTION
+        text += check_patch_instruction(project)
     if not text.strip():
         return
     (target_source / "HEURISTICS.md").write_text(text)
@@ -433,7 +452,7 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     else:
         print(f"[{bug_id}] Skipping build (--skip-build set).")
 
-    inject_heuristics(project_dir, sanitizer, bug_id)
+    inject_heuristics(project_dir, sanitizer, bug_id, bug["project"])
 
     print(f"[{bug_id}] Running agent (harness: {bug['fuzz_target']})...")
     timeout = _run_timeout()

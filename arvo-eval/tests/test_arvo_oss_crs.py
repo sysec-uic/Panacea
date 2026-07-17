@@ -350,3 +350,31 @@ def test_resolve_autosubmit_none_when_saved_diff_empty():
         collected=[], check_passed=True, autosubmit_diff="") is None
     assert arvo_oss_crs.resolve_autosubmit_patch(
         collected=[], check_passed=True, autosubmit_diff="   \n") is None
+
+
+# --- injected check-patch guidance: canonical single path + explicit repo location ---
+
+def test_check_patch_instruction_names_the_project_git_tree():
+    # Fix 2: point the agent straight at its editable git repo so it never re-discovers
+    # the layout, downloads a second copy, or git-inits the wrong dir.
+    text = arvo_oss_crs.check_patch_instruction("mruby")
+    assert "/src/mruby" in text
+    assert "check-patch" in text
+    low = text.lower()
+    assert "download-source" in low and "git init" in low     # explicitly warned against
+    assert "apply-patch-build" in low                          # the competing path, ruled out
+
+
+def test_check_patch_instruction_makes_pass_the_finish_line():
+    # Fix 1: a PASS is the submission (auto-submit records it), so the agent must NOT
+    # hand-write a diff or hunt for /patches/ path prefixes.
+    text = arvo_oss_crs.check_patch_instruction("mruby")
+    assert "PASS" in text
+    low = text.lower()
+    assert "automatically" in low or "for you" in low          # PASS is recorded for them
+    assert "diff" in low                                        # mentions diffs (to forbid hand-writing)
+
+
+def test_check_patch_instruction_is_project_parameterized():
+    assert "/src/openssl" in arvo_oss_crs.check_patch_instruction("openssl")
+    assert "/src/mruby" not in arvo_oss_crs.check_patch_instruction("openssl")
