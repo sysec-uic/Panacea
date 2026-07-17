@@ -164,10 +164,11 @@ def test_agent_runs_to_completion_without_timeout():
     def fake_run(cmd, **kw):
         calls.append(kw.get("timeout", "MISSING"))
 
-    timed_out = arvo_oss_crs._run_agent_with_timeout(
+    timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
         ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
         run=fake_run, teardown=lambda: teardowns.append(True))
     assert timed_out is False
+    assert aborted is False
     assert calls == [None]          # the cap is threaded through to subprocess.run
     assert teardowns == []          # nothing to tear down on a clean finish
 
@@ -182,11 +183,47 @@ def test_agent_timeout_tears_down_containers_and_reports_timed_out():
     def slow_run(cmd, **kw):
         raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
 
-    timed_out = arvo_oss_crs._run_agent_with_timeout(
+    timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
         ["uv", "run", "oss-crs"], cwd="/x", timeout=1.0,
         run=slow_run, teardown=lambda: teardowns.append(True))
     assert timed_out is True
+    assert aborted is False
     assert teardowns == [True]
+
+
+def test_agent_reports_aborted_when_event_set_after_clean_return():
+    # q-to-abort: an external thread sets abort_event AND tears down docker itself
+    # (terminate_crs_run), which is what unblocks the subprocess call -- this function
+    # does no teardown of its own for that case, only reports what happened.
+    import threading
+    teardowns = []
+    abort_event = threading.Event()
+    abort_event.set()   # simulates the external thread having already fired
+
+    def fake_run(cmd, **kw):
+        pass   # returned normally, as it would once its containers are gone
+
+    timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
+        run=fake_run, teardown=lambda: teardowns.append(True), abort_event=abort_event)
+    assert timed_out is False
+    assert aborted is True
+    assert teardowns == []          # teardown already happened externally, not here
+
+
+def test_agent_not_aborted_when_event_absent_or_unset():
+    def fake_run(cmd, **kw):
+        pass
+
+    timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None, run=fake_run)
+    assert aborted is False   # no abort_event passed at all
+
+    import threading
+    timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None, run=fake_run,
+        abort_event=threading.Event())   # passed but never set
+    assert aborted is False
 
 
 def test_terminate_crs_run_force_removes_live_containers():

@@ -394,23 +394,32 @@ def terminate_crs_run(*, run=subprocess.run) -> list[str]:
 
 
 def _run_agent_with_timeout(cmd, *, cwd, timeout, run=subprocess.run,
-                            teardown=None) -> bool:
-    """Run the CRS agent subprocess under `timeout`. Returns whether it timed out.
+                            teardown=None, abort_event=None) -> tuple[bool, bool]:
+    """Run the CRS agent subprocess under `timeout`. Returns (timed_out, aborted).
 
     On timeout, subprocess.run SIGKILLs the oss-crs process but its docker
     containers survive, so tear them down before reporting. A clean finish (or no
-    cap) reports False and tears down nothing."""
+    cap) reports (False, False) and tears down nothing.
+
+    `abort_event`, if given, is checked once this call returns: a user-requested
+    abort (live_status.py's q-to-abort) is handled by an external thread that sets
+    the event AND calls terminate_crs_run() itself -- that teardown is what actually
+    unblocks this call, so there's nothing to tear down here, only to report."""
     teardown = teardown or terminate_crs_run
     try:
         run(cmd, cwd=cwd, check=False, timeout=timeout)
-        return False
+        return False, bool(abort_event and abort_event.is_set())
     except subprocess.TimeoutExpired:
         teardown()
-        return True
+        return True, False
 
 
-def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
-    """Run crs-claude-code on one ARVO bug. Returns a summary dict."""
+def run_oss_crs(bug_id: int, skip_build: bool = False, abort_event=None) -> dict:
+    """Run crs-claude-code on one ARVO bug. Returns a summary dict.
+
+    `abort_event` (a threading.Event), if given, lets an external caller (the
+    live-status panel's q-to-abort) request that this run stop; see
+    _run_agent_with_timeout for how the teardown/detection actually happens."""
     bug = load_bug(bug_id)
     sanitizer = bug["sanitizer"].lower()
 
@@ -483,7 +492,7 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
 
     run_start = time.time()
     try:
-        timed_out = _run_agent_with_timeout(
+        timed_out, aborted = _run_agent_with_timeout(
             [*base, "run", *compose_args,
              "--fuzz-proj-path", str(project_dir),
              "--target-harness", bug["fuzz_target"],
@@ -491,6 +500,7 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
              "--incremental-build"],
             cwd=OSS_CRS_DIR,
             timeout=timeout,
+            abort_event=abort_event,
         )
     finally:
         if check_stop is not None:
@@ -501,6 +511,8 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
         print(f"[{bug_id}] Agent run hit the {timeout:.0f}s cap after {run_elapsed:.0f}s; "
               f"treating as a no-patch attempt. Any patch written before the cap is "
               f"still collected below.")
+    if aborted:
+        print(f"[{bug_id}] Run aborted by user after {run_elapsed:.0f}s.")
     run_dir = find_latest_run_dir(sanitizer)
     meta = {}
     patches = []
@@ -529,6 +541,7 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
         "project": bug["project"],
         "elapsed_seconds": round(run_elapsed),
         "timed_out": timed_out,
+        "aborted": aborted,
         # check_required: enforcement is on; check_passed: the agent got a check-patch
         # PASS this run. The repair loop rejects a submission that is required-but-unchecked.
         "check_required": _check_patch_enabled(),
