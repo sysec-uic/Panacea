@@ -255,6 +255,64 @@ def test_attempt_level_resume_continues_after_simulated_crash(tmp_path):
     assert read_checkpoint(ckpt) == []                     # cleared once fully recorded
 
 
+def test_usage_limit_stops_pass_without_ledger_write_or_checkpoint_clear(tmp_path):
+    # Bug 100 gets cut off by a usage cap on its first attempt; bug 200 (later in
+    # `bugs`) must never even be started -- it would hit the identical cap.
+    ledger = tmp_path / "ledger.jsonl"
+    checkpoint_path_for = lambda bid: tmp_path / "checkpoints" / str(bid) / "attempts.jsonl"
+
+    started = []
+
+    def capped_agent(bug_id, project_dir, skip_build):
+        started.append(bug_id)
+        return {"diff": "X", "trajectory_summary": "t",
+                "usage_limit": {"resets_at": 123, "resets_at_human": "9:50pm (UTC)"}}
+
+    result = run_pass(
+        bugs=[_bug(100), _bug(200)], pass_name="treatment", inject_enabled=True,
+        state_path=tmp_path / "state.json", ledger_path=ledger,
+        project_dir_for=lambda bid: tmp_path / f"proj-{bid}",
+        agent=capped_agent, verify=stub_verify, extract=stub_extract,
+        grade=_grade_stub("no_fix_available"),
+        checkpoint_path_for=checkpoint_path_for,
+    )
+
+    assert started == [100]                              # bug 200 never attempted
+    assert result == []                                   # nothing completed
+    from ledger import read_records
+    assert read_records(ledger) == []                     # no ledger entry for bug 100
+    from attempt_checkpoint import read_checkpoint
+    assert read_checkpoint(checkpoint_path_for(100)) == [] # the capped attempt wasn't checkpointed
+
+
+def test_usage_limit_after_real_checkpointed_attempts_preserves_them(tmp_path):
+    # A bug that already has 2 real checkpointed attempts hits the cap on attempt 3:
+    # attempts 1-2 must survive on disk for the next resume, untouched.
+    from attempt_checkpoint import append_checkpoint
+    ckpt = tmp_path / "checkpoints" / "100" / "attempts.jsonl"
+    append_checkpoint(ckpt, {"attempt": 1, "diff": "A", "verdict": "still_crashes",
+                             "feedback_for_next": "fb1", "tokens": {}})
+    append_checkpoint(ckpt, {"attempt": 2, "diff": "B", "verdict": "still_crashes",
+                             "feedback_for_next": "fb2", "tokens": {}})
+
+    def capped_agent(bug_id, project_dir, skip_build):
+        return {"diff": "C", "trajectory_summary": "t", "usage_limit": {"resets_at": 1}}
+
+    run_pass(
+        bugs=[_bug(100)], pass_name="treatment", inject_enabled=True,
+        state_path=tmp_path / "state.json", ledger_path=tmp_path / "ledger.jsonl",
+        project_dir_for=lambda bid: tmp_path / f"proj-{bid}",
+        agent=capped_agent, verify=stub_verify, extract=stub_extract,
+        grade=_grade_stub("no_fix_available"),
+        checkpoint_path_for=lambda bid: ckpt,
+    )
+
+    from attempt_checkpoint import read_checkpoint
+    saved = read_checkpoint(ckpt)
+    assert len(saved) == 2                                 # unchanged -- attempt 3 never checkpointed
+    assert [r["attempt"] for r in saved] == [1, 2]
+
+
 def test_checkpoint_path_for_none_disables_resume_entirely(tmp_path):
     # Default behavior (no checkpoint_path_for) must be unaffected -- a bug that
     # "crashes" simply propagates the exception with nothing persisted anywhere.

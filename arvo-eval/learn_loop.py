@@ -51,7 +51,8 @@ def _default_agent(bug_id, project_dir, skip_build):
     return {"diff": diff, "trajectory_summary": trajectory, "summary": summary,
             "timed_out": summary.get("timed_out", False),
             "check_required": summary.get("check_required", False),
-            "check_passed": summary.get("check_passed", False)}
+            "check_passed": summary.get("check_passed", False),
+            "usage_limit": summary.get("usage_limit")}
 
 
 def _default_verify(bug_id, diff):
@@ -145,13 +146,28 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
             return {"diff": run.get("diff", ""), "trajectory_summary": run.get("trajectory_summary", ""),
                     "timed_out": run.get("timed_out", False),
                     "check_required": run.get("check_required", False),
-                    "check_passed": run.get("check_passed", False)}
+                    "check_passed": run.get("check_passed", False),
+                    "usage_limit": run.get("usage_limit")}
 
         result = repair_with_retries(bug=bug, agent=attempt_agent, verify=verify,
                                      max_attempts=max_attempts,
                                      resume_attempts=resume_attempts,
                                      resume_feedback=resume_feedback,
                                      on_attempt=on_attempt)
+
+        if result["status"] == "interrupted":
+            # A usage cap cut the agent off mid-attempt, not a genuine failure --
+            # that attempt was never checkpointed (repair_with_retries left
+            # `attempts` untouched), so there's nothing to write to the ledger and
+            # whatever real attempts already exist stay on disk for the next run to
+            # resume into. The next bug would hit the identical cap within seconds,
+            # so stop the whole pass rather than grinding through the rest of `bugs`.
+            info = result.get("usage_limit") or {}
+            reset_msg = f" ({info['resets_at_human']})" if info.get("resets_at_human") else ""
+            print(f"[{bug_id}] usage limit hit{reset_msg} -- stopping pass={pass_name}, "
+                  f"{len(result['attempts'])} real attempt(s) already checkpointed")
+            break
+
         solved = result["status"] == "solved"
         final_verdict = "verified_correct" if solved else (
             result["attempts"][-1]["verdict"] if result["attempts"] else "no_changes")
