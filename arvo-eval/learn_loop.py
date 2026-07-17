@@ -29,16 +29,19 @@ def _agent_results_dir(bug_id):
     return RESULTS_BASE / _pass / str(bug_id) if _pass else RESULTS_BASE / str(bug_id)
 
 
-def _default_agent(bug_id, project_dir, skip_build):
+def _default_agent(bug_id, project_dir, skip_build, abort_event=None):
     """Real agent: drive OSS-CRS, then return the chosen patch + trajectory tail.
 
     Only patches listed in THIS run's summary count. Globbing the results dir
     resurrected stale oss_crs_patch_*.diff files from earlier runs whenever the
     agent produced nothing, so a dead run got verified (and fed back on) as if it
     had emitted the old patch.
+
+    `abort_event`, if given, is passed straight through to run_oss_crs -- see
+    _make_agent, which binds a real one in for a live-status-panel run.
     """
     import arvo_oss_crs
-    summary = arvo_oss_crs.run_oss_crs(bug_id, skip_build=skip_build)
+    summary = arvo_oss_crs.run_oss_crs(bug_id, skip_build=skip_build, abort_event=abort_event)
     results_dir = _agent_results_dir(bug_id)
     patch_files = [Path(p) for p in summary.get("patch_files") or []]
     diff = patch_files[0].read_text() if patch_files and patch_files[0].exists() else ""
@@ -52,7 +55,17 @@ def _default_agent(bug_id, project_dir, skip_build):
             "timed_out": summary.get("timed_out", False),
             "check_required": summary.get("check_required", False),
             "check_passed": summary.get("check_passed", False),
-            "usage_limit": summary.get("usage_limit")}
+            "usage_limit": summary.get("usage_limit"),
+            "aborted": summary.get("aborted", False)}
+
+
+def _make_agent(abort_event=None):
+    """Bind an abort_event into a fresh agent(bug_id, project_dir, skip_build)
+    callable, keeping that 3-arg contract stable for every existing caller/test
+    (run_pass's attempt_agent never needs to know about abort_event at all)."""
+    def agent(bug_id, project_dir, skip_build):
+        return _default_agent(bug_id, project_dir, skip_build, abort_event=abort_event)
+    return agent
 
 
 def _default_verify(bug_id, diff):
@@ -147,7 +160,8 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
                     "timed_out": run.get("timed_out", False),
                     "check_required": run.get("check_required", False),
                     "check_passed": run.get("check_passed", False),
-                    "usage_limit": run.get("usage_limit")}
+                    "usage_limit": run.get("usage_limit"),
+                    "aborted": run.get("aborted", False)}
 
         result = repair_with_retries(bug=bug, agent=attempt_agent, verify=verify,
                                      max_attempts=max_attempts,
@@ -156,15 +170,20 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
                                      on_attempt=on_attempt)
 
         if result["status"] == "interrupted":
-            # A usage cap cut the agent off mid-attempt, not a genuine failure --
-            # that attempt was never checkpointed (repair_with_retries left
-            # `attempts` untouched), so there's nothing to write to the ledger and
-            # whatever real attempts already exist stay on disk for the next run to
-            # resume into. The next bug would hit the identical cap within seconds,
-            # so stop the whole pass rather than grinding through the rest of `bugs`.
-            info = result.get("usage_limit") or {}
-            reset_msg = f" ({info['resets_at_human']})" if info.get("resets_at_human") else ""
-            print(f"[{bug_id}] usage limit hit{reset_msg} -- stopping pass={pass_name}, "
+            # A usage cap or a user-requested abort cut the agent off mid-attempt,
+            # not a genuine failure -- that attempt was never checkpointed
+            # (repair_with_retries left `attempts` untouched), so there's nothing
+            # to write to the ledger and whatever real attempts already exist stay
+            # on disk for the next run to resume into. Either way the pass stops
+            # here rather than grinding through the rest of `bugs` (a usage cap
+            # would hit the next bug identically; an abort means the user is done).
+            if result.get("aborted"):
+                reason = "aborted by user"
+            else:
+                info = result.get("usage_limit") or {}
+                reset_msg = f" ({info['resets_at_human']})" if info.get("resets_at_human") else ""
+                reason = f"usage limit hit{reset_msg}"
+            print(f"[{bug_id}] {reason} -- stopping pass={pass_name}, "
                   f"{len(result['attempts'])} real attempt(s) already checkpointed")
             break
 

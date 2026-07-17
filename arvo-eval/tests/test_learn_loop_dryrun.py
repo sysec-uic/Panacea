@@ -293,6 +293,31 @@ def test_usage_limit_stops_pass_without_ledger_write_or_checkpoint_clear(tmp_pat
     assert read_checkpoint(checkpoint_path_for(100)) == [] # the capped attempt wasn't checkpointed
 
 
+def test_user_abort_stops_pass_without_ledger_write(tmp_path, capsys):
+    # Same shape as a usage-limit hit, but user-triggered (q-to-abort) -- distinct
+    # print message, same "don't checkpoint, don't record, stop the pass" behavior.
+    ledger = tmp_path / "ledger.jsonl"
+    started = []
+
+    def aborted_agent(bug_id, project_dir, skip_build):
+        started.append(bug_id)
+        return {"diff": "X", "trajectory_summary": "t", "aborted": True}
+
+    result = run_pass(
+        bugs=[_bug(100), _bug(200)], pass_name="treatment", inject_enabled=True,
+        state_path=tmp_path / "state.json", ledger_path=ledger,
+        project_dir_for=lambda bid: tmp_path / f"proj-{bid}",
+        agent=aborted_agent, verify=stub_verify, extract=stub_extract,
+        grade=_grade_stub("no_fix_available"),
+    )
+
+    assert started == [100]                # bug 200 never attempted
+    assert result == []
+    from ledger import read_records
+    assert read_records(ledger) == []
+    assert "aborted by user" in capsys.readouterr().out
+
+
 def test_usage_limit_after_real_checkpointed_attempts_preserves_them(tmp_path):
     # A bug that already has 2 real checkpointed attempts hits the cap on attempt 3:
     # attempts 1-2 must survive on disk for the next resume, untouched.
@@ -421,7 +446,7 @@ def test_default_agent_ignores_stale_patch_from_previous_run(tmp_path, monkeypat
     d.mkdir()
     (d / "oss_crs_patch_0.diff").write_text("STALE DIFF")
     monkeypatch.setattr(arvo_oss_crs, "run_oss_crs",
-                        lambda bug_id, skip_build=False: {"patch_files": []})
+                        lambda bug_id, skip_build=False, abort_event=None: {"patch_files": []})
     run = learn_loop._default_agent(42, tmp_path / "proj", True)
     assert run["diff"] == ""
 
@@ -436,7 +461,7 @@ def test_default_agent_reads_patch_from_this_runs_summary(tmp_path, monkeypatch)
     fresh = d / "oss_crs_patch_0.diff"
     fresh.write_text("FRESH DIFF")
     monkeypatch.setattr(arvo_oss_crs, "run_oss_crs",
-                        lambda bug_id, skip_build=False: {"patch_files": [str(fresh)]})
+                        lambda bug_id, skip_build=False, abort_event=None: {"patch_files": [str(fresh)]})
     run = learn_loop._default_agent(42, tmp_path / "proj", True)
     assert run["diff"] == "FRESH DIFF"
     # The verify bridge is refreshed from the fresh patch.
