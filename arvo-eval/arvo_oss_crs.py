@@ -280,6 +280,44 @@ def parse_token_counts(log_path: Path) -> dict:
     }
 
 
+def detect_usage_limit(log_path: Path) -> dict | None:
+    """Detect a Claude Code usage-cap cutoff in a claude_stdout.log.
+
+    Claude Code CLI emits a structured `rate_limit_event` when a call is rejected
+    for being over the cap, and/or ends the turn with a top-level `result` object
+    carrying `is_error: true, api_error_status: 429`. Either is a clean, explicit
+    signal from the CLI itself -- not a heuristic -- so callers can tell "the agent
+    got cut off by a usage cap" apart from "the agent genuinely produced nothing",
+    and avoid burning a real attempt slot on the former (see repair_loop.py).
+
+    Returns None if the log shows no usage-limit cutoff, else a dict with whatever
+    of `resets_at` (unix epoch, from rate_limit_info) and `resets_at_human` (the
+    CLI's own human-readable message, e.g. "You've hit your session limit ·
+    resets 9:50pm (UTC)") were found.
+    """
+    if not log_path.exists():
+        return None
+    hit = False
+    resets_at = None
+    resets_at_human = None
+    for line in log_path.read_text(errors="replace").splitlines():
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") == "rate_limit_event":
+            info = obj.get("rate_limit_info", {})
+            if info.get("status") == "rejected":
+                hit = True
+                resets_at = info.get("resetsAt", resets_at)
+        elif obj.get("type") == "result" and obj.get("api_error_status") == 429:
+            hit = True
+            resets_at_human = obj.get("result") or resets_at_human
+    if not hit:
+        return None
+    return {"resets_at": resets_at, "resets_at_human": resets_at_human}
+
+
 def _run_epoch(s: str) -> int:
     """OSS-CRS embeds a 10-digit epoch in run/build ids (test-1783442751bt,
     crs_compose_1783528430al-...); it orders disposables by age."""
@@ -482,6 +520,10 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
 
     n_patches = meta.get("totals", {}).get("artifacts", {}).get("patches", 0)
     tokens = parse_token_counts(output_dir / "oss_crs_claude_stdout.log")
+    usage_limit = detect_usage_limit(output_dir / "oss_crs_claude_stdout.log")
+    if usage_limit:
+        print(f"[{bug_id}] Usage limit hit"
+              + (f" ({usage_limit['resets_at_human']})" if usage_limit.get("resets_at_human") else ""))
     summary = {
         "bug_id": bug_id,
         "project": bug["project"],
@@ -491,6 +533,7 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
         # PASS this run. The repair loop rejects a submission that is required-but-unchecked.
         "check_required": _check_patch_enabled(),
         "check_passed": check_marker.exists(),
+        "usage_limit": usage_limit,
         "patches": n_patches,
         "patch_files": [str(output_dir / f"oss_crs_patch_{i}.diff") for i in range(len(patches))],
         "tokens": tokens,

@@ -321,3 +321,62 @@ def test_token_counts_missing_file_is_zeroed(tmp_path):
         "input_tokens": 0, "output_tokens": 0,
         "cache_read_tokens": 0, "cache_write_tokens": 0,
     }
+
+
+def test_detect_usage_limit_none_on_clean_log(tmp_path):
+    log = _write_log(tmp_path, [
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "allowed", "resetsAt": 123}},
+        {"type": "result", "subtype": "success", "is_error": False},
+    ])
+    assert arvo_oss_crs.detect_usage_limit(log) is None
+
+
+def test_detect_usage_limit_none_on_warning_status(tmp_path):
+    # allowed_warning (approaching the cap) is not a cutoff -- must not trip the gate.
+    log = _write_log(tmp_path, [
+        {"type": "rate_limit_event",
+         "rate_limit_info": {"status": "allowed_warning", "resetsAt": 123, "utilization": 0.91}},
+    ])
+    assert arvo_oss_crs.detect_usage_limit(log) is None
+
+
+def test_detect_usage_limit_missing_file_is_none(tmp_path):
+    assert arvo_oss_crs.detect_usage_limit(tmp_path / "nope.log") is None
+
+
+def test_detect_usage_limit_real_rejected_event_shape(tmp_path):
+    # Real payload captured from a live run (bug 455612769, 2026-07-16) that got cut
+    # off by the 5-hour cap mid-investigation.
+    log = _write_log(tmp_path, [
+        {"type": "rate_limit_event",
+         "rate_limit_info": {"status": "rejected", "resetsAt": 1784238600,
+                             "rateLimitType": "five_hour", "overageStatus": "rejected",
+                             "overageDisabledReason": "org_level_disabled", "isUsingOverage": False},
+         "uuid": "dcce88a7-42ea-4e85-aacc-99dcd8be3ce1"},
+        {"type": "assistant", "error": "rate_limit",
+         "message": {"content": [{"type": "text", "text": "You've hit your session limit · resets 9:50pm (UTC)"}]}},
+        {"type": "result", "subtype": "success", "is_error": True, "api_error_status": 429,
+         "result": "You've hit your session limit · resets 9:50pm (UTC)"},
+    ])
+    result = arvo_oss_crs.detect_usage_limit(log)
+    assert result == {"resets_at": 1784238600,
+                      "resets_at_human": "You've hit your session limit · resets 9:50pm (UTC)"}
+
+
+def test_detect_usage_limit_result_object_alone_is_sufficient(tmp_path):
+    # If the log gets cut off before/without a rate_limit_event line (e.g. the CLI
+    # process itself got killed), the terminal result object alone must still trip it.
+    log = _write_log(tmp_path, [
+        {"type": "result", "subtype": "success", "is_error": True, "api_error_status": 429,
+         "result": "You've hit your session limit · resets 4:00am (UTC)"},
+    ])
+    assert arvo_oss_crs.detect_usage_limit(log) == {
+        "resets_at": None, "resets_at_human": "You've hit your session limit · resets 4:00am (UTC)",
+    }
+
+
+def test_detect_usage_limit_ignores_unparseable_lines(tmp_path):
+    log = tmp_path / "claude_stdout.log"
+    log.write_text('not json\n{"type": "rate_limit_event", "rate_limit_info": '
+                   '{"status": "rejected", "resetsAt": 5}}\n')
+    assert arvo_oss_crs.detect_usage_limit(log) == {"resets_at": 5, "resets_at_human": None}
