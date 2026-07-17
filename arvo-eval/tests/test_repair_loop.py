@@ -253,6 +253,28 @@ def test_usage_limit_after_a_real_prior_attempt_preserves_it():
     assert result["attempts"] == [prior]                 # attempt 1's real work is untouched
 
 
+def test_user_abort_interrupts_without_checkpointing():
+    verify_calls = []
+    on_attempt_calls = []
+
+    def agent(attempt_no, feedback):
+        return {"diff": "SOME_DIFF", "aborted": True}
+
+    def verify(bug_id, diff):
+        verify_calls.append(diff)
+        return {"classification": "verified_correct"}
+
+    result = repair_with_retries(bug=BUG, agent=agent, verify=verify, max_attempts=5,
+                                 on_attempt=lambda r: on_attempt_calls.append(r))
+
+    assert result["status"] == "interrupted"
+    assert result["attempts"] == []
+    assert result["aborted"] is True
+    assert result["usage_limit"] is None      # distinguishes an abort from a usage cap
+    assert verify_calls == []
+    assert on_attempt_calls == []
+
+
 def test_usage_limit_takes_priority_over_check_patch_gate():
     # If both usage_limit and an unchecked patch are present, the usage cap wins --
     # there's no point rejecting-and-nudging when the agent can't even respond.
