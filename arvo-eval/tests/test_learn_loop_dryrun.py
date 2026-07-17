@@ -239,11 +239,19 @@ def test_attempt_level_resume_continues_after_simulated_crash(tmp_path):
     def resuming_verify(bug_id, diff):
         return {"classification": "verified_correct", "make_test_ok": True}
 
+    def stub_contrastive(bug, rejected_diff, accepted_diff, rejected_verdict):
+        # Solved after a real failure (attempt 1's GUARD_DIFF) -> run_pass takes the
+        # contrastive-lesson path, which defaults to a REAL LLM call if not stubbed.
+        return {"trigger": "t", "wrong_approach": "guard", "correct_approach": "fix",
+                "lesson": "l", "how_to_apply": "a", "tags": ["t"], "confidence": "high",
+                "kind": "contrastive"}
+
     result = run_pass(
         bugs=[_bug(100)], pass_name="treatment", inject_enabled=True,
         state_path=state_path, ledger_path=ledger,
         project_dir_for=lambda bid: tmp_path / f"proj-{bid}",
         agent=resuming_agent, verify=resuming_verify, extract=stub_extract,
+        contrastive=stub_contrastive,
         grade=_grade_stub("no_fix_available"),
         checkpoint_path_for=checkpoint_path_for,
     )
