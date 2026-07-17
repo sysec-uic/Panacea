@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -376,50 +377,112 @@ def _run_timeout() -> float | None:
 
 
 def terminate_crs_run(*, run=subprocess.run) -> list[str]:
-    """Force-remove any live OSS-CRS compose containers.
+    """Force-remove any live OSS-CRS containers, both phases: the run phase
+    (`crs_compose_<runid>-...`, see oss-crs utils.py) and build-target
+    (`crs_<hash>-target_builder-run-<hash>`, a different naming scheme).
 
-    Killing the `uv run oss-crs` process on timeout only reaps that process --
-    docker-compose leaves its services running, and on the local-model box those
-    keep the GPU pegged. The compose project is named `crs_compose_<runid>` (see
-    oss-crs utils.py), so its containers all carry that name prefix; match and
-    remove them. Only invoked on the timeout path, so a serial campaign has at most
-    the one dead run to clean up."""
-    out = run(["docker", "ps", "-q", "--filter", "name=crs_compose"],
+    This is a SAFETY-NET SWEEP, not the primary teardown mechanism -- see
+    AbortController / _graceful_kill below, which signal the `uv run oss-crs`
+    process directly and let its own cli() (SIGTERM -> KeyboardInterrupt ->
+    _graceful_terminate in oss_crs/src/ui.py) gracefully stop its containers
+    itself. This just catches anything that somehow survives that."""
+    out = run(["docker", "ps", "-q", "--filter", "name=crs_compose",
+              "--filter", "name=target_builder"],
               capture_output=True, text=True)
     ids = out.stdout.split()
     if ids:
         run(["docker", "rm", "-f", *ids], capture_output=True, text=True)
-        print(f"[timeout] force-removed {len(ids)} live OSS-CRS containers")
+        print(f"[cleanup] force-removed {len(ids)} leftover OSS-CRS container(s)")
     return ids
 
 
-def _run_agent_with_timeout(cmd, *, cwd, timeout, run=subprocess.run,
-                            teardown=None, abort_event=None) -> tuple[bool, bool]:
-    """Run the CRS agent subprocess under `timeout`. Returns (timed_out, aborted).
+class AbortController:
+    """Lets an external caller (live_status.py's q-to-abort) signal whichever
+    OSS-CRS subprocess is CURRENTLY live -- a single run_oss_crs() call makes
+    multiple subprocess calls in turn (build-target, then run), so each one
+    registers itself here as it starts rather than binding to just one."""
 
-    On timeout, subprocess.run SIGKILLs the oss-crs process but its docker
-    containers survive, so tear them down before reporting. A clean finish (or no
-    cap) reports (False, False) and tears down nothing.
+    def __init__(self):
+        self.requested = threading.Event()
+        self._proc = None
+        self._lock = threading.Lock()
 
-    `abort_event`, if given, is checked once this call returns: a user-requested
-    abort (live_status.py's q-to-abort) is handled by an external thread that sets
-    the event AND calls terminate_crs_run() itself -- that teardown is what actually
-    unblocks this call, so there's nothing to tear down here, only to report."""
-    teardown = teardown or terminate_crs_run
+    def register(self, proc) -> None:
+        with self._lock:
+            self._proc = proc
+
+    def unregister(self, proc) -> None:
+        with self._lock:
+            if self._proc is proc:
+                self._proc = None
+
+    def abort(self) -> None:
+        """Mark the abort and SIGTERM whatever subprocess is live right now."""
+        self.requested.set()
+        with self._lock:
+            proc = self._proc
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+
+
+def _graceful_kill(proc, timeout: float = 20) -> None:
+    """SIGTERM, wait, then SIGKILL if it hasn't exited in time -- mirrors OSS-CRS's
+    own _graceful_terminate (oss_crs/src/ui.py) so its internal cleanup gets a real
+    chance to run instead of being cut off by an immediate hard kill."""
+    proc.terminate()
     try:
-        run(cmd, cwd=cwd, check=False, timeout=timeout)
-        return False, bool(abort_event and abort_event.is_set())
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def _run_agent_with_timeout(cmd, *, cwd, timeout, popen=subprocess.Popen,
+                            teardown=None, abort_controller=None,
+                            check=False) -> tuple[bool, bool]:
+    """Run an OSS-CRS subprocess under `timeout`. Returns (timed_out, aborted).
+
+    Uses Popen (not subprocess.run) so there's a live process handle to register
+    with `abort_controller` -- q-to-abort sends that process a real SIGTERM and
+    relies on OSS-CRS's own cli() to gracefully tear down its docker containers
+    itself (verified: it converts SIGTERM into a KeyboardInterrupt and calls its
+    own _graceful_terminate). `teardown` (terminate_crs_run by default) runs
+    afterward regardless, as a safety-net sweep for anything left behind.
+
+    `check=True` (build-target's semantics: a genuine build failure must still
+    raise) still raises CalledProcessError on a real failure, but not when the
+    nonzero exit was caused by our own abort."""
+    teardown = teardown or terminate_crs_run
+    proc = popen(cmd, cwd=cwd)
+    if abort_controller is not None:
+        abort_controller.register(proc)
+        if abort_controller.requested.is_set():
+            proc.terminate()   # abort raced in before we registered -- catch up
+    try:
+        proc.wait(timeout=timeout)
+        aborted = bool(abort_controller and abort_controller.requested.is_set())
+        if aborted:
+            teardown()
+            return False, True
+        if check and proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd)
+        return False, False
+    except subprocess.TimeoutExpired:
+        _graceful_kill(proc)
         teardown()
         return True, False
+    finally:
+        if abort_controller is not None:
+            abort_controller.unregister(proc)
 
 
-def run_oss_crs(bug_id: int, skip_build: bool = False, abort_event=None) -> dict:
+def run_oss_crs(bug_id: int, skip_build: bool = False, abort_controller=None) -> dict:
     """Run crs-claude-code on one ARVO bug. Returns a summary dict.
 
-    `abort_event` (a threading.Event), if given, lets an external caller (the
-    live-status panel's q-to-abort) request that this run stop; see
-    _run_agent_with_timeout for how the teardown/detection actually happens."""
+    `abort_controller` (an AbortController), if given, lets an external caller
+    (the live-status panel's q-to-abort) request that this run stop -- at any
+    point, build-target or run, since both phases register with it in turn.
+    See _run_agent_with_timeout for how the signal/teardown actually happens."""
     bug = load_bug(bug_id)
     sanitizer = bug["sanitizer"].lower()
 
@@ -448,13 +511,22 @@ def run_oss_crs(bug_id: int, skip_build: bool = False, abort_event=None) -> dict
 
     if not skip_build:
         print(f"[{bug_id}] Building target ({bug['project']})...")
-        subprocess.run(
+        _, build_aborted = _run_agent_with_timeout(
             [*base, "build-target", *compose_args,
              "--fuzz-proj-path", str(project_dir),
              "--incremental-build"],
             cwd=OSS_CRS_DIR,
+            timeout=None,
+            abort_controller=abort_controller,
             check=True,
         )
+        if build_aborted:
+            print(f"[{bug_id}] Build aborted by user.")
+            return {"bug_id": bug_id, "project": bug["project"], "elapsed_seconds": 0,
+                   "timed_out": False, "aborted": True, "check_required": _check_patch_enabled(),
+                   "check_passed": False, "usage_limit": None, "patches": 0, "patch_files": [],
+                   "tokens": {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
+                             "cache_write_tokens": 0}, "meta": {}}
     else:
         print(f"[{bug_id}] Skipping build (--skip-build set).")
 
@@ -500,7 +572,7 @@ def run_oss_crs(bug_id: int, skip_build: bool = False, abort_event=None) -> dict
              "--incremental-build"],
             cwd=OSS_CRS_DIR,
             timeout=timeout,
-            abort_event=abort_event,
+            abort_controller=abort_controller,
         )
     finally:
         if check_stop is not None:

@@ -156,74 +156,163 @@ def test_run_timeout_env_parsed_as_seconds(monkeypatch):
     assert arvo_oss_crs._run_timeout() == 7200.0
 
 
+class FakeProc:
+    """Minimal Popen stand-in. `wait_results` is consumed in order across
+    successive .wait() calls: an Exception instance is raised, an int is
+    returned (and stored as .returncode)."""
+
+    def __init__(self, wait_results):
+        self._results = list(wait_results)
+        self.returncode = None
+        self.terminate_calls = 0
+        self.kill_calls = 0
+
+    def wait(self, timeout=None):
+        result = self._results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        self.returncode = result
+        return result
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminate_calls += 1
+
+    def kill(self):
+        self.kill_calls += 1
+
+
 def test_agent_runs_to_completion_without_timeout():
     # No cap: run once, no teardown, and report the run did NOT time out.
-    calls = []
     teardowns = []
-
-    def fake_run(cmd, **kw):
-        calls.append(kw.get("timeout", "MISSING"))
+    proc = FakeProc([0])
 
     timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
         ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
-        run=fake_run, teardown=lambda: teardowns.append(True))
+        popen=lambda cmd, cwd: proc, teardown=lambda: teardowns.append(True))
     assert timed_out is False
     assert aborted is False
-    assert calls == [None]          # the cap is threaded through to subprocess.run
     assert teardowns == []          # nothing to tear down on a clean finish
 
 
-def test_agent_timeout_tears_down_containers_and_reports_timed_out():
-    # A run that blows the cap: subprocess.run raises TimeoutExpired (it SIGKILLs the
-    # oss-crs process), but the orphaned compose containers survive -- so we must tear
-    # them down and tell the caller this was a no-patch, timed-out attempt.
+def test_agent_timeout_gracefully_terminates_then_kills_and_tears_down():
+    # A run that blows the cap: SIGTERM first (mirrors OSS-CRS's own graceful
+    # shutdown), escalate to SIGKILL only if that doesn't work within _graceful_kill's
+    # own wait, then sweep leftover containers and report a no-patch timed-out attempt.
     import subprocess
     teardowns = []
-
-    def slow_run(cmd, **kw):
-        raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+    proc = FakeProc([
+        subprocess.TimeoutExpired(cmd=["x"], timeout=1.0),   # original cap blown
+        subprocess.TimeoutExpired(cmd=["x"], timeout=20),    # unresponsive to SIGTERM
+        -9,                                                   # SIGKILL finishes it
+    ])
 
     timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
         ["uv", "run", "oss-crs"], cwd="/x", timeout=1.0,
-        run=slow_run, teardown=lambda: teardowns.append(True))
+        popen=lambda cmd, cwd: proc, teardown=lambda: teardowns.append(True))
     assert timed_out is True
     assert aborted is False
+    assert proc.terminate_calls == 1
+    assert proc.kill_calls == 1
     assert teardowns == [True]
 
 
-def test_agent_reports_aborted_when_event_set_after_clean_return():
-    # q-to-abort: an external thread sets abort_event AND tears down docker itself
-    # (terminate_crs_run), which is what unblocks the subprocess call -- this function
-    # does no teardown of its own for that case, only reports what happened.
-    import threading
+def test_agent_reports_aborted_when_controller_already_requested():
+    # Abort raced in before this call even started (e.g. q pressed between phases):
+    # the process is terminated immediately on registration, and the clean-ish exit
+    # that follows is reported as aborted, with the safety-net teardown sweep run.
     teardowns = []
-    abort_event = threading.Event()
-    abort_event.set()   # simulates the external thread having already fired
-
-    def fake_run(cmd, **kw):
-        pass   # returned normally, as it would once its containers are gone
+    controller = arvo_oss_crs.AbortController()
+    controller.requested.set()
+    proc = FakeProc([-15])
 
     timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
         ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
-        run=fake_run, teardown=lambda: teardowns.append(True), abort_event=abort_event)
+        popen=lambda cmd, cwd: proc, teardown=lambda: teardowns.append(True),
+        abort_controller=controller)
     assert timed_out is False
     assert aborted is True
-    assert teardowns == []          # teardown already happened externally, not here
+    assert proc.terminate_calls == 1     # caught up immediately since requested was already set
+    assert teardowns == [True]
 
 
-def test_agent_not_aborted_when_event_absent_or_unset():
-    def fake_run(cmd, **kw):
+def test_agent_not_aborted_when_controller_absent_or_unrequested():
+    proc = FakeProc([0])
+    timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None, popen=lambda cmd, cwd: proc)
+    assert aborted is False   # no abort_controller passed at all
+
+    proc = FakeProc([0])
+    controller = arvo_oss_crs.AbortController()   # passed but never requested
+    timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None, popen=lambda cmd, cwd: proc,
+        abort_controller=controller)
+    assert aborted is False
+
+
+def test_check_true_raises_on_a_genuine_failure_not_caused_by_abort():
+    # build-target's semantics: a real nonzero exit (not an abort) must still raise.
+    import subprocess
+    proc = FakeProc([1])
+    try:
+        arvo_oss_crs._run_agent_with_timeout(
+            ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
+            popen=lambda cmd, cwd: proc, check=True)
+        assert False, "expected CalledProcessError"
+    except subprocess.CalledProcessError:
         pass
 
-    timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
-        ["uv", "run", "oss-crs"], cwd="/x", timeout=None, run=fake_run)
-    assert aborted is False   # no abort_event passed at all
 
-    import threading
+def test_check_true_does_not_raise_when_the_nonzero_exit_was_our_own_abort():
+    proc = FakeProc([-15])
+    controller = arvo_oss_crs.AbortController()
+    controller.requested.set()
+
     timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
-        ["uv", "run", "oss-crs"], cwd="/x", timeout=None, run=fake_run,
-        abort_event=threading.Event())   # passed but never set
-    assert aborted is False
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
+        popen=lambda cmd, cwd: proc, check=True, abort_controller=controller)
+    assert aborted is True   # no CalledProcessError, even though returncode != 0
+
+
+def test_abort_controller_terminates_the_currently_registered_process():
+    controller = arvo_oss_crs.AbortController()
+    proc = FakeProc([])
+    controller.register(proc)
+    controller.abort()
+    assert controller.requested.is_set()
+    assert proc.terminate_calls == 1
+
+
+def test_abort_controller_noop_when_nothing_registered():
+    controller = arvo_oss_crs.AbortController()
+    controller.abort()   # must not raise
+    assert controller.requested.is_set()
+
+
+def test_abort_controller_does_not_terminate_after_unregister():
+    controller = arvo_oss_crs.AbortController()
+    proc = FakeProc([])
+    controller.register(proc)
+    controller.unregister(proc)
+    controller.abort()
+    assert proc.terminate_calls == 0   # already unregistered -- must not touch it
+
+
+def test_abort_controller_switches_registration_across_phases():
+    # Simulates build-target's process finishing and the run phase's process
+    # registering next -- abort() must always reach whichever is CURRENT.
+    controller = arvo_oss_crs.AbortController()
+    build_proc = FakeProc([])
+    controller.register(build_proc)
+    controller.unregister(build_proc)   # build-target finished, its finally unregisters
+    run_proc = FakeProc([])
+    controller.register(run_proc)
+
+    controller.abort()
+    assert run_proc.terminate_calls == 1
+    assert build_proc.terminate_calls == 0
 
 
 def test_terminate_crs_run_force_removes_live_containers():
