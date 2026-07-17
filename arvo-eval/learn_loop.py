@@ -29,7 +29,7 @@ def _agent_results_dir(bug_id):
     return RESULTS_BASE / _pass / str(bug_id) if _pass else RESULTS_BASE / str(bug_id)
 
 
-def _default_agent(bug_id, project_dir, skip_build, abort_event=None):
+def _default_agent(bug_id, project_dir, skip_build, abort_controller=None):
     """Real agent: drive OSS-CRS, then return the chosen patch + trajectory tail.
 
     Only patches listed in THIS run's summary count. Globbing the results dir
@@ -37,11 +37,11 @@ def _default_agent(bug_id, project_dir, skip_build, abort_event=None):
     agent produced nothing, so a dead run got verified (and fed back on) as if it
     had emitted the old patch.
 
-    `abort_event`, if given, is passed straight through to run_oss_crs -- see
+    `abort_controller`, if given, is passed straight through to run_oss_crs -- see
     _make_agent, which binds a real one in for a live-status-panel run.
     """
     import arvo_oss_crs
-    summary = arvo_oss_crs.run_oss_crs(bug_id, skip_build=skip_build, abort_event=abort_event)
+    summary = arvo_oss_crs.run_oss_crs(bug_id, skip_build=skip_build, abort_controller=abort_controller)
     results_dir = _agent_results_dir(bug_id)
     patch_files = [Path(p) for p in summary.get("patch_files") or []]
     diff = patch_files[0].read_text() if patch_files and patch_files[0].exists() else ""
@@ -59,12 +59,12 @@ def _default_agent(bug_id, project_dir, skip_build, abort_event=None):
             "aborted": summary.get("aborted", False)}
 
 
-def _make_agent(abort_event=None):
-    """Bind an abort_event into a fresh agent(bug_id, project_dir, skip_build)
+def _make_agent(abort_controller=None):
+    """Bind an abort_controller into a fresh agent(bug_id, project_dir, skip_build)
     callable, keeping that 3-arg contract stable for every existing caller/test
-    (run_pass's attempt_agent never needs to know about abort_event at all)."""
+    (run_pass's attempt_agent never needs to know about abort_controller at all)."""
     def agent(bug_id, project_dir, skip_build):
-        return _default_agent(bug_id, project_dir, skip_build, abort_event=abort_event)
+        return _default_agent(bug_id, project_dir, skip_build, abort_controller=abort_controller)
     return agent
 
 

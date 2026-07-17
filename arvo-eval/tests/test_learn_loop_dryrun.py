@@ -446,7 +446,7 @@ def test_default_agent_ignores_stale_patch_from_previous_run(tmp_path, monkeypat
     d.mkdir()
     (d / "oss_crs_patch_0.diff").write_text("STALE DIFF")
     monkeypatch.setattr(arvo_oss_crs, "run_oss_crs",
-                        lambda bug_id, skip_build=False, abort_event=None: {"patch_files": []})
+                        lambda bug_id, skip_build=False, abort_controller=None: {"patch_files": []})
     run = learn_loop._default_agent(42, tmp_path / "proj", True)
     assert run["diff"] == ""
 
@@ -461,7 +461,7 @@ def test_default_agent_reads_patch_from_this_runs_summary(tmp_path, monkeypatch)
     fresh = d / "oss_crs_patch_0.diff"
     fresh.write_text("FRESH DIFF")
     monkeypatch.setattr(arvo_oss_crs, "run_oss_crs",
-                        lambda bug_id, skip_build=False, abort_event=None: {"patch_files": [str(fresh)]})
+                        lambda bug_id, skip_build=False, abort_controller=None: {"patch_files": [str(fresh)]})
     run = learn_loop._default_agent(42, tmp_path / "proj", True)
     assert run["diff"] == "FRESH DIFF"
     # The verify bridge is refreshed from the fresh patch.
