@@ -352,29 +352,48 @@ def test_resolve_autosubmit_none_when_saved_diff_empty():
         collected=[], check_passed=True, autosubmit_diff="   \n") is None
 
 
-# --- injected check-patch guidance: canonical single path + explicit repo location ---
+# --- injected check-patch guidance: cooperate with the base CLAUDE.md clean-src flow ---
 
-def test_check_patch_instruction_names_the_project_git_tree():
-    # Fix 2: point the agent straight at its editable git repo so it never re-discovers
-    # the layout, downloads a second copy, or git-inits the wrong dir.
+def test_check_patch_instruction_names_the_clean_src_git_tree():
+    # Fix 2 (reworked): the base CLAUDE.md is authoritative and tells the agent to
+    # download-source into /work/agent/clean-src and edit there. Cooperate with that --
+    # name the project's git repo INSIDE clean-src (/work/agent/clean-src/<project>) so
+    # the agent stops re-discovering the layout and stops git-init-ing the wrong dir.
     text = arvo_oss_crs.check_patch_instruction("mruby")
-    assert "/src/mruby" in text
+    assert "/work/agent/clean-src/mruby" in text
     assert "check-patch" in text
     low = text.lower()
-    assert "download-source" in low and "git init" in low     # explicitly warned against
-    assert "apply-patch-build" in low                          # the competing path, ruled out
+    assert "git init" in low                                   # warned against (it's already a repo)
+
+
+def test_check_patch_instruction_does_not_fight_the_base_workflow():
+    # It must NOT tell the agent to edit in /src (CLAUDE.md says /src is read-only
+    # reference) nor forbid download-source (that IS the sanctioned setup step).
+    text = arvo_oss_crs.check_patch_instruction("mruby")
+    assert "/src/mruby" not in text
+    assert "do not download-source" not in text.lower()
+    assert "don't download-source" not in text.lower()
 
 
 def test_check_patch_instruction_makes_pass_the_finish_line():
     # Fix 1: a PASS is the submission (auto-submit records it), so the agent must NOT
-    # hand-write a diff or hunt for /patches/ path prefixes.
+    # hand-write a diff, run apply-patch-build, or hunt for /patches/ path prefixes.
     text = arvo_oss_crs.check_patch_instruction("mruby")
     assert "PASS" in text
     low = text.lower()
     assert "automatically" in low or "for you" in low          # PASS is recorded for them
-    assert "diff" in low                                        # mentions diffs (to forbid hand-writing)
+    assert "apply-patch-build" in low                          # steered away from the manual build
+    assert "/patches/" in text                                 # tells it not to write there itself
+
+
+def test_check_patch_instruction_runs_check_from_the_clean_src_repo():
+    # check-patch does `git diff` from cwd, so the command must cd into the clean-src
+    # project repo -- the friction that cost attempt 2 ~50 minutes.
+    text = arvo_oss_crs.check_patch_instruction("mruby")
+    assert "cd /work/agent/clean-src/mruby" in text
+    assert "$OSS_CRS_SHARED_DIR/check-patch" in text
 
 
 def test_check_patch_instruction_is_project_parameterized():
-    assert "/src/openssl" in arvo_oss_crs.check_patch_instruction("openssl")
-    assert "/src/mruby" not in arvo_oss_crs.check_patch_instruction("openssl")
+    assert "/work/agent/clean-src/openssl" in arvo_oss_crs.check_patch_instruction("openssl")
+    assert "/work/agent/clean-src/mruby" not in arvo_oss_crs.check_patch_instruction("openssl")

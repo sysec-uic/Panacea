@@ -192,37 +192,38 @@ def find_shared_dir(sanitizer: str, newer_than: float | None = None) -> Path | N
 
 
 def check_patch_instruction(project: str) -> str:
-    """The injected `check-patch` guidance. Two hard-won points (Jul 17 postmortem, bug
-    439279102): the model fixes the bug correctly but then loses the whole run to
-    submission plumbing, so this (1) points it straight at its editable git tree so it
-    never re-discovers the layout / downloads a second copy / git-inits the wrong dir,
-    and (2) makes a check-patch PASS the finish line -- because run_oss_crs now
-    auto-submits the validated diff -- so it never hand-writes a diff or hunts for
-    /patches/ path prefixes. check-patch is the ONE build+test+submit action."""
-    src = f"/src/{project}"
+    """The injected `check-patch` guidance. Cooperates with the base CLAUDE.md workflow
+    (which is authoritative and tells the agent to `download-source` into
+    /work/agent/clean-src and edit there) rather than fighting it.
+
+    Two hard-won points (Jul 17 postmortem, bug 439279102): the model fixes the bug
+    correctly but loses the run to submission plumbing. So this (1) names the project's
+    git repo INSIDE clean-src (/work/agent/clean-src/<project>) and where to run
+    check-patch, so the agent stops re-discovering the layout, git-init-ing the wrong
+    dir, or wrestling diff path-prefixes; and (2) makes a check-patch PASS the finish
+    line -- because run_oss_crs now auto-submits the validated diff -- so it uses
+    check-patch instead of the manual apply-patch-build/write-/patches/ chain."""
+    repo = f"/work/agent/clean-src/{project}"
     return (
-        "\n\n## Your ONE loop: edit -> check-patch -> repeat until PASS\n"
-        f"The project source is at `{src}`, already a git repository with the code "
-        "checked out. Edit those files directly.\n"
-        f"Do NOT download a separate copy of the source (`download-source`), do NOT run "
-        "`git init`, and do NOT use `apply-patch-build`/`apply-patch-test` or hand-write "
-        "a diff -- every one of those paths burns the session on git/path plumbing "
-        "instead of fixing the bug.\n"
-        "`check-patch` is your single tool for building, testing, AND submitting. Run it "
-        "from the project tree:\n"
-        f"    cd {src} && bash \"$OSS_CRS_SHARED_DIR/check-patch\"\n"
-        "It captures your current edits (`git diff`), builds the sanitizer target with "
-        "them, re-runs the crashing input, and runs the test suite, then prints PASS or "
-        "FAIL with exactly what is wrong.\n"
+        "\n\n## Building, validating, and submitting: use check-patch\n"
+        "Follow the CLAUDE.md setup (`download-source target-source /work/agent/clean-src`) "
+        f"and make your edits in the project tree it creates: `{repo}`, which is already a "
+        "git repository -- do NOT run `git init` there, and do not create another copy of "
+        "the source.\n"
+        "To build, test, AND submit in one step, use `check-patch` instead of the manual "
+        "`apply-patch-build`/`apply-patch-test` chain. Run it from that repo so it captures "
+        "your edits via `git diff`:\n"
+        f"    cd {repo} && bash \"$OSS_CRS_SHARED_DIR/check-patch\"\n"
+        "It builds the sanitizer target with your changes, re-runs the crashing input, and "
+        "runs the test suite, then prints PASS or FAIL with exactly what is wrong.\n"
         "When check-patch prints PASS, you are DONE: that validated patch is recorded and "
-        "submitted for you automatically. You do NOT need to write any patch file or "
-        "produce a diff yourself -- stop there.\n"
-        "Do not read the whole codebase first. As soon as you have a root-cause "
-        f"hypothesis, make your best edit in `{src}` and run check-patch; let its FAIL "
-        "output drive the next edit. Checks are cheap (incremental rebuild -- seconds to "
-        "a couple of minutes after the first), so budget for several edit -> check "
-        "cycles. An early wrong edit that check-patch refutes teaches you more than an "
-        "hour of reading.\n"
+        "submitted for you automatically. Do NOT hand-write a diff, run `apply-patch-build`, "
+        "or write anything to `/patches/` yourself -- just stop.\n"
+        "Do not read the whole codebase first. As soon as you have a root-cause hypothesis, "
+        f"make your best edit in `{repo}` and run check-patch; let its FAIL output drive the "
+        "next edit. Checks are cheap (incremental rebuild -- seconds to a couple of minutes "
+        "after the first), so budget for several edit -> check cycles. An early wrong edit "
+        "that check-patch refutes teaches you more than an hour of reading.\n"
     )
 
 
