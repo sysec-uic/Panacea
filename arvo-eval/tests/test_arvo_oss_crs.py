@@ -321,3 +321,60 @@ def test_token_counts_missing_file_is_zeroed(tmp_path):
         "input_tokens": 0, "output_tokens": 0,
         "cache_read_tokens": 0, "cache_write_tokens": 0,
     }
+
+
+# --- check-patch auto-submit: promote the validated diff when the agent never submits ---
+
+def test_resolve_autosubmit_promotes_validated_diff_when_no_agent_patch():
+    # The attempt-1 loss mode: check-patch PASSed but the agent never wrote /patches/.
+    promoted = arvo_oss_crs.resolve_autosubmit_patch(
+        collected=[], check_passed=True, autosubmit_diff="DIFF that passed")
+    assert promoted == "DIFF that passed"
+
+
+def test_resolve_autosubmit_keeps_agent_patch_when_present():
+    # The agent's own submission always wins; auto-submit is only a fallback.
+    promoted = arvo_oss_crs.resolve_autosubmit_patch(
+        collected=[Path("oss_crs_patch_0.diff")], check_passed=True, autosubmit_diff="X")
+    assert promoted is None
+
+
+def test_resolve_autosubmit_none_without_a_pass():
+    # No check-patch PASS this run -> nothing validated to fall back on.
+    assert arvo_oss_crs.resolve_autosubmit_patch(
+        collected=[], check_passed=False, autosubmit_diff="X") is None
+
+
+def test_resolve_autosubmit_none_when_saved_diff_empty():
+    assert arvo_oss_crs.resolve_autosubmit_patch(
+        collected=[], check_passed=True, autosubmit_diff="") is None
+    assert arvo_oss_crs.resolve_autosubmit_patch(
+        collected=[], check_passed=True, autosubmit_diff="   \n") is None
+
+
+# --- injected check-patch guidance: canonical single path + explicit repo location ---
+
+def test_check_patch_instruction_names_the_project_git_tree():
+    # Fix 2: point the agent straight at its editable git repo so it never re-discovers
+    # the layout, downloads a second copy, or git-inits the wrong dir.
+    text = arvo_oss_crs.check_patch_instruction("mruby")
+    assert "/src/mruby" in text
+    assert "check-patch" in text
+    low = text.lower()
+    assert "download-source" in low and "git init" in low     # explicitly warned against
+    assert "apply-patch-build" in low                          # the competing path, ruled out
+
+
+def test_check_patch_instruction_makes_pass_the_finish_line():
+    # Fix 1: a PASS is the submission (auto-submit records it), so the agent must NOT
+    # hand-write a diff or hunt for /patches/ path prefixes.
+    text = arvo_oss_crs.check_patch_instruction("mruby")
+    assert "PASS" in text
+    low = text.lower()
+    assert "automatically" in low or "for you" in low          # PASS is recorded for them
+    assert "diff" in low                                        # mentions diffs (to forbid hand-writing)
+
+
+def test_check_patch_instruction_is_project_parameterized():
+    assert "/src/openssl" in arvo_oss_crs.check_patch_instruction("openssl")
+    assert "/src/mruby" not in arvo_oss_crs.check_patch_instruction("openssl")
