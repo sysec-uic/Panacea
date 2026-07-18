@@ -85,10 +85,13 @@ ARVO_DB_PATH=arvo_new.db LEARN_PASS=control .venv/bin/python3 learn_loop.py --bu
   --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu`, but declined for now (host-level
   change). This is environment-level, not bug-specific — could in principle recur on any
   bug that needs a fresh docker image layer build, though other bugs have built fine so far.
-  Also worth noting: `run_oss_crs`'s `build-target` subprocess call
-  (`arvo_oss_crs.py:181`) has no try/except, so a single failed build crashes the whole
-  `learn_loop.py` process rather than just failing that one bug — this is why the run
-  silently died mid-batch on 2026-07-12.
+  Note: `run_oss_crs`'s `build-target` subprocess call runs with `check=True`, so a
+  failed build raises. This used to crash the whole `learn_loop.py` process mid-batch
+  (as happened 2026-07-12). As of the 2026-07-17 crash-isolation fix, `run_pass` wraps
+  each bug in try/except: a raising agent/verify/grade is now recorded as an `error`
+  verdict in the ledger (so resume skips it) and the campaign continues to the next bug
+  instead of dying. A reliably-crashing bug like this one still won't get fixed, but it
+  no longer takes the rest of the batch down with it.
 - **Skipping bug `449498801`** — its ARVO `-vul` image (`n132/arvo:449498801-vul`) hits a
   corrupted containerd overlay snapshot (`failed to stat parent: ... snapshots/2648/fs: no
   such file or directory`), unrelated to the MTU issue above. Restarting the docker daemon
