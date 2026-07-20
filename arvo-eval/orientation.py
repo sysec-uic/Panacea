@@ -84,6 +84,11 @@ def parse_crash_output(crash_output: str, crash_type: str, project: str) -> Orie
     m = _CLASS_RE.search(crash_output)
     crash_class = m.group("cls") if m else None
 
+    summary_line = next(
+        (ln.strip() for ln in crash_output.splitlines() if ln.strip().startswith("SUMMARY:")),
+        None,
+    )
+
     call_chain: list[Frame] = []
     for fm in _FRAME_RE.finditer(crash_output):
         fr = _app_frame(fm.group("func"), fm.group("path"), fm.group("line"), prefix)
@@ -94,7 +99,7 @@ def parse_crash_output(crash_output: str, crash_type: str, project: str) -> Orie
     source_frame = _source_frame(crash_output, prefix)
     return Orientation(
         crash_class=crash_class,
-        summary_line=None,
+        summary_line=summary_line,
         fault_site=fault_site,
         call_chain=call_chain,
         source_frame=source_frame,

@@ -38,3 +38,34 @@ def test_asan_source_frame_is_root_cause():
     assert o.source_frame.func == "mrb_bint_reduce"
     assert o.source_frame.path == "mrbgems/mruby-bigint/core/bigint.c"
     assert o.source_frame.line == 3673
+
+
+def _msan():
+    return (FIX / "crash_440058794_msan.txt").read_text()
+
+
+def test_msan_crash_class_and_fault_site():
+    o = parse_crash_output(_msan(), "Use-of-uninitialized-value", "mruby")
+    assert o.crash_class == "use-of-uninitialized-value"
+    assert o.fault_site.func == "mrb_obj_hash_code"
+    assert o.fault_site.path == "src/hash.c"
+    assert o.fault_site.line == 332
+
+
+def test_summary_line_captured_when_present():
+    o = parse_crash_output(_asan(), "Stack-use-after-return READ 4", "mruby")
+    assert o.summary_line is not None
+    assert o.summary_line.startswith("SUMMARY:")
+
+
+def test_empty_crash_output_returns_none():
+    assert parse_crash_output("", "whatever", "mruby") is None
+    assert parse_crash_output("   \n  ", "whatever", "mruby") is None
+
+
+def test_nonempty_but_unparseable_returns_partial():
+    o = parse_crash_output("garbage with no frames at all", "x", "mruby")
+    assert o is not None
+    assert o.fault_site is None
+    assert o.call_chain == []
+    assert o.raw_trace == "garbage with no frames at all"
