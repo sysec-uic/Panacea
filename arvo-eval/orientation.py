@@ -105,3 +105,47 @@ def parse_crash_output(crash_output: str, crash_type: str, project: str) -> Orie
         source_frame=source_frame,
         raw_trace=crash_output,
     )
+
+
+HEURISTICS_POINTER = (
+    "Read ORIENTATION.md first -- it has the parsed crash trace (class, fault "
+    "site, call chain, root-cause frame). Do not re-derive it by grepping.\n\n"
+)
+
+
+def _fmt_frame(fr: Frame) -> str:
+    return f"{fr.func}    {fr.path}:{fr.line}"
+
+
+def _trim_trace(raw: str) -> str:
+    """Drop the libFuzzer preamble; keep from the first sanitizer line onward, capped."""
+    lines = raw.splitlines()
+    start = next(
+        (i for i, ln in enumerate(lines)
+         if "Sanitizer:" in ln or ln.strip().startswith(("#0", "==", "ERROR", "WARNING"))),
+        0,
+    )
+    return "\n".join(lines[start:])[:3500]
+
+
+def render_orientation(o: Orientation) -> str:
+    """Render an ORIENTATION.md body for the repair agent."""
+    out = ["# Crash orientation (parsed from the sanitizer report -- a real developer signal)"]
+    if o.crash_class:
+        out.append(f"Class:       {o.crash_class}")
+    if o.fault_site:
+        out.append(f"Fault site:  {_fmt_frame(o.fault_site)}")
+    if o.call_chain:
+        out.append("Call chain:  " + " <- ".join(f.func for f in o.call_chain))
+    if o.source_frame:
+        out.append("Source frame (where the bad memory came from):")
+        out.append(f"             {_fmt_frame(o.source_frame)}")
+    out.append(
+        "\n-> Read these functions first, form a root-cause hypothesis, make your "
+        "first edit, then run check-patch. Do NOT re-derive the trace by grepping "
+        "the codebase.\n"
+    )
+    out.append("```")
+    out.append(_trim_trace(o.raw_trace))
+    out.append("```")
+    return "\n".join(out) + "\n"

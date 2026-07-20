@@ -69,3 +69,23 @@ def test_nonempty_but_unparseable_returns_partial():
     assert o.fault_site is None
     assert o.call_chain == []
     assert o.raw_trace == "garbage with no frames at all"
+
+
+from orientation import render_orientation, HEURISTICS_POINTER
+
+
+def test_render_contains_key_fields():
+    o = parse_crash_output(_asan(), "Stack-use-after-return READ 4", "mruby")
+    md = render_orientation(o)
+    assert "stack-use-after-return" in md
+    assert "limb_addmul_1" in md
+    assert "mrbgems/mruby-bigint/core/bigint.c:726" in md
+    assert "mrb_bint_reduce" in md          # source frame
+    assert "check-patch" in md              # directive to iterate
+    assert "ORIENTATION.md" in HEURISTICS_POINTER
+
+
+def test_render_partial_orientation_still_useful():
+    o = parse_crash_output("some sanitizer text, no app frames", "x", "mruby")
+    md = render_orientation(o)
+    assert isinstance(md, str) and md.strip()   # never empty for a non-None Orientation
