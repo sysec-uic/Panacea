@@ -478,6 +478,7 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
         print(f"[{bug_id}] Skipping build (--skip-build set).")
 
     inject_heuristics(project_dir, sanitizer, bug_id, bug["project"])
+    inject_orientation(sanitizer, bug)
 
     print(f"[{bug_id}] Running agent (harness: {bug['fuzz_target']})...")
     timeout = _run_timeout()
