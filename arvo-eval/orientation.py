@@ -6,13 +6,18 @@ hands a real developer. This module only extracts what the report already states
 (crash class, faulting frame, call chain, root-cause frame); it adds no knowledge
 of the upstream fix.
 """
+from __future__ import annotations
+
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # One stack frame line, e.g.:
 #   #0 0x55e851c07304 in limb_addmul_1 /src/mruby/mrbgems/.../bigint.c:726:58
+# The ":line[:col]" suffix is optional -- some frames (e.g. mrb_vm_exec in
+# src/vm.c, seen in real MSan traces) are emitted without a line number at all.
 _FRAME_RE = re.compile(
-    r"#\d+ 0x[0-9a-f]+ in (?P<func>\S+) (?P<path>/\S+?):(?P<line>\d+)(?::\d+)?"
+    r"#\d+ 0x[0-9a-f]+ in (?P<func>\S+) (?P<path>/\S+?)"
+    r"(?::(?P<line>\d+)(?::\d+)?)?(?=\s|$)"
 )
 # The crash-class line: "ERROR: AddressSanitizer: stack-use-after-return ..." or
 # "WARNING: MemorySanitizer: use-of-uninitialized-value".
@@ -50,7 +55,7 @@ def _source_frame(crash_output: str, prefix: str) -> Frame | None:
 class Frame:
     func: str
     path: str   # repo-relative (leading /src/<project>/ stripped)
-    line: int
+    line: int | None   # None when the sanitizer omitted a line number
 
 
 @dataclass
@@ -63,16 +68,26 @@ class Orientation:
     raw_trace: str
 
 
-def _app_frame(func: str, path: str, line: str, prefix: str) -> Frame | None:
+def _app_frame(func: str, path: str, line: str | None, prefix: str) -> Frame | None:
     """A Frame iff the path is inside the project's own source tree (excluding
     the OSS-Fuzz fuzzing harness itself, which lives under the project prefix
-    but isn't app code)."""
+    but isn't app code). `line` may be None -- some sanitizer frames (e.g.
+    mrb_vm_exec in src/vm.c) are emitted without one; keep the frame anyway."""
     if not path.startswith(prefix):
         return None
     rel = path[len(prefix):]
     if rel.startswith("oss-fuzz/"):
         return None
-    return Frame(func=func, path=rel, line=int(line))
+    return Frame(func=func, path=rel, line=int(line) if line is not None else None)
+
+
+def _normalized_crash_type(crash_type: str) -> str | None:
+    """Fallback crash_class when the trace text doesn't carry a lowercase class
+    token (e.g. SEGV traces: 'ERROR: AddressSanitizer: SEGV on unknown address').
+    The caller's own classification (crash_type) is deployment-faithful too --
+    use it rather than surfacing crash_class=None."""
+    norm = re.sub(r"\s+", "-", (crash_type or "").strip().lower())
+    return norm or None
 
 
 def parse_crash_output(crash_output: str, crash_type: str, project: str) -> Orientation | None:
@@ -82,7 +97,7 @@ def parse_crash_output(crash_output: str, crash_type: str, project: str) -> Orie
     prefix = f"/src/{project}/"
 
     m = _CLASS_RE.search(crash_output)
-    crash_class = m.group("cls") if m else None
+    crash_class = m.group("cls") if m else _normalized_crash_type(crash_type)
 
     summary_line = next(
         (ln.strip() for ln in crash_output.splitlines() if ln.strip().startswith("SUMMARY:")),
@@ -114,18 +129,46 @@ HEURISTICS_POINTER = (
 
 
 def _fmt_frame(fr: Frame) -> str:
+    if fr.line is None:
+        return f"{fr.func}    {fr.path}"
     return f"{fr.func}    {fr.path}:{fr.line}"
 
 
-def _trim_trace(raw: str) -> str:
-    """Drop the libFuzzer preamble; keep from the first sanitizer line onward, capped."""
+# Cap on the pasted raw-trace section. This isn't about display -- it's a
+# budget for the repair agent's context tokens (raw traces can run to many KB
+# once you count duplicate ASan/MSan frame groups), so we keep it well under
+# what a full trace can cost while still surfacing the parts an agent needs.
+_TRACE_CAP = 3500
+_TRUNCATION_MARKER = "\n... [trace truncated] ...\n"
+
+
+def _trim_trace(raw: str, summary_line: str | None, source_frame: Frame | None) -> str:
+    """Drop the libFuzzer preamble; keep from the first sanitizer line onward,
+    capped at _TRACE_CAP chars. A plain head-slice can cut off the SUMMARY line
+    and the resolved source-frame line, which live near the *end* of long
+    traces (e.g. the MSan fixture) -- so if truncation would drop them, append
+    them after a truncation marker instead of silently losing them."""
     lines = raw.splitlines()
     start = next(
         (i for i, ln in enumerate(lines)
          if "Sanitizer:" in ln or ln.strip().startswith(("#0", "==", "ERROR", "WARNING"))),
         0,
     )
-    return "\n".join(lines[start:])[:3500]
+    trimmed = "\n".join(lines[start:])
+    if len(trimmed) <= _TRACE_CAP:
+        return trimmed
+
+    head = trimmed[:_TRACE_CAP]
+    tail_parts = []
+    if summary_line and summary_line not in head:
+        tail_parts.append(summary_line)
+    if source_frame is not None:
+        src_line = _fmt_frame(source_frame)
+        if src_line not in head:
+            tail_parts.append(f"Source frame: {src_line}")
+    if not tail_parts:
+        return head
+    return head + _TRUNCATION_MARKER + "\n".join(tail_parts)
 
 
 def render_orientation(o: Orientation) -> str:
@@ -146,6 +189,6 @@ def render_orientation(o: Orientation) -> str:
         "the codebase.\n"
     )
     out.append("```")
-    out.append(_trim_trace(o.raw_trace))
+    out.append(_trim_trace(o.raw_trace, o.summary_line, o.source_frame))
     out.append("```")
     return "\n".join(out) + "\n"
