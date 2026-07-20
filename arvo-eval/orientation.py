@@ -20,6 +20,31 @@ _CLASS_RE = re.compile(
     r"(?:ERROR|WARNING): \w*Sanitizer: (?P<cls>[a-z][a-z0-9-]+)"
 )
 
+# Markers that introduce the sanitizer's root-cause frame group.
+_SOURCE_MARKERS = (
+    "located in stack of",
+    "previously allocated by",
+    "freed by",
+    "allocated by",
+    "Uninitialized value was created by",
+)
+
+
+def _source_frame(crash_output: str, prefix: str) -> Frame | None:
+    """First app frame appearing after a root-cause marker line."""
+    after_marker = False
+    for line in crash_output.splitlines():
+        if not after_marker:
+            if any(mk in line for mk in _SOURCE_MARKERS):
+                after_marker = True
+            continue
+        fm = _FRAME_RE.search(line)
+        if fm:
+            fr = _app_frame(fm.group("func"), fm.group("path"), fm.group("line"), prefix)
+            if fr is not None:
+                return fr
+    return None
+
 
 @dataclass
 class Frame:
@@ -66,11 +91,12 @@ def parse_crash_output(crash_output: str, crash_type: str, project: str) -> Orie
             call_chain.append(fr)
 
     fault_site = call_chain[0] if call_chain else None
+    source_frame = _source_frame(crash_output, prefix)
     return Orientation(
         crash_class=crash_class,
         summary_line=None,
         fault_site=fault_site,
         call_chain=call_chain,
-        source_frame=None,
+        source_frame=source_frame,
         raw_trace=crash_output,
     )

@@ -30,3 +30,11 @@ def test_asan_call_chain_is_app_frames_in_order():
     assert funcs[:4] == ["limb_addmul_1", "mpz_mul_basic", "mpz_mul", "bint_mul"]
     assert "LLVMFuzzerTestOneInput" not in funcs
     assert all("llvm-project" not in f.path for f in o.call_chain)
+
+
+def test_asan_source_frame_is_root_cause():
+    o = parse_crash_output(_asan(), "Stack-use-after-return READ 4", "mruby")
+    assert o.source_frame is not None
+    assert o.source_frame.func == "mrb_bint_reduce"
+    assert o.source_frame.path == "mrbgems/mruby-bigint/core/bigint.c"
+    assert o.source_frame.line == 3673
