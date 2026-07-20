@@ -399,7 +399,7 @@ def test_check_patch_instruction_is_project_parameterized():
     assert "/work/agent/clean-src/mruby" not in arvo_oss_crs.check_patch_instruction("openssl")
 
 
-def test_inject_orientation_writes_files_and_pointer(tmp_path, monkeypatch):
+def test_inject_orientation_inlines_briefing_into_heuristics(tmp_path, monkeypatch):
     import arvo_oss_crs
     monkeypatch.setenv("OSS_CRS_ORIENT", "1")
     monkeypatch.setattr(arvo_oss_crs, "find_target_source_dir", lambda san: tmp_path)
@@ -414,10 +414,15 @@ def test_inject_orientation_writes_files_and_pointer(tmp_path, monkeypatch):
         ),
     }
     assert arvo_oss_crs.inject_orientation("address", bug) is True
+    # ORIENTATION.md is still written as an inspectable artifact...
     assert "limb_addmul_1" in (tmp_path / "ORIENTATION.md").read_text()
+    # ...but the fix: the full briefing is INLINED at the top of HEURISTICS.md (the
+    # file the agent reliably reads), not behind a pointer it must choose to open.
     heur = (tmp_path / "HEURISTICS.md").read_text()
-    assert heur.startswith("Read ORIENTATION.md first")
-    assert "EXISTING PLAYBOOK" in heur   # pointer prepended, not clobbered
+    assert heur.startswith("# Crash orientation")
+    assert "limb_addmul_1" in heur                        # fault site inline
+    assert "mrbgems/mruby-bigint/core/bigint.c:726" in heur
+    assert "EXISTING PLAYBOOK" in heur                    # playbook preserved below
 
 
 def test_inject_orientation_disabled_by_default(tmp_path, monkeypatch):

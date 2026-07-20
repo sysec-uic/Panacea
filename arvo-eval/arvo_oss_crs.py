@@ -33,7 +33,7 @@ import urllib.request
 from pathlib import Path
 
 from build_instance import load_bug
-from orientation import parse_crash_output, render_orientation, HEURISTICS_POINTER
+from orientation import parse_crash_output, render_orientation
 
 OSS_CRS_DIR = Path.home() / "oss-crs"
 def _compose_file() -> Path:
@@ -270,12 +270,20 @@ def inject_orientation(sanitizer: str, bug: dict) -> bool:
     if target_source is None:
         print(f"[{bug['localId']}] Warning: no target-source dir, skipping orientation")
         return False
-    (target_source / "ORIENTATION.md").write_text(render_orientation(o))
+    briefing = render_orientation(o)
+    # Keep ORIENTATION.md as an inspectable artifact, but deliver the briefing by
+    # INLINING it at the top of HEURISTICS.md -- the file the agent reliably reads
+    # first. A separate ORIENTATION.md behind a one-line pointer was ignored in a
+    # live A/B (2026-07-20): the agent read HEURISTICS.md but never followed the
+    # pointer to open the second file (the same "won't act on an instruction to go
+    # do something" failure that dooms check-patch). So hand it the content, not a
+    # reference to it.
+    (target_source / "ORIENTATION.md").write_text(briefing)
     heur = target_source / "HEURISTICS.md"
     existing = heur.read_text() if heur.exists() else ""
-    if HEURISTICS_POINTER not in existing:
-        heur.write_text(HEURISTICS_POINTER + existing)
-    print(f"[{bug['localId']}] Injected ORIENTATION.md into {target_source}")
+    if "# Crash orientation" not in existing:
+        heur.write_text(briefing + "\n\n" + existing)
+    print(f"[{bug['localId']}] Inlined crash orientation into HEURISTICS.md at {target_source}")
     return True
 
 
