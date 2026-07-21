@@ -11,6 +11,7 @@ Run this file directly for a simulated demo:
 """
 from __future__ import annotations
 
+import os
 import select
 import sys
 import threading
@@ -171,7 +172,15 @@ class LiveStatus:
             while not self._stop_keys.is_set():
                 ready, _, _ = select.select([fd], [], [], 0.2)
                 if ready:
-                    self._handle_key(sys.stdin.read(1))
+                    # os.read, not sys.stdin.read: the latter is buffered and can
+                    # silently pull a second fast keystroke into its internal
+                    # buffer during this call. That byte is then invisible to the
+                    # next select() (which only sees the OS-level fd), so it sits
+                    # stuck until some later keypress triggers another ready event
+                    # -- surfacing the stale key instead of the new one.
+                    ch = os.read(fd, 1).decode(errors="ignore")
+                    if ch:
+                        self._handle_key(ch)
         except Exception:
             pass
         finally:

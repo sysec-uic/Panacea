@@ -101,6 +101,60 @@ ARVO_DB_PATH=arvo_new.db LEARN_PASS=control .venv/bin/python3 learn_loop.py --bu
 
 ---
 
+## To-do (as of 2026-07-20)
+
+Priority order, per explicit decisions — don't reorder without checking in:
+
+1. **Reconcile `feature/live-status-ui` with `origin/main`** (planned 2026-07-21,
+   before #2) — `origin/main` picked up a `fix/verify-pipeline-e2e` merge (13 commits)
+   with two real fixes: per-bug crash isolation in `run_pass` (a bug's build/verify/grade
+   exception now records an `error` verdict and moves on, instead of killing the whole
+   campaign — this is the fix for the `449429295` gotcha below about `build-target`
+   having no try/except), and check-patch auto-submit (promotes a validated diff to
+   `/patches/` if the agent earns a PASS but never writes the file). **Not a clean
+   merge** — `learn_loop.py` has a real conflict: both branches independently rewrote
+   the same per-bug loop body (ours: attempt-level checkpointing/resume + abort/
+   usage-limit handling; theirs: try/except crash isolation). Needs manual
+   reintegration of both behaviors, not picking a side. `arvo_oss_crs.py`'s conflict is
+   trivial (one dict-key collision, keep both). Run the full test suite after
+   reconciling, before trusting it on a real run.
+2. **Wire `verify_fix.py`/`differential_oracle.py` into the live status UI as real
+   phases** (after #1) — currently run after `run_oss_crs` returns, so they show as
+   instant/coarse instead of getting their own progress rows. Already called out as
+   the next step in `README.md`.
+3. **`detect_cyber_refusal`** — mirror `detect_usage_limit` (`arvo_oss_crs.py:284`),
+   surface Anthropic cyber-safeguard refusals as their own ledger field instead of
+   silently blending into `no_changes`. Motivated by `462331852` (2026-07-20): its
+   first control attempts got refused mid-cleanup *after* already root-causing the bug
+   and building a working patch — the ledger currently can't distinguish that from a
+   genuine dead end.
+4. **Hoist `maybe_compress` out of the per-attempt retry loop** — `learn_loop.py`'s
+   `attempt_agent` closure recomputes the compression LLM call fresh on every retry of
+   a bug, even though the playbook state doesn't change across a bug's attempts. Waste
+   that compounds on hard bugs burning multiple retries.
+5. **Possible `usage_exhausted` ledger classification** — for bugs whose attempts all
+   get cut off by the session usage limit instead of reaching a real `no_changes`
+   verdict (e.g. `455612769`, 2026-07-21). Not the same as a genuine dead end — still
+   useful data, shouldn't undercount fix rate.
+
+**Declined for now, to avoid disturbing the running experiment:** raising the
+3000-char playbook compression cap, and the retrieval-based playbook redesign
+(inject only heuristics relevant to the current bug instead of compressing the whole
+thing). Revisit after the current 30-bug run completes, not mid-experiment.
+
+**Low priority, revisit later:** `AbortController.requested` (a single
+`threading.Event()` per `learn_loop.py` process, never reset between attempts/bugs —
+if a real abort ever fires, every later attempt in that process silently self-aborts).
+Not causing active harm; not decided whether it needs fixing.
+
+**Unconfirmed, worth asking about:** teammate may have added a separate heuristic-
+learning setup that injects scripts rather than a markdown playbook — possibly worth
+comparing against the same ~20-bug set this experiment settles on. Not yet understood
+well enough to act on; get details before assuming it's related to the check-patch
+auto-submit feature in #1.
+
+---
+
 ## Ledger
 
 `results/learn/ledger.jsonl` — one JSON record per bug per pass. Git-ignored (local only).
