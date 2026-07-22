@@ -110,6 +110,15 @@ def wait_for_local_model(url: str = None, *, poll_seconds: float = 15.0,
 PROJECTS_DIR = Path.home() / ".arvo-oss-crs"   # stable per-bug project dirs live here
 RESULTS_DIR = Path(__file__).parent / "results"
 
+
+def bug_workdir(bug_id) -> Path:
+    """Per-bug agent working root, namespaced by LEARN_PASS so a control and a
+    treatment run of the same bug never share (and clobber) a project tree -- the
+    same isolation verify_fix.results_dir() already applies to the results dir.
+    Unset LEARN_PASS keeps the flat path for standalone single-bug runs."""
+    _pass = os.environ.get("LEARN_PASS", "")
+    return PROJECTS_DIR / _pass / str(bug_id) if _pass else PROJECTS_DIR / str(bug_id)
+
 SANITIZER_DIR = {"asan": "address", "msan": "memory", "ubsan": "undefined", "coverage": "coverage"}
 
 
@@ -450,8 +459,9 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     bug = load_bug(bug_id)
     sanitizer = bug["sanitizer"].lower()
 
-    project_dir = PROJECTS_DIR / str(bug_id) / "project"
-    pov_path = PROJECTS_DIR / str(bug_id) / "poc"
+    workdir = bug_workdir(bug_id)
+    project_dir = workdir / "project"
+    pov_path = workdir / "poc"
     _pass = os.environ.get("LEARN_PASS", "")
     output_dir = RESULTS_DIR / _pass / str(bug_id) if _pass else RESULTS_DIR / str(bug_id)
     output_dir.mkdir(parents=True, exist_ok=True)

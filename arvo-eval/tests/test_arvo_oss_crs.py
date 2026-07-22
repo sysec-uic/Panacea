@@ -28,6 +28,20 @@ def test_uses_local_model_false_for_oauth_compose():
         Path("/x/example/crs-claude-code/compose-oauth.yaml")) is False
 
 
+def test_bug_workdir_respects_learn_pass(monkeypatch):
+    # The agent's project tree must be namespaced by pass so a control and a
+    # treatment run of the same bug never share (and clobber) a working dir --
+    # the same isolation verify_fix.results_dir() already applies to results/.
+    monkeypatch.setattr(arvo_oss_crs, "PROJECTS_DIR", Path("/wk"))
+    monkeypatch.setenv("LEARN_PASS", "control")
+    assert arvo_oss_crs.bug_workdir(439237851) == Path("/wk/control/439237851")
+    monkeypatch.setenv("LEARN_PASS", "treatment")
+    assert arvo_oss_crs.bug_workdir(439237851) == Path("/wk/treatment/439237851")
+    # Unset LEARN_PASS keeps the flat path for standalone single-bug runs.
+    monkeypatch.delenv("LEARN_PASS", raising=False)
+    assert arvo_oss_crs.bug_workdir(439237851) == Path("/wk/439237851")
+
+
 def test_reachability_passes_when_endpoint_up():
     calls = []
     # A stub opener that "succeeds" records the call and returns without raising.
