@@ -532,11 +532,19 @@ def _run_agent_with_timeout(cmd, *, cwd, timeout, popen=subprocess.Popen,
     stall `.wait()`) -- the live-status panel's raw-output feed. ONLY in that case
     is stdout/stderr piped at all; with on_line=None (every caller before this
     feature) the child's output is inherited exactly as before, so default
-    behavior (and every existing test) is unaffected."""
+    behavior (and every existing test) is unaffected.
+
+    stdin is always closed (DEVNULL), never inherited. Without this, the child
+    (and its own descendant processes, e.g. build-target's docker compose/buildx
+    chain) shares the real terminal's stdin fd with live_status's key-listener
+    thread (select()+os.read() in cbreak mode for v/q) -- two readers racing on the
+    same tty fd is exactly the kind of thing that can make a keystroke appear to
+    double-fire or drop. These are non-interactive batch subcommands (build-target,
+    run); they were never meant to read from stdin anyway."""
     teardown = teardown or terminate_crs_run
-    popen_kwargs = {}
+    popen_kwargs = {"stdin": subprocess.DEVNULL}
     if on_line is not None:
-        popen_kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        popen_kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1)
     proc = popen(cmd, cwd=cwd, **popen_kwargs)
 

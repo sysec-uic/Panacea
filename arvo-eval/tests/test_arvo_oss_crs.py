@@ -198,7 +198,7 @@ def test_agent_runs_to_completion_without_timeout():
 
     timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
         ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
-        popen=lambda cmd, cwd: proc, teardown=lambda: teardowns.append(True))
+        popen=lambda cmd, cwd, **kw: proc, teardown=lambda: teardowns.append(True))
     assert timed_out is False
     assert aborted is False
     assert teardowns == []          # nothing to tear down on a clean finish
@@ -218,7 +218,7 @@ def test_agent_timeout_gracefully_terminates_then_kills_and_tears_down():
 
     timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
         ["uv", "run", "oss-crs"], cwd="/x", timeout=1.0,
-        popen=lambda cmd, cwd: proc, teardown=lambda: teardowns.append(True))
+        popen=lambda cmd, cwd, **kw: proc, teardown=lambda: teardowns.append(True))
     assert timed_out is True
     assert aborted is False
     assert proc.terminate_calls == 1
@@ -237,7 +237,7 @@ def test_agent_reports_aborted_when_controller_already_requested():
 
     timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
         ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
-        popen=lambda cmd, cwd: proc, teardown=lambda: teardowns.append(True),
+        popen=lambda cmd, cwd, **kw: proc, teardown=lambda: teardowns.append(True),
         abort_controller=controller)
     assert timed_out is False
     assert aborted is True
@@ -248,13 +248,13 @@ def test_agent_reports_aborted_when_controller_already_requested():
 def test_agent_not_aborted_when_controller_absent_or_unrequested():
     proc = FakeProc([0])
     timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
-        ["uv", "run", "oss-crs"], cwd="/x", timeout=None, popen=lambda cmd, cwd: proc)
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None, popen=lambda cmd, cwd, **kw: proc)
     assert aborted is False   # no abort_controller passed at all
 
     proc = FakeProc([0])
     controller = arvo_oss_crs.AbortController()   # passed but never requested
     timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
-        ["uv", "run", "oss-crs"], cwd="/x", timeout=None, popen=lambda cmd, cwd: proc,
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None, popen=lambda cmd, cwd, **kw: proc,
         abort_controller=controller)
     assert aborted is False
 
@@ -266,7 +266,7 @@ def test_check_true_raises_on_a_genuine_failure_not_caused_by_abort():
     try:
         arvo_oss_crs._run_agent_with_timeout(
             ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
-            popen=lambda cmd, cwd: proc, check=True)
+            popen=lambda cmd, cwd, **kw: proc, check=True)
         assert False, "expected CalledProcessError"
     except subprocess.CalledProcessError:
         pass
@@ -279,7 +279,7 @@ def test_check_true_does_not_raise_when_the_nonzero_exit_was_our_own_abort():
 
     timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
         ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
-        popen=lambda cmd, cwd: proc, check=True, abort_controller=controller)
+        popen=lambda cmd, cwd, **kw: proc, check=True, abort_controller=controller)
     assert aborted is True   # no CalledProcessError, even though returncode != 0
 
 
@@ -336,10 +336,11 @@ def test_on_line_receives_every_line_from_the_subprocess():
 
 
 def test_on_line_none_does_not_pipe_stdout_at_all():
-    # Default behavior (no live panel) must be byte-for-byte unaffected: the
+    # Default behavior (no live panel) must be unaffected for stdout/stderr: the
     # child's output inherits the terminal directly, exactly like before this
     # feature existed -- confirmed here by checking NO stdout/stderr kwargs are
-    # passed to popen at all when on_line is absent.
+    # passed to popen at all when on_line is absent. stdin IS always closed
+    # (DEVNULL) regardless of on_line -- see test_stdin_is_always_closed_to_the_child.
     seen_kwargs = {}
 
     def fake_popen(cmd, cwd, **kw):
@@ -348,7 +349,23 @@ def test_on_line_none_does_not_pipe_stdout_at_all():
 
     arvo_oss_crs._run_agent_with_timeout(
         ["uv", "run", "oss-crs"], cwd="/x", timeout=None, popen=fake_popen)
-    assert seen_kwargs == {}   # no stdout=PIPE, no stderr=STDOUT, no text=True
+    assert seen_kwargs == {"stdin": subprocess.DEVNULL}   # no stdout=PIPE, no stderr=STDOUT, no text=True
+
+
+def test_stdin_is_always_closed_to_the_child():
+    # The child (and its own descendants, e.g. build-target's docker compose/buildx
+    # chain) must never share the real terminal's stdin fd with live_status's
+    # key-listener thread -- two readers racing on the same tty fd is exactly the
+    # kind of thing that can make a keystroke (v/q) appear to double-fire or drop.
+    seen_kwargs = {}
+
+    def fake_popen(cmd, cwd, **kw):
+        seen_kwargs.update(kw)
+        return FakeProc([0], stdout_lines=[])
+
+    arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None, popen=fake_popen, on_line=lambda l: None)
+    assert seen_kwargs["stdin"] == subprocess.DEVNULL
 
 
 def test_on_line_pipes_stdout_and_merges_stderr():
