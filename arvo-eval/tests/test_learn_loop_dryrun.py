@@ -606,3 +606,103 @@ def test_make_agent_before_attempt_fires_once_per_agent_call():
         assert calls == [100, 100]
     finally:
         learn_loop._default_agent = orig
+
+
+# --- exhausted-bug path + per-bug crash isolation -----------------------------
+
+def test_exhausted_bug_is_recorded_with_last_verdict(tmp_path):
+    # A bug that never gets fixed must still land in the ledger (with its last verdict),
+    # so resume skips it and one hard bug doesn't get re-attempted forever.
+    from ledger import read_records
+    ledger = tmp_path / "ledger.jsonl"
+
+    def timing_out_agent(bug_id, project_dir, skip_build):
+        return {"diff": "", "trajectory_summary": "", "timed_out": True,
+                "summary": {"tokens": {}}}
+
+    result = run_pass(
+        bugs=[_bug(100)], pass_name="treatment", inject_enabled=True,
+        state_path=tmp_path / "state.json", ledger_path=ledger,
+        project_dir_for=lambda bid: tmp_path / f"proj-{bid}",
+        agent=timing_out_agent, verify=stub_verify, extract=stub_extract,
+        grade=_grade_stub("no_fix_available"), max_attempts=3,
+    )
+    recs = read_records(ledger)
+    assert [r["bug_id"] for r in recs] == [100]
+    assert recs[0]["classification"] == "timed_out"   # last attempt's verdict, not dropped
+    assert recs[0]["n_attempts"] == 3
+    assert result[0]["classification"] == "timed_out"
+
+
+def test_one_bugs_crash_does_not_abort_the_rest_of_the_batch(tmp_path):
+    # A raising agent/verify (e.g. build-target subprocess check=True) on one bug must
+    # not kill the whole campaign -- every later bug must still be attempted. This is the
+    # Jul 17 loss mode: bug 439279102 left no ledger entry and no later bug ran.
+    from ledger import read_records
+    ledger = tmp_path / "ledger.jsonl"
+    seen = []
+
+    def crashing_agent(bug_id, project_dir, skip_build):
+        seen.append(bug_id)
+        if bug_id == 100:
+            raise RuntimeError("build-target failed (docker build error)")
+        return stub_agent(bug_id, project_dir, skip_build)
+
+    result = run_pass(
+        bugs=[_bug(100), _bug(200)], pass_name="treatment", inject_enabled=True,
+        state_path=tmp_path / "state.json", ledger_path=ledger,
+        project_dir_for=lambda bid: tmp_path / f"proj-{bid}",
+        agent=crashing_agent, verify=stub_verify, extract=stub_extract,
+        grade=_grade_stub("no_fix_available"),
+    )
+    assert seen == [100, 200]                         # bug 200 still attempted after 100 crashed
+    by_id = {r["bug_id"]: r for r in read_records(ledger)}
+    assert by_id[100]["classification"] == "error"    # the crash is recorded, not silent
+    assert "build-target failed" in by_id[100].get("error", "")
+    assert by_id[200]["classification"] == "verified_correct"
+
+
+def test_crashed_bug_is_skipped_on_resume(tmp_path):
+    # Because the crash is recorded as an 'error' verdict, the resume set covers it -- a
+    # re-run doesn't retry a bug that reliably explodes.
+    from ledger import append_record
+    ledger = tmp_path / "ledger.jsonl"
+    append_record(ledger, {"bug_id": 100, "pass": "treatment",
+                           "classification": "error", "n_attempts": 0})
+    seen = []
+
+    def recording_agent(bug_id, project_dir, skip_build):
+        seen.append(bug_id)
+        return stub_agent(bug_id, project_dir, skip_build)
+
+    run_pass(
+        bugs=[_bug(100), _bug(200)], pass_name="treatment", inject_enabled=True,
+        state_path=tmp_path / "state.json", ledger_path=ledger,
+        project_dir_for=lambda bid: tmp_path / f"proj-{bid}",
+        agent=recording_agent, verify=stub_verify, extract=stub_extract,
+        grade=_grade_stub("no_fix_available"),
+    )
+    assert seen == [200]   # crashed bug 100 skipped on resume
+
+
+def test_crashing_extractor_does_not_abort_but_repair_is_still_recorded(tmp_path):
+    # Extraction runs after the ledger write; a rate-limited/crashing extractor must
+    # cost only the lesson, never the recorded repair or the rest of the batch.
+    from ledger import read_records
+    ledger = tmp_path / "ledger.jsonl"
+
+    def boom_extract(bug, diff, trajectory_summary, verdict):
+        raise RuntimeError("extractor 429 rate limited")
+
+    result = run_pass(
+        bugs=[_bug(100), _bug(200)], pass_name="treatment", inject_enabled=True,
+        state_path=tmp_path / "state.json", ledger_path=ledger,
+        project_dir_for=lambda bid: tmp_path / f"proj-{bid}",
+        agent=stub_agent, verify=stub_verify, extract=boom_extract,
+        grade=_grade_stub("no_fix_available"),
+    )
+    by_id = {r["bug_id"]: r for r in read_records(ledger)}
+    # Both bugs recorded as solved despite extraction blowing up on each.
+    assert by_id[100]["classification"] == "verified_correct"
+    assert by_id[200]["classification"] == "verified_correct"
+    assert [r["bug_id"] for r in result] == [100, 200]

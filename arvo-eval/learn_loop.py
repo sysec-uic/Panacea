@@ -211,118 +211,142 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
         if bug_id in done:
             print(f"[{bug_id}] already recorded for pass={pass_name}; skipping (resume)")
             continue
-        project_dir = Path(project_dir_for(bug_id))
-        project_dir.mkdir(parents=True, exist_ok=True)
-        last_run = {}
-        total_tokens: dict = {}
+        # Per-bug crash isolation: agent()/verify()/grade() shell out with check=True
+        # (build-target, docker run, extract_poc), so any one bug's build failure or
+        # infra hiccup raises. Without this guard that exception aborts the WHOLE
+        # campaign and the in-progress bug leaves no ledger entry -- exactly the Jul 17
+        # loss where 439279102 vanished and no later bug ran. Record it as `error`
+        # (so resume skips it and it's diagnosable) and move on to the next bug.
+        try:
+            project_dir = Path(project_dir_for(bug_id))
+            project_dir.mkdir(parents=True, exist_ok=True)
+            last_run = {}
+            total_tokens: dict = {}
 
-        checkpoint_path = checkpoint_path_for(bug_id) if checkpoint_path_for else None
-        resume_attempts = read_checkpoint(checkpoint_path) if checkpoint_path else []
-        resume_feedback = resume_attempts[-1].get("feedback_for_next", "") if resume_attempts else ""
-        for prior in resume_attempts:
-            for k, v in prior.get("tokens", {}).items():
-                total_tokens[k] = total_tokens.get(k, 0) + v
-        if resume_attempts:
-            print(f"[{bug_id}] resuming pass={pass_name} at attempt {len(resume_attempts) + 1} "
-                  f"({len(resume_attempts)} attempt(s) already checkpointed)")
+            checkpoint_path = checkpoint_path_for(bug_id) if checkpoint_path_for else None
+            resume_attempts = read_checkpoint(checkpoint_path) if checkpoint_path else []
+            resume_feedback = resume_attempts[-1].get("feedback_for_next", "") if resume_attempts else ""
+            for prior in resume_attempts:
+                for k, v in prior.get("tokens", {}).items():
+                    total_tokens[k] = total_tokens.get(k, 0) + v
+            if resume_attempts:
+                print(f"[{bug_id}] resuming pass={pass_name} at attempt {len(resume_attempts) + 1} "
+                      f"({len(resume_attempts)} attempt(s) already checkpointed)")
 
-        def on_attempt(record, _checkpoint_path=checkpoint_path):
-            if _checkpoint_path is not None:
-                tokens = dict(last_run.get("summary", {}).get("tokens", {}))
-                append_checkpoint(_checkpoint_path, {**record, "tokens": tokens})
+            def on_attempt(record, _checkpoint_path=checkpoint_path):
+                if _checkpoint_path is not None:
+                    tokens = dict(last_run.get("summary", {}).get("tokens", {}))
+                    append_checkpoint(_checkpoint_path, {**record, "tokens": tokens})
 
-        def attempt_agent(attempt_no, feedback, _bug_id=bug_id, _project_dir=project_dir):
-            # Render is holdout-filtered: only lessons from strictly-earlier bugs. Read at
-            # call time, so it reflects this bug's pre-update store.
-            text = maybe_compress(render_playbook(state, before_bug=_bug_id)) if inject_enabled else ""
-            if feedback:
-                text = (text + "\n\n## Feedback on your previous attempt\n" + feedback).strip()
-            inject(text, _project_dir)
-            run = agent(_bug_id, _project_dir, skip_build)
-            last_run.clear()
-            last_run.update(run)
-            for k, v in run.get("summary", {}).get("tokens", {}).items():
-                total_tokens[k] = total_tokens.get(k, 0) + v
-            return {"diff": run.get("diff", ""), "trajectory_summary": run.get("trajectory_summary", ""),
-                    "timed_out": run.get("timed_out", False),
-                    "check_required": run.get("check_required", False),
-                    "check_passed": run.get("check_passed", False),
-                    "usage_limit": run.get("usage_limit"),
-                    "aborted": run.get("aborted", False)}
+            def attempt_agent(attempt_no, feedback, _bug_id=bug_id, _project_dir=project_dir):
+                # Render is holdout-filtered: only lessons from strictly-earlier bugs. Read at
+                # call time, so it reflects this bug's pre-update store.
+                text = maybe_compress(render_playbook(state, before_bug=_bug_id)) if inject_enabled else ""
+                if feedback:
+                    text = (text + "\n\n## Feedback on your previous attempt\n" + feedback).strip()
+                inject(text, _project_dir)
+                run = agent(_bug_id, _project_dir, skip_build)
+                last_run.clear()
+                last_run.update(run)
+                for k, v in run.get("summary", {}).get("tokens", {}).items():
+                    total_tokens[k] = total_tokens.get(k, 0) + v
+                return {"diff": run.get("diff", ""), "trajectory_summary": run.get("trajectory_summary", ""),
+                        "timed_out": run.get("timed_out", False),
+                        "check_required": run.get("check_required", False),
+                        "check_passed": run.get("check_passed", False),
+                        "usage_limit": run.get("usage_limit"),
+                        "aborted": run.get("aborted", False)}
 
-        result = repair_with_retries(bug=bug, agent=attempt_agent, verify=verify,
-                                     max_attempts=max_attempts,
-                                     resume_attempts=resume_attempts,
-                                     resume_feedback=resume_feedback,
-                                     on_attempt=on_attempt)
+            result = repair_with_retries(bug=bug, agent=attempt_agent, verify=verify,
+                                         max_attempts=max_attempts,
+                                         resume_attempts=resume_attempts,
+                                         resume_feedback=resume_feedback,
+                                         on_attempt=on_attempt)
 
-        if result["status"] == "interrupted":
-            # A usage cap or a user-requested abort cut the agent off mid-attempt,
-            # not a genuine failure -- that attempt was never checkpointed
-            # (repair_with_retries left `attempts` untouched), so there's nothing
-            # to write to the ledger and whatever real attempts already exist stay
-            # on disk for the next run to resume into. Either way the pass stops
-            # here rather than grinding through the rest of `bugs` (a usage cap
-            # would hit the next bug identically; an abort means the user is done).
-            if result.get("aborted"):
-                reason = "aborted by user"
-            else:
-                info = result.get("usage_limit") or {}
-                reset_msg = f" ({info['resets_at_human']})" if info.get("resets_at_human") else ""
-                reason = f"usage limit hit{reset_msg}"
-            print(f"[{bug_id}] {reason} -- stopping pass={pass_name}, "
-                  f"{len(result['attempts'])} real attempt(s) already checkpointed")
-            break
+            if result["status"] == "interrupted":
+                # A usage cap or a user-requested abort cut the agent off mid-attempt,
+                # not a genuine failure -- that attempt was never checkpointed
+                # (repair_with_retries left `attempts` untouched), so there's nothing
+                # to write to the ledger and whatever real attempts already exist stay
+                # on disk for the next run to resume into. Either way the pass stops
+                # here rather than grinding through the rest of `bugs` (a usage cap
+                # would hit the next bug identically; an abort means the user is done).
+                if result.get("aborted"):
+                    reason = "aborted by user"
+                else:
+                    info = result.get("usage_limit") or {}
+                    reset_msg = f" ({info['resets_at_human']})" if info.get("resets_at_human") else ""
+                    reason = f"usage limit hit{reset_msg}"
+                print(f"[{bug_id}] {reason} -- stopping pass={pass_name}, "
+                      f"{len(result['attempts'])} real attempt(s) already checkpointed")
+                break
 
-        solved = result["status"] == "solved"
-        final_verdict = "verified_correct" if solved else (
-            result["attempts"][-1]["verdict"] if result["attempts"] else "no_changes")
+            solved = result["status"] == "solved"
+            final_verdict = "verified_correct" if solved else (
+                result["attempts"][-1]["verdict"] if result["attempts"] else "no_changes")
 
-        oracle_fields = {}
-        playbook_version_snap = state["version"]   # snapshot before any add_heuristic bumps it
-        verdict = None
-        if solved:
-            # Oracle grade first: it's a Docker differential test (no LLM), so it can't
-            # rate-limit, and its label feeds both the ledger record and the veto below.
-            verdict = grade(bug, result["accepted"]["diff"])
-            oracle_fields = {"oracle_label": verdict["label"],
-                             "fix_image_available": verdict["fix_image_available"],
-                             "n_divergences": len(verdict["divergences"]),
-                             # Keep the grader's error string, or oracle_error
-                             # records are undiagnosable after the fact.
-                             **({"oracle_error": verdict["error"]} if "error" in verdict else {})}
+            oracle_fields = {}
+            playbook_version_snap = state["version"]   # snapshot before any add_heuristic bumps it
+            verdict = None
+            if solved:
+                # Oracle grade first: it's a Docker differential test (no LLM), so it can't
+                # rate-limit, and its label feeds both the ledger record and the veto below.
+                verdict = grade(bug, result["accepted"]["diff"])
+                oracle_fields = {"oracle_label": verdict["label"],
+                                 "fix_image_available": verdict["fix_image_available"],
+                                 "n_divergences": len(verdict["divergences"]),
+                                 # Keep the grader's error string, or oracle_error
+                                 # records are undiagnosable after the fact.
+                                 **({"oracle_error": verdict["error"]} if "error" in verdict else {})}
 
-        # Record the outcome BEFORE the fragile LLM extraction below. A solved bug's
-        # repair is expensive; if the extractor rate-limits we must not discard it.
-        # Once recorded, the `done` resume-set skips this bug on the next run.
-        record = {"bug_id": bug_id, "pass": pass_name, "classification": final_verdict,
-                  "n_attempts": len(result["attempts"]), "playbook_version": playbook_version_snap,
-                  **oracle_fields, **({"tokens": total_tokens} if total_tokens else {})}
-        append_record(ledger_path, record)
-        if checkpoint_path is not None:
-            clear_checkpoint(checkpoint_path)
-        records.append({**record, **{k: last_run[k] for k in ("injected_seen",) if k in last_run}})
+            # Record the outcome BEFORE the fragile LLM extraction below. A solved bug's
+            # repair is expensive; if the extractor rate-limits we must not discard it.
+            # Once recorded, the `done` resume-set skips this bug on the next run.
+            record = {"bug_id": bug_id, "pass": pass_name, "classification": final_verdict,
+                      "n_attempts": len(result["attempts"]), "playbook_version": playbook_version_snap,
+                      **oracle_fields, **({"tokens": total_tokens} if total_tokens else {})}
+            append_record(ledger_path, record)
+            if checkpoint_path is not None:
+                clear_checkpoint(checkpoint_path)
+            records.append({**record, **{k: last_run[k] for k in ("injected_seen",) if k in last_run}})
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            err = {"bug_id": bug_id, "pass": pass_name, "classification": "error",
+                   "n_attempts": 0, "error": f"{type(exc).__name__}: {exc}"}
+            append_record(ledger_path, err)
+            records.append(err)
+            print(f"[{bug_id}] crashed ({type(exc).__name__}: {exc}); recorded as error, "
+                  f"continuing to next bug")
+            continue
 
         # Learn from all solved bugs. Extraction (an LLM call) runs AFTER the ledger
         # write, so a failure here costs at most this bug's lesson -- never the
-        # completed repair, which is already durably recorded above.
+        # completed repair, which is already durably recorded above. Guarded for the
+        # same reason: a rate-limited or crashing extractor must not abort the campaign.
         if inject_enabled and solved:
-            accepted = result["accepted"]
-            pair = result["contrastive_pair"]
-            if pair:                      # failed-then-succeeded: contrastive lesson
-                rejected, _ = pair
-                lesson = contrastive(bug, rejected["diff"], accepted["diff"], rejected["verdict"])
-            else:                         # solved first try: plain success lesson
-                lesson = extract(bug, accepted["diff"], accepted.get("trajectory_summary", ""),
-                                 "verified_correct")
+            try:
+                accepted = result["accepted"]
+                pair = result["contrastive_pair"]
+                if pair:                      # failed-then-succeeded: contrastive lesson
+                    rejected, _ = pair
+                    lesson = contrastive(bug, rejected["diff"], accepted["diff"], rejected["verdict"])
+                else:                         # solved first try: plain success lesson
+                    lesson = extract(bug, accepted["diff"], accepted.get("trajectory_summary", ""),
+                                     "verified_correct")
 
-            if verdict["label"] == "oracle_confirmed":
-                lesson["oracle"] = "confirmed"
-                lesson["confidence"] = "high"
-            else:                         # divergent | no_fix_available | oracle_error
-                lesson["oracle"] = "tests_only"
-            state = add_heuristic(state, lesson, source_bug=bug_id, after_bug=bug_id)
-            save_state(state, state_path)
+                if verdict["label"] == "oracle_confirmed":
+                    lesson["oracle"] = "confirmed"
+                    lesson["confidence"] = "high"
+                else:                         # divergent | no_fix_available | oracle_error
+                    lesson["oracle"] = "tests_only"
+                state = add_heuristic(state, lesson, source_bug=bug_id, after_bug=bug_id)
+                save_state(state, state_path)
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                print(f"[{bug_id}] lesson extraction failed ({type(exc).__name__}: {exc}); "
+                      f"repair already recorded, skipping lesson")
     return records
 
 

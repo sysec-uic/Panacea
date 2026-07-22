@@ -84,6 +84,42 @@ def test_serve_one_no_marker_on_failing_check(tmp_path):
     assert not marker.exists()
 
 
+def test_serve_one_saves_validated_diff_for_autosubmit_on_pass(tmp_path):
+    # On a PASS, the responder stashes the exact diff that passed so run_oss_crs can
+    # submit it if the agent never writes one to /patches/ (the attempt-1 loss mode).
+    req, resp = tmp_path / "req.diff", tmp_path / "resp.txt"
+    auto = tmp_path / ".check_passed.diff"
+    req.write_text("--- a/mrbgems/mruby-bigint/core/bigint.c\n+++ b/x\n")
+    check_server.serve_one(req, resp, bug=BUG, project="mruby", exec_fn=None,
+                           run_check=lambda *a, **k: {"classification": "verified_correct"},
+                           autosubmit_path=auto)
+    assert auto.exists() and "bigint.c" in auto.read_text()
+
+
+def test_serve_one_no_autosubmit_diff_on_failing_check(tmp_path):
+    req, resp = tmp_path / "req.diff", tmp_path / "resp.txt"
+    auto = tmp_path / ".check_passed.diff"
+    req.write_text("DIFF")
+    check_server.serve_one(req, resp, bug=BUG, project="mruby", exec_fn=None,
+                           run_check=lambda *a, **k: {"classification": "still_crashes"},
+                           autosubmit_path=auto)
+    assert not auto.exists()
+
+
+def test_serve_one_autosubmit_keeps_only_latest_passing_diff(tmp_path):
+    # A later PASS supersedes an earlier one, so the promoted patch is the freshest fix.
+    req, resp = tmp_path / "req.diff", tmp_path / "resp.txt"
+    auto = tmp_path / ".check_passed.diff"
+    kw = dict(bug=BUG, project="mruby", exec_fn=None,
+              run_check=lambda *a, **k: {"classification": "verified_correct"},
+              autosubmit_path=auto)
+    req.write_text("FIRST bigint.c")
+    check_server.serve_one(req, resp, **kw)
+    req.write_text("SECOND numeric.c")
+    check_server.serve_one(req, resp, **kw)
+    assert auto.read_text() == "SECOND numeric.c"
+
+
 def test_run_service_waits_for_channel_prepares_it_and_tears_down(tmp_path):
     # find_dir returns None once (channel not up yet), then the dir; stop() then ends
     # the serve loop. Asserts it drops the client and always removes the container.

@@ -34,6 +34,7 @@ import urllib.request
 from pathlib import Path
 
 from build_instance import load_bug
+from orientation import parse_crash_output, render_orientation
 
 OSS_CRS_DIR = Path.home() / "oss-crs"
 def _compose_file() -> Path:
@@ -192,35 +193,55 @@ def find_shared_dir(sanitizer: str, newer_than: float | None = None) -> Path | N
     return max(dirs, key=lambda p: p.stat().st_mtime)
 
 
-CHECK_PATCH_INSTRUCTION = (
-    "\n\n## Your primary loop: edit -> check-patch -> iterate\n"
-    "You have a `check-patch` tool. It builds the sanitizer target with your current "
-    "changes, re-runs the crashing input, and runs the test suite, then prints PASS "
-    "(the crash is gone and tests pass) or FAIL with exactly what is still wrong. "
-    "Run it from your source tree:\n"
-    "    bash \"$OSS_CRS_SHARED_DIR/check-patch\"\n"
-    "Do NOT try to understand the whole codebase before editing. As soon as you have "
-    "a root-cause hypothesis, make your best edit and run check-patch; let its FAIL "
-    "output drive the next read or edit. Checks are cheap (incremental rebuild -- "
-    "seconds to a couple of minutes after the first), so expect and budget for "
-    "several edit -> check cycles. An early wrong edit that check-patch refutes "
-    "teaches you more than an hour of reading. Submit only after check-patch prints "
-    "PASS.\n"
-)
+def check_patch_instruction(project: str) -> str:
+    """The injected `check-patch` guidance. Cooperates with the base CLAUDE.md workflow
+    (which is authoritative and tells the agent to `download-source` into
+    /work/agent/clean-src and edit there) rather than fighting it.
+
+    Two hard-won points (Jul 17 postmortem, bug 439279102): the model fixes the bug
+    correctly but loses the run to submission plumbing. So this (1) names the project's
+    git repo INSIDE clean-src (/work/agent/clean-src/<project>) and where to run
+    check-patch, so the agent stops re-discovering the layout, git-init-ing the wrong
+    dir, or wrestling diff path-prefixes; and (2) makes a check-patch PASS the finish
+    line -- because run_oss_crs now auto-submits the validated diff -- so it uses
+    check-patch instead of the manual apply-patch-build/write-/patches/ chain."""
+    repo = f"/work/agent/clean-src/{project}"
+    return (
+        "\n\n## Building, validating, and submitting: use check-patch\n"
+        "Follow the CLAUDE.md setup (`download-source target-source /work/agent/clean-src`) "
+        f"and make your edits in the project tree it creates: `{repo}`, which is already a "
+        "git repository -- do NOT run `git init` there, and do not create another copy of "
+        "the source.\n"
+        "To build, test, AND submit in one step, use `check-patch` instead of the manual "
+        "`apply-patch-build`/`apply-patch-test` chain. Run it from that repo so it captures "
+        "your edits via `git diff`:\n"
+        f"    cd {repo} && bash \"$OSS_CRS_SHARED_DIR/check-patch\"\n"
+        "It builds the sanitizer target with your changes, re-runs the crashing input, and "
+        "runs the test suite, then prints PASS or FAIL with exactly what is wrong.\n"
+        "When check-patch prints PASS, you are DONE: that validated patch is recorded and "
+        "submitted for you automatically. Do NOT hand-write a diff, run `apply-patch-build`, "
+        "or write anything to `/patches/` yourself -- just stop.\n"
+        "Do not read the whole codebase first. As soon as you have a root-cause hypothesis, "
+        f"make your best edit in `{repo}` and run check-patch; let its FAIL output drive the "
+        "next edit. Checks are cheap (incremental rebuild -- seconds to a couple of minutes "
+        "after the first), so budget for several edit -> check cycles. An early wrong edit "
+        "that check-patch refutes teaches you more than an hour of reading.\n"
+    )
 
 
 def _check_patch_enabled() -> bool:
     return os.environ.get("OSS_CRS_CHECK_PATCH") == "1"
 
 
-def inject_heuristics(project_dir: Path, sanitizer: str, bug_id: int) -> None:
+def inject_heuristics(project_dir: Path, sanitizer: str, bug_id: int, project: str) -> None:
     """Deliver the playbook (and, when enabled, the check-patch instruction) into the
     agent's source directory.
 
     HEURISTICS.md is written to the fake OSS-Fuzz project dir by injector.py but that
     dir never reaches the agent; this bridges the gap by writing into the extracted
     target-source dir where the agent runs. The check-patch instruction is appended
-    even when the playbook is empty, so the agent always learns the tool exists.
+    even when the playbook is empty, so the agent always learns the tool exists, and it
+    names the project's own source tree (/src/<project>) so the agent edits in place.
     """
     target_source = find_target_source_dir(sanitizer)
     if target_source is None:
@@ -229,16 +250,69 @@ def inject_heuristics(project_dir: Path, sanitizer: str, bug_id: int) -> None:
     src = project_dir / "HEURISTICS.md"
     text = src.read_text() if src.exists() else ""
     if _check_patch_enabled():
-        text += CHECK_PATCH_INSTRUCTION
+        text += check_patch_instruction(project)
     if not text.strip():
         return
     (target_source / "HEURISTICS.md").write_text(text)
     print(f"[{bug_id}] Injected HEURISTICS.md into {target_source}")
 
 
+def inject_orientation(sanitizer: str, bug: dict) -> bool:
+    """Write ORIENTATION.md (parsed sanitizer trace) into the agent's source dir and
+    prepend a pointer to HEURISTICS.md. Gated by OSS_CRS_ORIENT=1. Applied to both
+    passes -- orientation is a harness signal, not the playbook under test -- so it
+    must not skew the control/treatment comparison. Returns True if it injected."""
+    if os.environ.get("OSS_CRS_ORIENT") != "1":
+        return False
+    o = parse_crash_output(bug.get("crash_output") or "", bug.get("crash_type") or "", bug["project"])
+    if o is None:
+        return False
+    target_source = find_target_source_dir(sanitizer)
+    if target_source is None:
+        print(f"[{bug['localId']}] Warning: no target-source dir, skipping orientation")
+        return False
+    briefing = render_orientation(o)
+    # Keep ORIENTATION.md as an inspectable artifact, but deliver the briefing by
+    # INLINING it at the top of HEURISTICS.md -- the file the agent reliably reads
+    # first. A separate ORIENTATION.md behind a one-line pointer was ignored in a
+    # live A/B (2026-07-20): the agent read HEURISTICS.md but never followed the
+    # pointer to open the second file (the same "won't act on an instruction to go
+    # do something" failure that dooms check-patch). So hand it the content, not a
+    # reference to it.
+    (target_source / "ORIENTATION.md").write_text(briefing)
+    heur = target_source / "HEURISTICS.md"
+    existing = heur.read_text() if heur.exists() else ""
+    if "# Crash orientation" not in existing:
+        heur.write_text(briefing + "\n\n" + existing)
+    print(f"[{bug['localId']}] Inlined crash orientation into HEURISTICS.md at {target_source}")
+    return True
+
+
 def collect_patches(run_dir: Path) -> list[Path]:
     """Find patch diff files the agent produced in this run."""
     return list(run_dir.glob("**/SUBMIT_DIR/*/patches/*.diff"))
+
+
+def resolve_autosubmit_patch(*, collected: list, check_passed: bool,
+                             autosubmit_diff: str) -> str | None:
+    """Promote a check-patch-validated diff as the submission, or None to keep things
+    as-is. Returns the diff text to submit on the agent's behalf.
+
+    The agent sometimes earns a check-patch PASS but never writes the patch to
+    /patches/ before the run ends -- it overran the cap mid-validation, or drowned in
+    diff/git plumbing -- and a genuinely-fixed bug was recorded as a no-patch attempt
+    (Jul 17 postmortem, both attempts on 439279102). When that happens, submit the
+    exact diff that passed. The agent's own submission always wins (auto-submit is only
+    a fallback), and there must be a real PASS this run to fall back on -- the promoted
+    diff still goes through the authoritative fresh-container verify() downstream, so
+    this only rescues the submission step, never the correctness judgement."""
+    if collected:
+        return None
+    if not check_passed:
+        return None
+    if not (autosubmit_diff or "").strip():
+        return None
+    return autosubmit_diff
 
 
 def copy_session_files(run_dir: Path, output_dir: Path) -> None:
@@ -583,7 +657,8 @@ def run_oss_crs(bug_id: int, skip_build: bool = False, abort_controller=None,
     else:
         _log(f"[{bug_id}] Skipping build (--skip-build set).")
 
-    inject_heuristics(project_dir, sanitizer, bug_id)
+    inject_heuristics(project_dir, sanitizer, bug_id, bug["project"])
+    inject_orientation(sanitizer, bug)
 
     _log(f"[{bug_id}] Running agent (harness: {bug['fuzz_target']})...")
     _phase("agent", "start")
@@ -595,13 +670,18 @@ def run_oss_crs(bug_id: int, skip_build: bool = False, abort_controller=None,
     # the agent's check-patch requests against a warm -vul container for the duration
     # of this run. Best-effort and daemon, so it can never wedge or fail the run.
     check_marker = output_dir / ".check_passed"
+    # Holds the exact diff of the latest check-patch PASS, so a validated fix the agent
+    # never wrote to /patches/ can still be submitted (see resolve_autosubmit_patch).
+    check_autosubmit = output_dir / ".check_passed.diff"
     check_stop = check_thread = None
     if _check_patch_enabled():
         import threading
         import check_server
         from build_instance import build_instance
-        # Fresh marker per run: only a PASS from THIS run should let a submission through.
+        # Fresh marker + saved diff per run: only a PASS from THIS run should let a
+        # submission through, and only THIS run's validated diff can be promoted.
         check_marker.unlink(missing_ok=True)
+        check_autosubmit.unlink(missing_ok=True)
         check_stop = threading.Event()
         # Only latch a SHARED_DIR created after now, so a stale dir from a prior/killed
         # run can't win the newest-by-mtime race (observed live: the responder attached
@@ -611,7 +691,8 @@ def run_oss_crs(bug_id: int, skip_build: bool = False, abort_controller=None,
             target=check_server.run_service,
             args=(bug, build_instance(bug), bug["project"]),
             kwargs={"find_dir": lambda: find_shared_dir(sanitizer, newer_than=svc_start),
-                    "stop": check_stop.is_set, "marker_path": check_marker},
+                    "stop": check_stop.is_set, "marker_path": check_marker,
+                    "autosubmit_path": check_autosubmit},
             daemon=True)
         check_thread.start()
         _log(f"[{bug_id}] check-patch self-check service running (OSS_CRS_CHECK_PATCH=1)")
@@ -659,6 +740,23 @@ def run_oss_crs(bug_id: int, skip_build: bool = False, abort_controller=None,
         _log(f"[{bug_id}] Saved session files to {output_dir}")
 
     n_patches = meta.get("totals", {}).get("artifacts", {}).get("patches", 0)
+    patch_files = [str(output_dir / f"oss_crs_patch_{i}.diff") for i in range(len(patches))]
+
+    # Auto-submit: if check-patch PASSed this run but the agent never wrote a patch,
+    # promote the validated diff so the fix reaches verify() instead of being lost.
+    auto_submitted = False
+    promoted = resolve_autosubmit_patch(
+        collected=patches, check_passed=check_marker.exists(),
+        autosubmit_diff=check_autosubmit.read_text() if check_autosubmit.exists() else "")
+    if promoted is not None:
+        dest = output_dir / "oss_crs_patch_0.diff"
+        dest.write_text(promoted)
+        patch_files = [str(dest)]
+        n_patches = max(n_patches, 1)
+        auto_submitted = True
+        print(f"[{bug_id}] check-patch PASSed but no patch was submitted; auto-submitting "
+              f"the validated diff ({dest}).")
+
     tokens = parse_token_counts(output_dir / "oss_crs_claude_stdout.log")
     usage_limit = detect_usage_limit(output_dir / "oss_crs_claude_stdout.log")
     if usage_limit:
@@ -675,8 +773,11 @@ def run_oss_crs(bug_id: int, skip_build: bool = False, abort_controller=None,
         "check_required": _check_patch_enabled(),
         "check_passed": check_marker.exists(),
         "usage_limit": usage_limit,
+        # auto_submitted: this run's patch is a check-patch-validated diff we promoted
+        # because the agent earned a PASS but never wrote one to /patches/.
+        "auto_submitted": auto_submitted,
         "patches": n_patches,
-        "patch_files": [str(output_dir / f"oss_crs_patch_{i}.diff") for i in range(len(patches))],
+        "patch_files": patch_files,
         "tokens": tokens,
         "meta": meta,
     }

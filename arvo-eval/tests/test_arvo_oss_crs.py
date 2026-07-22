@@ -570,3 +570,114 @@ def test_detect_usage_limit_ignores_unparseable_lines(tmp_path):
     log.write_text('not json\n{"type": "rate_limit_event", "rate_limit_info": '
                    '{"status": "rejected", "resetsAt": 5}}\n')
     assert arvo_oss_crs.detect_usage_limit(log) == {"resets_at": 5, "resets_at_human": None}
+
+
+# --- check-patch auto-submit: promote the validated diff when the agent never submits ---
+
+def test_resolve_autosubmit_promotes_validated_diff_when_no_agent_patch():
+    # The attempt-1 loss mode: check-patch PASSed but the agent never wrote /patches/.
+    promoted = arvo_oss_crs.resolve_autosubmit_patch(
+        collected=[], check_passed=True, autosubmit_diff="DIFF that passed")
+    assert promoted == "DIFF that passed"
+
+
+def test_resolve_autosubmit_keeps_agent_patch_when_present():
+    # The agent's own submission always wins; auto-submit is only a fallback.
+    promoted = arvo_oss_crs.resolve_autosubmit_patch(
+        collected=[Path("oss_crs_patch_0.diff")], check_passed=True, autosubmit_diff="X")
+    assert promoted is None
+
+
+def test_resolve_autosubmit_none_without_a_pass():
+    # No check-patch PASS this run -> nothing validated to fall back on.
+    assert arvo_oss_crs.resolve_autosubmit_patch(
+        collected=[], check_passed=False, autosubmit_diff="X") is None
+
+
+def test_resolve_autosubmit_none_when_saved_diff_empty():
+    assert arvo_oss_crs.resolve_autosubmit_patch(
+        collected=[], check_passed=True, autosubmit_diff="") is None
+    assert arvo_oss_crs.resolve_autosubmit_patch(
+        collected=[], check_passed=True, autosubmit_diff="   \n") is None
+
+
+# --- injected check-patch guidance: cooperate with the base CLAUDE.md clean-src flow ---
+
+def test_check_patch_instruction_names_the_clean_src_git_tree():
+    # Fix 2 (reworked): the base CLAUDE.md is authoritative and tells the agent to
+    # download-source into /work/agent/clean-src and edit there. Cooperate with that --
+    # name the project's git repo INSIDE clean-src (/work/agent/clean-src/<project>) so
+    # the agent stops re-discovering the layout and stops git-init-ing the wrong dir.
+    text = arvo_oss_crs.check_patch_instruction("mruby")
+    assert "/work/agent/clean-src/mruby" in text
+    assert "check-patch" in text
+    low = text.lower()
+    assert "git init" in low                                   # warned against (it's already a repo)
+
+
+def test_check_patch_instruction_does_not_fight_the_base_workflow():
+    # It must NOT tell the agent to edit in /src (CLAUDE.md says /src is read-only
+    # reference) nor forbid download-source (that IS the sanctioned setup step).
+    text = arvo_oss_crs.check_patch_instruction("mruby")
+    assert "/src/mruby" not in text
+    assert "do not download-source" not in text.lower()
+    assert "don't download-source" not in text.lower()
+
+
+def test_check_patch_instruction_makes_pass_the_finish_line():
+    # Fix 1: a PASS is the submission (auto-submit records it), so the agent must NOT
+    # hand-write a diff, run apply-patch-build, or hunt for /patches/ path prefixes.
+    text = arvo_oss_crs.check_patch_instruction("mruby")
+    assert "PASS" in text
+    low = text.lower()
+    assert "automatically" in low or "for you" in low          # PASS is recorded for them
+    assert "apply-patch-build" in low                          # steered away from the manual build
+    assert "/patches/" in text                                 # tells it not to write there itself
+
+
+def test_check_patch_instruction_runs_check_from_the_clean_src_repo():
+    # check-patch does `git diff` from cwd, so the command must cd into the clean-src
+    # project repo -- the friction that cost attempt 2 ~50 minutes.
+    text = arvo_oss_crs.check_patch_instruction("mruby")
+    assert "cd /work/agent/clean-src/mruby" in text
+    assert "$OSS_CRS_SHARED_DIR/check-patch" in text
+
+
+def test_check_patch_instruction_is_project_parameterized():
+    assert "/work/agent/clean-src/openssl" in arvo_oss_crs.check_patch_instruction("openssl")
+    assert "/work/agent/clean-src/mruby" not in arvo_oss_crs.check_patch_instruction("openssl")
+
+
+def test_inject_orientation_inlines_briefing_into_heuristics(tmp_path, monkeypatch):
+    import arvo_oss_crs
+    monkeypatch.setenv("OSS_CRS_ORIENT", "1")
+    monkeypatch.setattr(arvo_oss_crs, "find_target_source_dir", lambda san: tmp_path)
+    (tmp_path / "HEURISTICS.md").write_text("EXISTING PLAYBOOK\n")
+    bug = {
+        "localId": 439494108, "project": "mruby",
+        "crash_type": "Stack-use-after-return READ 4",
+        "crash_output": (
+            "==7==ERROR: AddressSanitizer: stack-use-after-return on address 0x1\n"
+            "    #0 0x1 in limb_addmul_1 /src/mruby/mrbgems/mruby-bigint/core/bigint.c:726:58\n"
+            "SUMMARY: AddressSanitizer: stack-use-after-return bigint.c:726\n"
+        ),
+    }
+    assert arvo_oss_crs.inject_orientation("address", bug) is True
+    # ORIENTATION.md is still written as an inspectable artifact...
+    assert "limb_addmul_1" in (tmp_path / "ORIENTATION.md").read_text()
+    # ...but the fix: the full briefing is INLINED at the top of HEURISTICS.md (the
+    # file the agent reliably reads), not behind a pointer it must choose to open.
+    heur = (tmp_path / "HEURISTICS.md").read_text()
+    assert heur.startswith("# Crash orientation")
+    assert "limb_addmul_1" in heur                        # fault site inline
+    assert "mrbgems/mruby-bigint/core/bigint.c:726" in heur
+    assert "EXISTING PLAYBOOK" in heur                    # playbook preserved below
+
+
+def test_inject_orientation_disabled_by_default(tmp_path, monkeypatch):
+    import arvo_oss_crs
+    monkeypatch.delenv("OSS_CRS_ORIENT", raising=False)
+    monkeypatch.setattr(arvo_oss_crs, "find_target_source_dir", lambda san: tmp_path)
+    bug = {"localId": 1, "project": "mruby", "crash_type": "x", "crash_output": "==ERROR: ..."}
+    assert arvo_oss_crs.inject_orientation("address", bug) is False
+    assert not (tmp_path / "ORIENTATION.md").exists()
