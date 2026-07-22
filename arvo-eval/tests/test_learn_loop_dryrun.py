@@ -197,7 +197,12 @@ def test_attempt_level_resume_continues_after_simulated_crash(tmp_path):
     state_path = tmp_path / "state.json"
     checkpoint_path_for = lambda bid: tmp_path / "checkpoints" / str(bid) / "attempts.jsonl"
 
-    class SimulatedCrash(Exception):
+    # BaseException, not Exception: this simulates the whole process dying (usage
+    # cap kill, OOM, ctrl-C) -- run_pass's per-bug crash isolation (except Exception)
+    # deliberately does NOT catch this, same as it wouldn't catch a real process death.
+    # An in-process Exception (e.g. a failed docker build) is a different scenario,
+    # covered by test_one_bugs_crash_does_not_abort_the_rest_of_the_batch.
+    class SimulatedCrash(BaseException):
         pass
 
     calls = []
@@ -347,9 +352,10 @@ def test_usage_limit_after_real_checkpointed_attempts_preserves_them(tmp_path):
 
 
 def test_checkpoint_path_for_none_disables_resume_entirely(tmp_path):
-    # Default behavior (no checkpoint_path_for) must be unaffected -- a bug that
-    # "crashes" simply propagates the exception with nothing persisted anywhere.
-    class SimulatedCrash(Exception):
+    # Default behavior (no checkpoint_path_for) must be unaffected -- a whole-process
+    # death (BaseException, not the Exception subclass run_pass's crash isolation
+    # catches) simply propagates, with nothing persisted anywhere.
+    class SimulatedCrash(BaseException):
         pass
 
     def dying_agent(bug_id, project_dir, skip_build):
