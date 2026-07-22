@@ -33,6 +33,7 @@ import urllib.request
 from pathlib import Path
 
 from build_instance import load_bug
+from orientation import parse_crash_output, render_orientation
 
 OSS_CRS_DIR = Path.home() / "oss-crs"
 def _compose_file() -> Path:
@@ -255,6 +256,37 @@ def inject_heuristics(project_dir: Path, sanitizer: str, bug_id: int, project: s
     print(f"[{bug_id}] Injected HEURISTICS.md into {target_source}")
 
 
+def inject_orientation(sanitizer: str, bug: dict) -> bool:
+    """Write ORIENTATION.md (parsed sanitizer trace) into the agent's source dir and
+    prepend a pointer to HEURISTICS.md. Gated by OSS_CRS_ORIENT=1. Applied to both
+    passes -- orientation is a harness signal, not the playbook under test -- so it
+    must not skew the control/treatment comparison. Returns True if it injected."""
+    if os.environ.get("OSS_CRS_ORIENT") != "1":
+        return False
+    o = parse_crash_output(bug.get("crash_output") or "", bug.get("crash_type") or "", bug["project"])
+    if o is None:
+        return False
+    target_source = find_target_source_dir(sanitizer)
+    if target_source is None:
+        print(f"[{bug['localId']}] Warning: no target-source dir, skipping orientation")
+        return False
+    briefing = render_orientation(o)
+    # Keep ORIENTATION.md as an inspectable artifact, but deliver the briefing by
+    # INLINING it at the top of HEURISTICS.md -- the file the agent reliably reads
+    # first. A separate ORIENTATION.md behind a one-line pointer was ignored in a
+    # live A/B (2026-07-20): the agent read HEURISTICS.md but never followed the
+    # pointer to open the second file (the same "won't act on an instruction to go
+    # do something" failure that dooms check-patch). So hand it the content, not a
+    # reference to it.
+    (target_source / "ORIENTATION.md").write_text(briefing)
+    heur = target_source / "HEURISTICS.md"
+    existing = heur.read_text() if heur.exists() else ""
+    if "# Crash orientation" not in existing:
+        heur.write_text(briefing + "\n\n" + existing)
+    print(f"[{bug['localId']}] Inlined crash orientation into HEURISTICS.md at {target_source}")
+    return True
+
+
 def collect_patches(run_dir: Path) -> list[Path]:
     """Find patch diff files the agent produced in this run."""
     return list(run_dir.glob("**/SUBMIT_DIR/*/patches/*.diff"))
@@ -454,6 +486,7 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
         print(f"[{bug_id}] Skipping build (--skip-build set).")
 
     inject_heuristics(project_dir, sanitizer, bug_id, bug["project"])
+    inject_orientation(sanitizer, bug)
 
     print(f"[{bug_id}] Running agent (harness: {bug['fuzz_target']})...")
     timeout = _run_timeout()
