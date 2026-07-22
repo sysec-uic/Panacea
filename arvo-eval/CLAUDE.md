@@ -108,23 +108,28 @@ ARVO_DB_PATH=arvo_new.db LEARN_PASS=control .venv/bin/python3 learn_loop.py --bu
 
 Priority order, per explicit decisions — don't reorder without checking in:
 
-1. **Reconcile `feature/live-status-ui` with `origin/main`** (planned 2026-07-21,
-   before #2) — `origin/main` picked up a `fix/verify-pipeline-e2e` merge (13 commits)
-   with two real fixes: per-bug crash isolation in `run_pass` (a bug's build/verify/grade
-   exception now records an `error` verdict and moves on, instead of killing the whole
-   campaign — this is the fix for the `449429295` gotcha below about `build-target`
-   having no try/except), and check-patch auto-submit (promotes a validated diff to
-   `/patches/` if the agent earns a PASS but never writes the file). **Not a clean
-   merge** — `learn_loop.py` has a real conflict: both branches independently rewrote
-   the same per-bug loop body (ours: attempt-level checkpointing/resume + abort/
-   usage-limit handling; theirs: try/except crash isolation). Needs manual
-   reintegration of both behaviors, not picking a side. `arvo_oss_crs.py`'s conflict is
-   trivial (one dict-key collision, keep both). Run the full test suite after
-   reconciling, before trusting it on a real run.
-2. **Wire `verify_fix.py`/`differential_oracle.py` into the live status UI as real
-   phases** (after #1) — currently run after `run_oss_crs` returns, so they show as
-   instant/coarse instead of getting their own progress rows. Already called out as
-   the next step in `README.md`.
+1. ~~Reconcile `feature/live-status-ui` with `origin/main`~~ — done 2026-07-22.
+   `origin/main` had grown to 22 commits ahead (crash-orientation feature plus the
+   two real fixes: per-bug crash isolation in `run_pass`, and check-patch
+   auto-submit). Manually reintegrated the real `learn_loop.py` conflict (nested our
+   attempt-level checkpointing/resume + usage-limit/abort handling inside their
+   try/except crash isolation, rather than picking a side); `arvo_oss_crs.py`'s
+   conflict was the anticipated trivial dict-key collision. Two pre-existing tests
+   (`test_attempt_level_resume_continues_after_simulated_crash`,
+   `test_checkpoint_path_for_none_disables_resume_entirely`) broke because they
+   simulated "process died mid-attempt" by raising a plain `Exception`, which the
+   new crash isolation now legitimately swallows — fixed by switching those
+   simulated crashes to `BaseException`, since a genuine whole-process death
+   (OOM/SIGKILL/usage-cap) would never reach `run_pass`'s `except Exception` in the
+   first place. Full suite (287 tests) passed before push.
+2. ~~Wire `verify_fix.py`/`differential_oracle.py` into the live status UI as real
+   phases~~ — done 2026-07-22. `PHASE_ORDER`/`PHASE_LABELS` in `learn_loop.py`
+   extended from 3 to 5 entries; new `_make_verify`/`_make_grade` wrappers bracket
+   the existing `_default_verify`/`_default_grade` calls with `on_phase(key,
+   "start"/"done")`, mirroring `_make_agent`. Neither `verify_fix.py` nor
+   `differential_oracle.py` was touched — they stay pure Docker-only functions with
+   no UI awareness. "verify fix" only activates on attempts with a real diff to
+   check; "differential oracle" only activates once per bug, after a solve.
 3. **`detect_cyber_refusal`** — mirror `detect_usage_limit` (`arvo_oss_crs.py:284`),
    surface Anthropic cyber-safeguard refusals as their own ledger field instead of
    silently blending into `no_changes`. Motivated by `462331852` (2026-07-20): its
@@ -139,6 +144,25 @@ Priority order, per explicit decisions — don't reorder without checking in:
    get cut off by the session usage limit instead of reaching a real `no_changes`
    verdict (e.g. `455612769`, 2026-07-21). Not the same as a genuine dead end — still
    useful data, shouldn't undercount fix rate.
+6. **Possible fix: `repair_loop.py:94` checks `usage_limit` before checking for a
+   diff** — on `455612769` (treatment, 2026-07-21) a rate-limit rejection hit ~28min
+   into the run, the agent kept going on overage and submitted a real patch 23min
+   later, but the whole attempt still got discarded as `"interrupted"` (no verify, no
+   ledger entry) — had to be manually recovered. Check for a non-empty diff first.
+7. **Report verify/oracle progress into the live status panel's raw feed** (lower
+   priority, added 2026-07-22 as a follow-on to #2 above) — build/agent already
+   stream real subprocess output into the `v`-toggled raw panel via `on_line`, but
+   verify and the oracle currently give zero insight beyond a spinner + elapsed
+   time once their phase goes active: `verify_fix.run_check` and
+   `differential_oracle.grade` are blocking `subprocess.run`/`docker_exec` calls
+   with no callback hook at all. Plan: add an optional `on_step(msg)` param
+   (default `None`, so every existing caller — CLI entry points, check-patch,
+   tests — is unaffected) to both, firing a short message before each already-
+   identifiable step (verify: apply patch → compile → run PoC → run `rake test`;
+   oracle: build agent container → start fix container → run PoC → check binary →
+   build/read probe goldens → run each of the 6 probes, "probe N/6"). Thread
+   `status.feed_raw` through as that `on_step` in `_make_verify`/`_make_grade`.
+   Unlike #2, this DOES require touching `verify_fix.py`/`differential_oracle.py`.
 
 **Declined for now, to avoid disturbing the running experiment:** raising the
 3000-char playbook compression cap, and the retrieval-based playbook redesign

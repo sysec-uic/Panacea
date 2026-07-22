@@ -83,8 +83,10 @@ PHASE_LABELS = {
     "prepare": "prepare environment",
     "build": "build target",
     "agent": "running agent",
+    "verify": "verify fix · rebuild + PoC + rake test",
+    "grade": "differential oracle · 6 probes + PoC",
 }
-PHASE_ORDER = ["prepare", "build", "agent"]
+PHASE_ORDER = ["prepare", "build", "agent", "verify", "grade"]
 
 
 class PhaseTracker:
@@ -155,14 +157,38 @@ def playbook_stat(state_path):
     return {"playbook": f"v{state.get('version', 0)} · {len(heuristics)} heuristics"}
 
 
-def _default_verify(bug_id, diff):
+def _default_verify(bug_id, diff, quiet=False):
     """Real verification: rebuild in a fresh -vul container, re-run the PoC, run the
     correctness gate. verify_fix reads results/<pass>/<id>/patch.diff, which
-    _default_agent bridges from the OSS-CRS patch naming."""
+    _default_agent bridges from the OSS-CRS patch naming. `quiet` is passed straight
+    through to verify_fix.verify -- see _make_verify."""
     if not diff.strip():
         return {"classification": "no_changes"}
     import verify_fix
-    return verify_fix.verify(bug_id)
+    return verify_fix.verify(bug_id, quiet=quiet)
+
+
+def _make_verify(on_phase=None):
+    """Wrap _default_verify with "verify" phase start/done timing for the live status
+    panel. verify_fix knows nothing about phases itself -- this just brackets the
+    (already synchronous, already slow) call, same as _make_agent does for
+    run_oss_crs's own on_phase callbacks. Only called when there's a real diff to
+    check (repair_loop short-circuits verify() entirely on an empty/unchecked diff),
+    so the phase legitimately stays pending on those attempts.
+
+    Also passes quiet=True through to verify_fix (whenever a panel is actually up,
+    i.e. on_phase is given) so its own prints don't land straight in the terminal
+    and corrupt the panel's redraw -- the same reason arvo_oss_crs.py suppresses its
+    own prints via `_log`/`live_mode` for the prepare/build/agent phases."""
+    def verify(bug_id, diff):
+        if on_phase is not None:
+            on_phase("verify", "start")
+        try:
+            return _default_verify(bug_id, diff, quiet=on_phase is not None)
+        finally:
+            if on_phase is not None:
+                on_phase("verify", "done")
+    return verify
 
 
 def _default_extract(bug, diff, trajectory_summary, verdict):
@@ -179,6 +205,21 @@ def _default_contrastive(bug, rejected_diff, accepted_diff, rejected_verdict):
 def _default_grade(bug, diff):
     from differential_oracle import grade
     return grade(bug, diff)
+
+
+def _make_grade(on_phase=None):
+    """Wrap _default_grade with "grade" phase start/done timing, mirroring
+    _make_verify. Only fires once per bug -- run_pass calls grade() a single time,
+    after a solve -- so the row stays pending on bugs that never got fixed."""
+    def grade(bug, diff):
+        if on_phase is not None:
+            on_phase("grade", "start")
+        try:
+            return _default_grade(bug, diff)
+        finally:
+            if on_phase is not None:
+                on_phase("grade", "done")
+    return grade
 
 
 def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
@@ -426,11 +467,13 @@ def main():
 
     agent = _make_agent(abort_controller=controller, on_phase=tracker.on_phase,
                         before_attempt=before_attempt, on_line=status.feed_raw)
+    verify = _make_verify(on_phase=tracker.on_phase)
+    grade = _make_grade(on_phase=tracker.on_phase)
 
     old_sigint = signal.signal(signal.SIGINT, lambda signum, frame: controller.abort())
     try:
         with status:
-            run_pass(agent=agent, **common_kwargs)
+            run_pass(agent=agent, verify=verify, grade=grade, **common_kwargs)
     finally:
         signal.signal(signal.SIGINT, old_sigint)
 

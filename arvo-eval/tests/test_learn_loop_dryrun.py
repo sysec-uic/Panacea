@@ -424,7 +424,7 @@ def test_default_verify_delegates_to_verify_fix(monkeypatch):
     import verify_fix
     calls = []
 
-    def fake_verify(bug_id):
+    def fake_verify(bug_id, quiet=False):
         calls.append(bug_id)
         return {"classification": "still_crashes", "run_output_tail": "boom"}
 
@@ -518,7 +518,9 @@ def test_phase_tracker_resets_and_orders_phases_per_bug():
     n = tracker.reset_for_bug(100)
     assert n == 1
     labels = [p.label for p in status.phases_calls[-1]]
-    assert labels == ["prepare environment", "build target", "running agent"]
+    assert labels == ["prepare environment", "build target", "running agent",
+                      "verify fix · rebuild + PoC + rake test",
+                      "differential oracle · 6 probes + PoC"]
     assert all(p.status.value == "pending" for p in status.phases_calls[-1])
 
     n2 = tracker.reset_for_bug(100)   # a retry on the SAME bug -- attempt count grows
@@ -612,6 +614,66 @@ def test_make_agent_before_attempt_fires_once_per_agent_call():
         assert calls == [100, 100]
     finally:
         learn_loop._default_agent = orig
+
+
+def test_make_verify_emits_start_then_done_around_the_real_call():
+    from learn_loop import _make_verify
+    import learn_loop
+    events = []
+    orig = learn_loop._default_verify
+    learn_loop._default_verify = lambda bug_id, diff, quiet=False: {"classification": "verified_correct"}
+    try:
+        verify = _make_verify(on_phase=lambda key, event: events.append((key, event)))
+        result = verify(100, "DIFF")
+        assert events == [("verify", "start"), ("verify", "done")]
+        assert result == {"classification": "verified_correct"}
+    finally:
+        learn_loop._default_verify = orig
+
+
+def test_make_verify_still_fires_done_when_the_real_call_raises():
+    # The phase must not get stuck ACTIVE forever if verify_fix blows up.
+    from learn_loop import _make_verify
+    import learn_loop
+    events = []
+    orig = learn_loop._default_verify
+    def boom(bug_id, diff, quiet=False):
+        raise RuntimeError("docker exploded")
+    learn_loop._default_verify = boom
+    try:
+        verify = _make_verify(on_phase=lambda key, event: events.append((key, event)))
+        with pytest.raises(RuntimeError):
+            verify(100, "DIFF")
+        assert events == [("verify", "start"), ("verify", "done")]
+    finally:
+        learn_loop._default_verify = orig
+
+
+def test_make_verify_without_on_phase_is_a_plain_passthrough():
+    from learn_loop import _make_verify
+    import learn_loop
+    orig = learn_loop._default_verify
+    learn_loop._default_verify = lambda bug_id, diff, quiet=False: {"classification": "still_crashes"}
+    try:
+        verify = _make_verify()
+        assert verify(100, "DIFF") == {"classification": "still_crashes"}
+    finally:
+        learn_loop._default_verify = orig
+
+
+def test_make_grade_emits_start_then_done_around_the_real_call():
+    from learn_loop import _make_grade
+    import learn_loop
+    events = []
+    orig = learn_loop._default_grade
+    learn_loop._default_grade = lambda bug, diff: {"label": "oracle_confirmed"}
+    try:
+        grade = _make_grade(on_phase=lambda key, event: events.append((key, event)))
+        result = grade(_bug(100), "DIFF")
+        assert events == [("grade", "start"), ("grade", "done")]
+        assert result == {"label": "oracle_confirmed"}
+    finally:
+        learn_loop._default_grade = orig
 
 
 # --- exhausted-bug path + per-bug crash isolation -----------------------------

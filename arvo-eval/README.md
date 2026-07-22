@@ -193,8 +193,9 @@ the reset time the CLI itself reports. Re-run the same command once usage resets
 
 Set `LEARN_LIVE_UI=1` to replace the raw OSS-CRS log spam with a live terminal panel
 (`live_status.py`, generic/pipeline-agnostic — nothing in it knows about ARVO or mruby)
-showing real phase progress (prepare → build target → running agent), a playbook stat
-(treatment only) and control/treatment tallies straight from the ledger:
+showing real phase progress (prepare → build target → running agent → verify fix →
+differential oracle), a playbook stat (treatment only) and control/treatment tallies
+straight from the ledger:
 
 ```bash
 LEARN_LIVE_UI=1 ARVO_DB_PATH=arvo_new.db LEARN_PASS=control python3 learn_loop.py --bugs <id>
@@ -212,9 +213,12 @@ normal behavior). Keys:
   the ledger — same zero-cost-attempt treatment as a usage-cap cutoff — so re-running
   the same command resumes cleanly.
 
-Known gap: only the prepare/build/agent phases are tracked live; verify and the
-differential oracle (which run after `run_oss_crs` returns) still show as coarse/instant
-in the panel today.
+`verify_fix.verify()` and `differential_oracle.grade()` are wrapped (`_make_verify` /
+`_make_grade` in `learn_loop.py`) with the same start/done phase timing as the agent
+phases — neither module knows about the panel itself, the wrapping just brackets the
+existing calls. The "verify fix" row only activates on attempts with a real diff to
+check (an empty/unchecked diff skips verify() entirely); "differential oracle" only
+activates once per bug, after a solve.
 
 ### Running the experiment
 

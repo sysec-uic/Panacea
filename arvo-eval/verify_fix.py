@@ -271,19 +271,24 @@ def check_feedback(verification: dict) -> str:
     return f"FAIL: self-check returned {cls}."
 
 
-def save(instance: dict, verification: dict) -> dict:
+def save(instance: dict, verification: dict, quiet: bool = False) -> dict:
     out_path = results_dir(instance["instance_id"]) / "verification.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(verification, indent=2))
-    print(json.dumps(verification, indent=2))
+    if not quiet:
+        print(json.dumps(verification, indent=2))
 
-    classification = verification["classification"]
-    print(f"\n=== RESULT: {classification.upper()} ===")
-    print(f"Full details saved to {out_path}")
+        classification = verification["classification"]
+        print(f"\n=== RESULT: {classification.upper()} ===")
+        print(f"Full details saved to {out_path}")
     return verification
 
 
-def verify(bug_id: int, keep: bool = False) -> dict:
+def verify(bug_id: int, keep: bool = False, quiet: bool = False) -> dict:
+    """`quiet=True` (used by learn_loop's live status panel) still writes
+    verification.json but skips every print -- these would otherwise land straight
+    in the terminal, corrupting the panel's redraw the same way arvo_oss_crs.py's
+    own `_log`/`live_mode` suppression exists to prevent for prepare/build/agent."""
     bug = load_bug(bug_id)
     instance = build_instance(bug)
     project = instance["project"]
@@ -295,12 +300,12 @@ def verify(bug_id: int, keep: bool = False) -> dict:
 
     if not diff.strip():
         verification["classification"] = "no_changes"
-        return save(instance, verification)
+        return save(instance, verification, quiet=quiet)
 
     if touches_harness(diff):
         verification["classification"] = "patch_touches_harness"
         verification["harness_paths"] = changed_paths(diff)
-        return save(instance, verification)
+        return save(instance, verification, quiet=quiet)
 
     container = f"arvo-{instance['instance_id']}-verify"
     subprocess.run(["docker", "rm", "-f", container], capture_output=True)
@@ -316,7 +321,7 @@ def verify(bug_id: int, keep: bool = False) -> dict:
         exec_fn = lambda cmd, input=None, timeout=60: docker_exec(
             container, cmd, input=input, timeout=timeout)
         verification.update(run_check(bug, diff, exec_fn, project=project))
-        return save(instance, verification)
+        return save(instance, verification, quiet=quiet)
     finally:
         if keep:
             verification["container"] = container
