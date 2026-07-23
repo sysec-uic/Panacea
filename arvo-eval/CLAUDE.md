@@ -170,6 +170,12 @@ PYTHONPATH=. .venv/bin/python3 -m pytest tests -q
 
 ## Gotchas
 
+- **`OSS_CRS_FORCE_EDIT=1`** — enables the recon->forced-edit two-pass: if the agent
+  makes 0 edits within `OSS_CRS_RECON_TIMEOUT` seconds (default 1800), the harness kills
+  the recon pass and reruns the agent with a narrow "make the edit now" directive seeded
+  with its own stated root cause. Off by default (single pass, unchanged). Apply to BOTH
+  arms when enabled (it is a harness signal, not the playbook under test), which means the
+  existing control 6/10 baseline must be re-run under the flag for a clean comparison.
 - **OAuth token expires** — re-export before each session or runs silently complete in
   ~5 seconds with 0 LLM calls
 - **OSS_CRS_COMPOSE_FILE** — must point to `compose-oauth.yaml` when using OAuth; the
