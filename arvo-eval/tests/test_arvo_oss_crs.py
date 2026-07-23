@@ -486,3 +486,21 @@ def test_force_edit_flag_and_recon_timeout(monkeypatch):
     monkeypatch.setenv("OSS_CRS_RECON_TIMEOUT", "600")
     assert a._force_edit_enabled() is True
     assert a._recon_timeout() == 600.0
+
+
+def test_agent_edit_count(tmp_path):
+    import arvo_oss_crs as a, json
+    log = tmp_path / "claude_stdout.log"
+    lines = [
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "let me look"},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "grep x"}}]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Edit", "input": {"file_path": "a.c"}}]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Write", "input": {"file_path": "b.c"}}]}},
+        "this is not json",
+    ]
+    log.write_text("\n".join(json.dumps(x) if isinstance(x, dict) else x for x in lines))
+    assert a.agent_edit_count(log) == 2
+    assert a.agent_edit_count(tmp_path / "missing.log") == 0

@@ -404,6 +404,32 @@ def parse_token_counts(log_path: Path) -> dict:
     }
 
 
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "str_replace", "str_replace_editor"}
+
+
+def agent_edit_count(log_path: "Path") -> int:
+    """Count edit-family tool_use events (Edit/Write/MultiEdit/str_replace) in a
+    claude_stdout.log JSONL stream. Missing/unreadable file or malformed lines -> those
+    contribute 0, so the worst case is under-counting to 0 ('treat as no edits')."""
+    n = 0
+    try:
+        text = Path(log_path).read_text()
+    except OSError:
+        return 0
+    for line in text.splitlines():
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        content = obj.get("message", {}).get("content")
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_use" \
+                        and b.get("name") in EDIT_TOOLS:
+                    n += 1
+    return n
+
+
 def _run_epoch(s: str) -> int:
     """OSS-CRS embeds a 10-digit epoch in run/build ids (test-1783442751bt,
     crs_compose_1783528430al-...); it orders disposables by age."""
