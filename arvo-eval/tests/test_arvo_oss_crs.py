@@ -527,3 +527,17 @@ def test_live_edit_count(tmp_path, monkeypatch):
     assert a._live_edit_count("address") == 1
     monkeypatch.setattr(a, "find_latest_run_dir", lambda san: None)
     assert a._live_edit_count("address") == 0
+
+
+def test_extract_root_cause(tmp_path):
+    import arvo_oss_crs as a, json
+    log = tmp_path / "claude_stdout.log"
+    big = "The set kset_put path stores keys without a write barrier. " * 6  # >200 chars
+    lines = [
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": big}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+    ]
+    log.write_text("\n".join(json.dumps(x) for x in lines))
+    assert a.extract_root_cause(log).startswith("The set kset_put path")
+    assert a.extract_root_cause(tmp_path / "missing.log") == ""

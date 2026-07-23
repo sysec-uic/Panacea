@@ -449,6 +449,31 @@ def agent_edit_count(log_path: "Path") -> int:
     return n
 
 
+def extract_root_cause(log_path: "Path", min_len: int = 200) -> str:
+    """Return the agent's last substantial (>= min_len chars) assistant text block from
+    the stream log, stripped. Empty string if none / unreadable. This is the agent's own
+    diagnosis, fed back verbatim into the forced-edit directive -- the harness never
+    interprets or rewrites it into a patch."""
+    last = ""
+    try:
+        text = Path(log_path).read_text()
+    except OSError:
+        return ""
+    for line in text.splitlines():
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        content = obj.get("message", {}).get("content")
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    t = (b.get("text") or "").strip()
+                    if len(t) >= min_len:
+                        last = t
+    return last
+
+
 def _run_epoch(s: str) -> int:
     """OSS-CRS embeds a 10-digit epoch in run/build ids (test-1783442751bt,
     crs_compose_1783528430al-...); it orders disposables by age."""
