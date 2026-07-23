@@ -673,6 +673,42 @@ def _run_agent_recon_phase(cmd, *, cwd, hard_cap, recon_cap, edit_probe,
         sleep(poll_interval)
 
 
+def run_agent_phases(*, run_cmd, cwd, sanitizer, bug, project, hard_cap,
+                     newer_than, exclude, single, recon, inject_forced, edit_probe,
+                     phase1_elapsed_override=None, now=time.monotonic):
+    """Decide and drive the recon/forced-edit passes. All side-effecting steps are passed
+    in so this is unit-testable:
+      single(cmd, cwd, timeout) -> timed_out      (a normal capped agent run)
+      recon(**kw) -> (timed_out, forced)          (Phase-1 poll runner)
+      inject_forced(sanitizer, bug, project, newer_than, exclude) -> bool
+      edit_probe() -> int                         (edit count for the current run)
+    Returns a dict of forced-edit fields for the summary/ledger."""
+    if not _force_edit_enabled():
+        timed_out = single(run_cmd, cwd, hard_cap)
+        return {"timed_out": timed_out, "forced_edit_triggered": False,
+                "phase1_edits": None, "phase2_edits": edit_probe(),
+                "edit_phase": "recon" if edit_probe() else None}
+
+    t0 = now()
+    timed_out, forced = recon(cmd=run_cmd, cwd=cwd, hard_cap=hard_cap,
+                              recon_cap=_recon_timeout(), edit_probe=edit_probe,
+                              sanitizer=sanitizer)
+    phase1_elapsed = phase1_elapsed_override if phase1_elapsed_override is not None \
+        else (now() - t0)
+    phase1_edits = edit_probe()
+    if not forced:
+        return {"timed_out": timed_out, "forced_edit_triggered": False,
+                "phase1_edits": phase1_edits, "phase2_edits": phase1_edits,
+                "edit_phase": "recon" if phase1_edits else None}
+
+    inject_forced(sanitizer, bug, project, newer_than, exclude)
+    timed_out = single(run_cmd, cwd, phase2_timeout(hard_cap, phase1_elapsed))
+    phase2_edits = edit_probe()
+    return {"timed_out": timed_out, "forced_edit_triggered": True,
+            "phase1_edits": phase1_edits, "phase2_edits": phase2_edits,
+            "edit_phase": "forced" if phase2_edits else "recon"}
+
+
 def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     """Run crs-claude-code on one ARVO bug. Returns a summary dict."""
     bug = load_bug(bug_id)
@@ -764,16 +800,22 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
         print(f"[{bug_id}] check-patch self-check service running (OSS_CRS_CHECK_PATCH=1)")
 
     run_start = time.time()
+    run_cmd = [*base, "run", *compose_args,
+               "--fuzz-proj-path", str(project_dir),
+               "--target-harness", bug["fuzz_target"],
+               "--pov", str(pov_path),
+               "--incremental-build"]
     try:
-        timed_out = _run_agent_with_timeout(
-            [*base, "run", *compose_args,
-             "--fuzz-proj-path", str(project_dir),
-             "--target-harness", bug["fuzz_target"],
-             "--pov", str(pov_path),
-             "--incremental-build"],
-            cwd=OSS_CRS_DIR,
-            timeout=timeout,
-        )
+        phase_info = run_agent_phases(
+            run_cmd=run_cmd, cwd=OSS_CRS_DIR, sanitizer=sanitizer, bug=bug,
+            project=bug["project"], hard_cap=timeout,
+            newer_than=build_start, exclude=ts_before,
+            single=lambda cmd, cwd, to: _run_agent_with_timeout(cmd, cwd=cwd, timeout=to),
+            recon=lambda **kw: (kw.pop("sanitizer", None),
+                                _run_agent_recon_phase(kw.pop("cmd"), **kw))[1],
+            inject_forced=inject_forced_edit,
+            edit_probe=lambda: _live_edit_count(sanitizer))
+        timed_out = phase_info["timed_out"]
     finally:
         if check_stop is not None:
             check_stop.set()
@@ -831,6 +873,10 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
         # auto_submitted: this run's patch is a check-patch-validated diff we promoted
         # because the agent earned a PASS but never wrote one to /patches/.
         "auto_submitted": auto_submitted,
+        "forced_edit_triggered": phase_info["forced_edit_triggered"],
+        "edit_phase": phase_info["edit_phase"],
+        "phase1_edits": phase_info["phase1_edits"],
+        "phase2_edits": phase_info["phase2_edits"],
         "patches": n_patches,
         "patch_files": patch_files,
         "tokens": tokens,

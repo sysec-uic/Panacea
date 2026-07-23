@@ -682,3 +682,37 @@ def test_run_agent_recon_phase_natural_exit():
         edit_probe=lambda: 0, popen=lambda cmd, cwd: FakeProc(),
         teardown=lambda: None, now=fake_now, sleep=lambda s: None)
     assert (timed_out, forced) == (False, False)
+
+
+def test_run_agent_phases_flag_off_single_call(monkeypatch):
+    import arvo_oss_crs as a
+    calls = []
+    monkeypatch.setenv("OSS_CRS_FORCE_EDIT", "0") if False else monkeypatch.delenv("OSS_CRS_FORCE_EDIT", raising=False)
+    res = a.run_agent_phases(
+        run_cmd=["run"], cwd=".", sanitizer="address", bug={"localId": 1},
+        project="mruby", hard_cap=100, newer_than=None, exclude=(),
+        single=lambda cmd, cwd, timeout: (calls.append(("single", timeout)) or False),
+        recon=lambda **k: (_ for _ in ()).throw(AssertionError("recon must not run")),
+        inject_forced=lambda *a_, **k: True,
+        edit_probe=lambda: 0)
+    assert res["forced_edit_triggered"] is False
+    assert calls == [("single", 100)]
+
+
+def test_run_agent_phases_forced_pair(monkeypatch):
+    import arvo_oss_crs as a
+    monkeypatch.setenv("OSS_CRS_FORCE_EDIT", "1")
+    calls = []
+    injected = []
+    res = a.run_agent_phases(
+        run_cmd=["run"], cwd=".", sanitizer="address", bug={"localId": 1},
+        project="mruby", hard_cap=7200, newer_than=None, exclude=(),
+        single=lambda cmd, cwd, timeout: calls.append(("single", timeout)) or False,
+        recon=lambda **k: (False, True),          # recon ends with 0 edits -> force
+        inject_forced=lambda *a_, **k: injected.append(True) or True,
+        edit_probe=lambda: 0,
+        phase1_elapsed_override=1800)
+    assert res["forced_edit_triggered"] is True
+    assert injected == [True]
+    # Phase 2 is the single-call path, capped at remaining budget (7200-1800=5400)
+    assert calls == [("single", 5400)]
