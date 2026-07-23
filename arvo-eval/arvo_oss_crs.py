@@ -664,11 +664,27 @@ def _run_agent_recon_phase(cmd, *, cwd, hard_cap, recon_cap, edit_probe,
         elapsed = now() - start
         if not checked_recon and elapsed >= recon_cap:
             checked_recon = True
-            if edit_probe() == 0:
-                proc.kill(); proc.wait(); teardown()
+            try:
+                no_edits = edit_probe() == 0
+            except Exception:
+                # A probe failure (e.g. PermissionError stat-ing a root-owned log) must
+                # never leak the live run: treat as "still working", don't force-kill.
+                no_edits = False
+            if no_edits:
+                proc.kill()
+                try:
+                    proc.wait(timeout=30)
+                except Exception:
+                    pass
+                teardown()
                 return (False, True)
         if hard_cap is not None and elapsed >= hard_cap:
-            proc.kill(); proc.wait(); teardown()
+            proc.kill()
+            try:
+                proc.wait(timeout=30)
+            except Exception:
+                pass
+            teardown()
             return (True, False)
         sleep(poll_interval)
 
@@ -685,14 +701,14 @@ def run_agent_phases(*, run_cmd, cwd, sanitizer, bug, project, hard_cap,
     Returns a dict of forced-edit fields for the summary/ledger."""
     if not _force_edit_enabled():
         timed_out = single(run_cmd, cwd, hard_cap)
+        edits = edit_probe()
         return {"timed_out": timed_out, "forced_edit_triggered": False,
-                "phase1_edits": None, "phase2_edits": edit_probe(),
-                "edit_phase": "recon" if edit_probe() else None}
+                "phase1_edits": None, "phase2_edits": edits,
+                "edit_phase": None}   # feature off -> no two-pass phase ran
 
     t0 = now()
     timed_out, forced = recon(cmd=run_cmd, cwd=cwd, hard_cap=hard_cap,
-                              recon_cap=_recon_timeout(), edit_probe=edit_probe,
-                              sanitizer=sanitizer)
+                              recon_cap=_recon_timeout(), edit_probe=edit_probe)
     phase1_elapsed = phase1_elapsed_override if phase1_elapsed_override is not None \
         else (now() - t0)
     phase1_edits = edit_probe()
@@ -805,14 +821,15 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
                "--target-harness", bug["fuzz_target"],
                "--pov", str(pov_path),
                "--incremental-build"]
+    def _recon(**kw):
+        return _run_agent_recon_phase(kw.pop("cmd"), **kw)
     try:
         phase_info = run_agent_phases(
             run_cmd=run_cmd, cwd=OSS_CRS_DIR, sanitizer=sanitizer, bug=bug,
             project=bug["project"], hard_cap=timeout,
             newer_than=build_start, exclude=ts_before,
             single=lambda cmd, cwd, to: _run_agent_with_timeout(cmd, cwd=cwd, timeout=to),
-            recon=lambda **kw: (kw.pop("sanitizer", None),
-                                _run_agent_recon_phase(kw.pop("cmd"), **kw))[1],
+            recon=_recon,
             inject_forced=inject_forced_edit,
             edit_probe=lambda: _live_edit_count(sanitizer))
         timed_out = phase_info["timed_out"]

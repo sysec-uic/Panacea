@@ -687,7 +687,7 @@ def test_run_agent_recon_phase_natural_exit():
 def test_run_agent_phases_flag_off_single_call(monkeypatch):
     import arvo_oss_crs as a
     calls = []
-    monkeypatch.setenv("OSS_CRS_FORCE_EDIT", "0") if False else monkeypatch.delenv("OSS_CRS_FORCE_EDIT", raising=False)
+    monkeypatch.delenv("OSS_CRS_FORCE_EDIT", raising=False)
     res = a.run_agent_phases(
         run_cmd=["run"], cwd=".", sanitizer="address", bug={"localId": 1},
         project="mruby", hard_cap=100, newer_than=None, exclude=(),
@@ -716,3 +716,58 @@ def test_run_agent_phases_forced_pair(monkeypatch):
     assert injected == [True]
     # Phase 2 is the single-call path, capped at remaining budget (7200-1800=5400)
     assert calls == [("single", 5400)]
+
+
+def test_run_agent_recon_phase_no_hard_cap_runs_until_exit():
+    import arvo_oss_crs as a
+    class FakeProc:
+        def __init__(self): self.calls = 0; self.killed = False
+        def poll(self):
+            self.calls += 1
+            return None if self.calls < 4 else 0   # exits on the 4th poll
+        def kill(self): self.killed = True
+        def wait(self, timeout=None): return 0
+    clock = {"t": 0.0}
+    def fake_now(): clock["t"] += 10; return clock["t"]
+    timed_out, forced = a._run_agent_recon_phase(
+        ["run"], cwd=".", hard_cap=None, recon_cap=30,
+        edit_probe=lambda: 5,                       # editing -> not forced
+        popen=lambda cmd, cwd: FakeProc(),
+        teardown=lambda: None, now=fake_now, sleep=lambda s: None)
+    assert (timed_out, forced) == (False, False)    # natural exit, no None-comparison crash
+
+
+def test_run_agent_recon_phase_probe_error_does_not_leak():
+    import arvo_oss_crs as a
+    class FakeProc:
+        def __init__(self): self.killed = False
+        def poll(self): return None
+        def kill(self): self.killed = True
+        def wait(self, timeout=None): return 0
+    proc = FakeProc(); torn = []
+    clock = {"t": 0.0}
+    def fake_now(): clock["t"] += 10; return clock["t"]
+    def boom(): raise PermissionError("root-owned log")
+    timed_out, forced = a._run_agent_recon_phase(
+        ["run"], cwd=".", hard_cap=100, recon_cap=30,
+        edit_probe=boom, popen=lambda cmd, cwd: proc,
+        teardown=lambda: torn.append(True), now=fake_now, sleep=lambda s: None)
+    # probe raised -> not forced; runs to hard_cap -> killed + torn down, no leak, no raise
+    assert (timed_out, forced) == (True, False)
+    assert proc.killed and torn == [True]
+
+
+def test_run_agent_phases_flag_off_probes_once(monkeypatch):
+    import arvo_oss_crs as a
+    monkeypatch.delenv("OSS_CRS_FORCE_EDIT", raising=False)
+    calls = {"n": 0}
+    def probe(): calls["n"] += 1; return 2
+    res = a.run_agent_phases(
+        run_cmd=["run"], cwd=".", sanitizer="address", bug={"localId": 1},
+        project="mruby", hard_cap=100, newer_than=None, exclude=(),
+        single=lambda cmd, cwd, to: False,
+        recon=lambda **k: (_ for _ in ()).throw(AssertionError("recon must not run")),
+        inject_forced=lambda *a_, **k: True, edit_probe=probe)
+    assert calls["n"] == 1                # probed exactly once
+    assert res["phase2_edits"] == 2
+    assert res["edit_phase"] is None      # flag off -> no phase label
