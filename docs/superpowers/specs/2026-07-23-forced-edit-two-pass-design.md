@@ -76,8 +76,19 @@ poll), and either cuts over or steps aside.
 - **Reuses machinery we already own.** Phase 2 is just another `oss-crs run` against the
   same already-built `target-source`, and it changes what the agent reads through the
   **existing injection channel** (`inject_heuristics` writes into `target-source`). No new
-  prompt-assembly hooks in OSS-CRS, no new services. The `check_server` self-check thread
-  and auto-submit already work per-run and are re-created for Phase 2 with no changes.
+  prompt-assembly hooks in OSS-CRS, no new services.
+  - **Correction (found in final review, fixed in implementation):** the `check_server`
+    self-check thread is **not** reusable as-is across the two passes. It latches a single
+    SHARED_DIR at construction and serves it forever, but Phase 2 is a fresh `oss-crs run`
+    with a **new** SHARED_DIR — so a thread started once for Phase 1 would leave Phase 2's
+    `check-patch` client unwritten and its responder bound to Phase-1's torn-down dir,
+    silently crippling the forced pass in the `OSS_CRS_CHECK_PATCH=1` config. The service
+    must be **stopped and restarted between phases** (fresh `svc_start` so `find_shared_dir`
+    fences out the dead Phase-1 dir, fresh PASS-marker/autosubmit-diff). This is done via an
+    `on_forced_handoff` hook (`_recycle_for_phase2`) that stops the old thread, prunes
+    docker networks — the second per-bug `oss-crs run` doubles network-pool pressure — then
+    starts a fresh thread; the warm `-vul` instance metadata is captured once and reused.
+    Auto-submit needs no change (it reads the current run's marker/diff).
 - **No lost work, no fragile surgery.** Phase 2 is only ever entered when Phase 1 made
   **0 edits**, so a fresh Phase-2 worktree discards nothing. This sidesteps all
   container-persistence / session-resume fragility — we never have to keep a container
