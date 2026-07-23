@@ -570,3 +570,27 @@ def test_phase2_timeout():
     assert a.phase2_timeout(7200, 7000, floor=900) == 900
     # No hard cap -> no phase-2 cap
     assert a.phase2_timeout(None, 1800) is None
+
+
+def test_inject_forced_edit_overwrites_target_source(tmp_path, monkeypatch):
+    import arvo_oss_crs as a, json
+    ts = tmp_path / "target-source"
+    ts.mkdir()
+    (ts / "HEURISTICS.md").write_text("OLD PLAYBOOK CONTENT")
+    # stream log with the agent's diagnosis
+    log = tmp_path / "claude_stdout.log"
+    big = "Root cause: kset_put stores keys without a write barrier. " * 5
+    log.write_text(json.dumps({"type": "assistant",
+        "message": {"content": [{"type": "text", "text": big}]}}))
+    monkeypatch.setattr(a, "find_target_source_dir", lambda san, newer_than=None, exclude=(): ts)
+    monkeypatch.setattr(a, "find_latest_run_dir", lambda san: tmp_path)
+    monkeypatch.setattr(a, "find_agent_stdout_log", lambda rd: log)
+    monkeypatch.setattr(a, "parse_crash_output", lambda *args, **kw: None)  # no orientation
+    ok = a.inject_forced_edit("address", {"localId": 1, "project": "mruby",
+                                          "crash_output": "", "crash_type": ""}, "mruby",
+                              newer_than=None, exclude=())
+    assert ok is True
+    written = (ts / "HEURISTICS.md").read_text()
+    assert written.lstrip().startswith("# FORCED EDIT")
+    assert "OLD PLAYBOOK CONTENT" not in written          # overwritten, not appended
+    assert "kset_put stores keys" in written              # agent's diagnosis fed back

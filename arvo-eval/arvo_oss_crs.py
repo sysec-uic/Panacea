@@ -364,6 +364,40 @@ def inject_orientation(sanitizer: str, bug: dict, newer_than: float | None = Non
     return True
 
 
+def inject_forced_edit(sanitizer: str, bug: dict, project: str,
+                       newer_than: float | None = None,
+                       exclude: "set[Path] | tuple" = ()) -> bool:
+    """Overwrite THIS run's target-source HEURISTICS.md with the forced-edit directive,
+    seeded with the agent's own Phase-1 diagnosis. Same `newer_than`/`exclude` pinning as
+    inject_heuristics, so it always targets this run's freshly-built dir. Returns True on
+    write, False if the target-source can't be found."""
+    target_source = find_target_source_dir(sanitizer, newer_than=newer_than, exclude=exclude)
+    if target_source is None:
+        print(f"[{bug['localId']}] WARNING: no fresh target-source dir -- forced-edit "
+              f"directive NOT injected; Phase 2 will run without it.")
+        return False
+    # Agent's own diagnosis from Phase 1 (best effort).
+    root_cause = ""
+    run_dir = find_latest_run_dir(sanitizer)
+    if run_dir is not None:
+        log = find_agent_stdout_log(run_dir)
+        if log is not None:
+            root_cause = extract_root_cause(log)
+    # Crash orientation (best effort; reuse the same parser inject_orientation uses).
+    orientation = ""
+    o = parse_crash_output(bug.get("crash_output") or "", bug.get("crash_type") or "",
+                           bug["project"])
+    if o is not None:
+        orientation = render_orientation(o)
+    directive = build_forced_edit_directive(project=project, root_cause=root_cause,
+                                            orientation=orientation)
+    dest = target_source / "HEURISTICS.md"
+    dest.write_text(directive)
+    print(f"[{bug['localId']}] Injected FORCED-EDIT directive ({len(directive)} bytes, "
+          f"root_cause={len(root_cause)}B) into {dest}")
+    return True
+
+
 def collect_patches(run_dir: Path) -> list[Path]:
     """Find patch diff files the agent produced in this run."""
     return list(run_dir.glob("**/SUBMIT_DIR/*/patches/*.diff"))
