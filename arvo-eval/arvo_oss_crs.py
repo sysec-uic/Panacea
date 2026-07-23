@@ -256,6 +256,19 @@ def _check_patch_enabled() -> bool:
     return os.environ.get("OSS_CRS_CHECK_PATCH") == "1"
 
 
+def _force_edit_enabled() -> bool:
+    """Master switch for the recon->forced-edit two-pass (OSS_CRS_FORCE_EDIT=1).
+    Unset -> single-pass behavior identical to before this feature."""
+    return os.environ.get("OSS_CRS_FORCE_EDIT") == "1"
+
+
+def _recon_timeout() -> float:
+    """Phase-1 elapsed time (seconds) at which the 0-edit check fires.
+    Default 1800 (30 min); bounded above by OSS_CRS_RUN_TIMEOUT in practice."""
+    v = os.environ.get("OSS_CRS_RECON_TIMEOUT")
+    return float(v) if v else 1800.0
+
+
 def inject_heuristics(project_dir: Path, sanitizer: str, bug_id: int, project: str,
                       newer_than: float | None = None, exclude: "set[Path] | tuple" = ()) -> None:
     """Deliver the playbook (and, when enabled, the check-patch instruction) into the

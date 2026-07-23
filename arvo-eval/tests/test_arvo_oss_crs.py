@@ -474,3 +474,15 @@ def test_inject_orientation_disabled_by_default(tmp_path, monkeypatch):
     bug = {"localId": 1, "project": "mruby", "crash_type": "x", "crash_output": "==ERROR: ..."}
     assert arvo_oss_crs.inject_orientation("address", bug) is False
     assert not (tmp_path / "ORIENTATION.md").exists()
+
+
+def test_force_edit_flag_and_recon_timeout(monkeypatch):
+    import arvo_oss_crs as a
+    monkeypatch.delenv("OSS_CRS_FORCE_EDIT", raising=False)
+    monkeypatch.delenv("OSS_CRS_RECON_TIMEOUT", raising=False)
+    assert a._force_edit_enabled() is False
+    assert a._recon_timeout() == 1800.0
+    monkeypatch.setenv("OSS_CRS_FORCE_EDIT", "1")
+    monkeypatch.setenv("OSS_CRS_RECON_TIMEOUT", "600")
+    assert a._force_edit_enabled() is True
+    assert a._recon_timeout() == 600.0
