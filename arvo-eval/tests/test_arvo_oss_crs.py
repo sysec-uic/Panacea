@@ -514,3 +514,16 @@ def test_find_agent_stdout_log(tmp_path):
     p.write_text("{}")
     assert a.find_agent_stdout_log(run_dir) == p
     assert a.find_agent_stdout_log(tmp_path / "empty") is None
+
+
+def test_live_edit_count(tmp_path, monkeypatch):
+    import arvo_oss_crs as a, json
+    run_dir = tmp_path / "run"
+    p = run_dir / "crs/crs-claude-code/proj/LOG_DIR/mruby_fuzzer/agent/claude_stdout.log"
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": "Edit", "input": {"file_path": "a.c"}}]}}))
+    monkeypatch.setattr(a, "find_latest_run_dir", lambda san: run_dir)
+    assert a._live_edit_count("address") == 1
+    monkeypatch.setattr(a, "find_latest_run_dir", lambda san: None)
+    assert a._live_edit_count("address") == 0

@@ -372,6 +372,16 @@ def find_agent_stdout_log(run_dir: "Path") -> "Path | None":
     return max(logs, key=lambda p: p.stat().st_mtime) if logs else None
 
 
+def _live_edit_count(sanitizer: str) -> int:
+    """Edit count for the current (newest) run's agent stream. 0 when the run dir or log
+    does not exist yet (early in a run, or run never started)."""
+    run_dir = find_latest_run_dir(sanitizer)
+    if run_dir is None:
+        return 0
+    log = find_agent_stdout_log(run_dir)
+    return agent_edit_count(log) if log is not None else 0
+
+
 def copy_session_files(run_dir: Path, output_dir: Path) -> None:
     """Copy claude_stdout.log to output_dir."""
     log = find_agent_stdout_log(run_dir)
