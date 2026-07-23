@@ -376,6 +376,17 @@ def test_crashed_bug_is_skipped_on_resume(tmp_path):
     assert seen == [200]   # crashed bug 100 skipped on resume
 
 
+def test_forced_edit_fields_selects_present_keys():
+    import learn_loop
+    full = {"forced_edit_triggered": True, "edit_phase": "forced",
+            "phase1_edits": 0, "phase2_edits": 1, "tokens": {"in": 5}, "patches": 1}
+    assert learn_loop.forced_edit_fields(full) == {
+        "forced_edit_triggered": True, "edit_phase": "forced",
+        "phase1_edits": 0, "phase2_edits": 1}
+    # A flag-off / single-pass summary carries none of these -> empty dict
+    assert learn_loop.forced_edit_fields({"patches": 0}) == {}
+
+
 def test_crashing_extractor_does_not_abort_but_repair_is_still_recorded(tmp_path):
     # Extraction runs after the ledger write; a rate-limited/crashing extractor must
     # cost only the lesson, never the recorded repair or the rest of the batch.

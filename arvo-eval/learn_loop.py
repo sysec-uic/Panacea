@@ -79,6 +79,14 @@ def _default_grade(bug, diff):
     return grade(bug, diff)
 
 
+def forced_edit_fields(summary: dict) -> dict:
+    """Select the forced-edit two-pass fields from a run summary for the ledger record.
+    Absent keys are omitted (a single-pass/flag-off run simply carries none)."""
+    return {k: summary[k] for k in
+            ("forced_edit_triggered", "edit_phase", "phase1_edits", "phase2_edits")
+            if k in summary}
+
+
 def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
              project_dir_for, agent=_default_agent, verify=_default_verify,
              extract=_default_extract, contrastive=_default_contrastive,
@@ -155,6 +163,7 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
             # Once recorded, the `done` resume-set skips this bug on the next run.
             record = {"bug_id": bug_id, "pass": pass_name, "classification": final_verdict,
                       "n_attempts": len(result["attempts"]), "playbook_version": playbook_version_snap,
+                      **forced_edit_fields(last_run.get("summary", {})),
                       **oracle_fields, **({"tokens": total_tokens} if total_tokens else {})}
             append_record(ledger_path, record)
             records.append({**record, **{k: last_run[k] for k in ("injected_seen",) if k in last_run}})
