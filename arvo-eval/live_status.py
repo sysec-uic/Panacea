@@ -240,8 +240,14 @@ class LiveStatus:
         items.append(Text(controls, style="grey35", justify="right"))
 
         if show_raw:
+            # height must fit all 20 lines (+2 for the panel's own border) -- a
+            # shorter box doesn't scroll, it silently CROPS from the bottom,
+            # hiding the newest lines and showing only the oldest ones in the
+            # window. That looked like "verify/oracle's messages never show up
+            # live" when really they'd been delivered on time and were just
+            # cropped out of view the whole time.
             raw_body = "\n".join(raw[-20:]) if raw else "(no output yet)"
-            items.append(Panel(Text(raw_body, style="grey42"), border_style="grey23", height=12))
+            items.append(Panel(Text(raw_body, style="grey42"), border_style="grey23", height=22))
 
         return Group(*items)
 

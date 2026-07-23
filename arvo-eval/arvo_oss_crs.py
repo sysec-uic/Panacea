@@ -550,7 +550,7 @@ def _graceful_kill(proc, timeout: float = 20) -> None:
 
 def _run_agent_with_timeout(cmd, *, cwd, timeout, popen=subprocess.Popen,
                             teardown=None, abort_controller=None,
-                            check=False, on_line=None) -> tuple[bool, bool]:
+                            check=False, on_line=None, drain_timeout=5) -> tuple[bool, bool]:
     """Run an OSS-CRS subprocess under `timeout`. Returns (timed_out, aborted).
 
     Uses Popen (not subprocess.run) so there's a live process handle to register
@@ -571,6 +571,16 @@ def _run_agent_with_timeout(cmd, *, cwd, timeout, popen=subprocess.Popen,
     feature) the child's output is inherited exactly as before, so default
     behavior (and every existing test) is unaffected.
 
+    The drain thread is only joined with a bounded `drain_timeout` (not waited on
+    indefinitely): docker compose can leave a grandchild process holding the same
+    stdout pipe open, so in the worst case it never sees EOF at all, and blocking
+    forever on that would hang the whole campaign. But once we've given up
+    waiting, a `gate` flag is flipped so any lines the (still-running, harmless)
+    background thread reads AFTER that point are silently dropped instead of
+    delivered -- otherwise a slow final burst of output (e.g. compose teardown
+    logs) keeps trickling into the SAME raw feed after the caller has already
+    moved on to the next phase, visually overlapping with it.
+
     stdin is always closed (DEVNULL), never inherited. Without this, the child
     (and its own descendant processes, e.g. build-target's docker compose/buildx
     chain) shares the real terminal's stdin fd with live_status's key-listener
@@ -587,10 +597,13 @@ def _run_agent_with_timeout(cmd, *, cwd, timeout, popen=subprocess.Popen,
 
     reader_thread = None
     if on_line is not None:
+        gate = {"open": True}
+
         def _drain():
             try:
                 for line in iter(proc.stdout.readline, ""):
-                    on_line(line.rstrip("\n"))
+                    if gate["open"]:
+                        on_line(line.rstrip("\n"))
             except Exception:
                 pass
         reader_thread = threading.Thread(target=_drain, daemon=True)
@@ -617,7 +630,8 @@ def _run_agent_with_timeout(cmd, *, cwd, timeout, popen=subprocess.Popen,
         if abort_controller is not None:
             abort_controller.unregister(proc)
         if reader_thread is not None:
-            reader_thread.join(timeout=5)
+            reader_thread.join(timeout=drain_timeout)
+            gate["open"] = False
 
 
 def run_oss_crs(bug_id: int, skip_build: bool = False, abort_controller=None,

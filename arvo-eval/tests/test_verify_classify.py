@@ -110,6 +110,36 @@ def test_verify_rejects_harness_patch_before_any_docker(tmp_path, monkeypatch):
     assert verify_fix.verify(7)["classification"] == "patch_touches_harness"
 
 
+def test_verify_reports_start_container_before_run_check_steps(tmp_path, monkeypatch):
+    # verify()'s own container startup (docker rm -f / docker run -d) happens
+    # BEFORE run_check is ever called and had no on_step message at all -- a
+    # silent gap the live panel's raw feed had no way to explain. "start verify
+    # container" must fire first, ahead of run_check's own steps.
+    monkeypatch.setattr(verify_fix, "RESULTS_DIR", tmp_path)
+    monkeypatch.delenv("LEARN_PASS", raising=False)
+    monkeypatch.setattr(verify_fix, "load_bug", lambda bug_id: {
+        "localId": bug_id, "sanitizer": "asan", "project": "mruby"})
+    monkeypatch.setattr(verify_fix, "build_instance", lambda bug: {
+        "instance_id": bug["localId"], "project": "mruby", "image_name": "unused"})
+
+    class _Proc:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    monkeypatch.setattr(verify_fix.subprocess, "run", lambda *a, **k: _Proc())
+    monkeypatch.setattr(verify_fix, "docker_exec", lambda *a, **k: _Proc())
+
+    d = tmp_path / "7"
+    d.mkdir()
+    (d / "patch.diff").write_text("--- a/mruby/src/array.c\n+++ b/mruby/src/array.c\n")
+
+    steps = []
+    verify_fix.verify(7, on_step=steps.append)
+    assert steps[0] == "start verify container"
+    assert steps[1:] == ["apply patch", "compile", "run PoC", "run rake test"]
+
+
 def test_results_dir_respects_learn_pass(tmp_path, monkeypatch):
     # Under LEARN_PASS, verify must read/write the same namespaced dir the agent
     # writes to (results/<pass>/<bug_id>/), or it never finds the patch.

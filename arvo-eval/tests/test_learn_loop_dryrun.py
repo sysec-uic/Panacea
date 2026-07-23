@@ -424,7 +424,7 @@ def test_default_verify_delegates_to_verify_fix(monkeypatch):
     import verify_fix
     calls = []
 
-    def fake_verify(bug_id, quiet=False):
+    def fake_verify(bug_id, quiet=False, on_step=None):
         calls.append(bug_id)
         return {"classification": "still_crashes", "run_output_tail": "boom"}
 
@@ -558,21 +558,26 @@ def test_phase_tracker_ignores_unknown_phase_keys():
 
 
 def test_pass_tallies_counts_verified_vs_total_per_pass(tmp_path):
+    # Control and treatment write SEPARATE ledger.<pass>.jsonl files (per-pass
+    # ledger split) -- pass_tallies must read both from the directory, not one
+    # shared file, or the pass that isn't currently running would show 0/0 forever.
     from learn_loop import pass_tallies
     from ledger import append_record
-    ledger = tmp_path / "ledger.jsonl"
-    append_record(ledger, {"bug_id": 1, "pass": "control", "classification": "verified_correct"})
-    append_record(ledger, {"bug_id": 2, "pass": "control", "classification": "still_crashes"})
-    append_record(ledger, {"bug_id": 3, "pass": "treatment", "classification": "verified_correct"})
+    append_record(tmp_path / "ledger.control.jsonl",
+                  {"bug_id": 1, "pass": "control", "classification": "verified_correct"})
+    append_record(tmp_path / "ledger.control.jsonl",
+                  {"bug_id": 2, "pass": "control", "classification": "still_crashes"})
+    append_record(tmp_path / "ledger.treatment.jsonl",
+                  {"bug_id": 3, "pass": "treatment", "classification": "verified_correct"})
 
-    tallies = {t.label: t for t in pass_tallies(ledger)}
+    tallies = {t.label: t for t in pass_tallies(tmp_path)}
     assert tallies["control"].done == 1 and tallies["control"].total == 2
     assert tallies["treatment"].done == 1 and tallies["treatment"].total == 1
 
 
 def test_pass_tallies_missing_ledger_is_zeroed(tmp_path):
     from learn_loop import pass_tallies
-    tallies = {t.label: t for t in pass_tallies(tmp_path / "nope.jsonl")}
+    tallies = {t.label: t for t in pass_tallies(tmp_path)}
     assert tallies["control"].done == 0 and tallies["control"].total == 0
     assert tallies["treatment"].done == 0 and tallies["treatment"].total == 0
 
@@ -621,7 +626,7 @@ def test_make_verify_emits_start_then_done_around_the_real_call():
     import learn_loop
     events = []
     orig = learn_loop._default_verify
-    learn_loop._default_verify = lambda bug_id, diff, quiet=False: {"classification": "verified_correct"}
+    learn_loop._default_verify = lambda bug_id, diff, quiet=False, on_step=None: {"classification": "verified_correct"}
     try:
         verify = _make_verify(on_phase=lambda key, event: events.append((key, event)))
         result = verify(100, "DIFF")
@@ -637,7 +642,7 @@ def test_make_verify_still_fires_done_when_the_real_call_raises():
     import learn_loop
     events = []
     orig = learn_loop._default_verify
-    def boom(bug_id, diff, quiet=False):
+    def boom(bug_id, diff, quiet=False, on_step=None):
         raise RuntimeError("docker exploded")
     learn_loop._default_verify = boom
     try:
@@ -653,7 +658,7 @@ def test_make_verify_without_on_phase_is_a_plain_passthrough():
     from learn_loop import _make_verify
     import learn_loop
     orig = learn_loop._default_verify
-    learn_loop._default_verify = lambda bug_id, diff, quiet=False: {"classification": "still_crashes"}
+    learn_loop._default_verify = lambda bug_id, diff, quiet=False, on_step=None: {"classification": "still_crashes"}
     try:
         verify = _make_verify()
         assert verify(100, "DIFF") == {"classification": "still_crashes"}
@@ -666,7 +671,7 @@ def test_make_grade_emits_start_then_done_around_the_real_call():
     import learn_loop
     events = []
     orig = learn_loop._default_grade
-    learn_loop._default_grade = lambda bug, diff: {"label": "oracle_confirmed"}
+    learn_loop._default_grade = lambda bug, diff, on_step=None: {"label": "oracle_confirmed"}
     try:
         grade = _make_grade(on_phase=lambda key, event: events.append((key, event)))
         result = grade(_bug(100), "DIFF")
@@ -674,6 +679,116 @@ def test_make_grade_emits_start_then_done_around_the_real_call():
         assert result == {"label": "oracle_confirmed"}
     finally:
         learn_loop._default_grade = orig
+
+
+def test_make_verify_passes_none_through_when_no_on_step_given():
+    # Must not silently wrap a no-op tagging closure when there's nothing to tag
+    # for -- _default_verify should see a real None, same as before tagging existed.
+    from learn_loop import _make_verify
+    import learn_loop
+    seen = {}
+    orig = learn_loop._default_verify
+    def fake(bug_id, diff, quiet=False, on_step=None):
+        seen["on_step"] = on_step
+        return {"classification": "verified_correct"}
+    learn_loop._default_verify = fake
+    try:
+        verify = _make_verify(on_phase=lambda k, e: None)
+        verify(100, "DIFF")
+        assert seen["on_step"] is None
+    finally:
+        learn_loop._default_verify = orig
+
+
+def test_make_grade_passes_none_through_when_no_on_step_given():
+    from learn_loop import _make_grade
+    import learn_loop
+    seen = {}
+    orig = learn_loop._default_grade
+    def fake(bug, diff, on_step=None):
+        seen["on_step"] = on_step
+        return {"label": "oracle_confirmed"}
+    learn_loop._default_grade = fake
+    try:
+        grade = _make_grade(on_phase=lambda k, e: None)
+        grade(_bug(100), "DIFF")
+        assert seen["on_step"] is None
+    finally:
+        learn_loop._default_grade = orig
+
+
+def test_make_verify_forwards_on_step_to_default_verify():
+    # The live-status raw feed hook must actually reach verify_fix's steps, not
+    # just be accepted and dropped.
+    from learn_loop import _make_verify
+    import learn_loop
+    seen = {}
+    orig = learn_loop._default_verify
+    def fake(bug_id, diff, quiet=False, on_step=None):
+        seen["on_step"] = on_step
+        return {"classification": "verified_correct"}
+    learn_loop._default_verify = fake
+    try:
+        received = []
+        verify = _make_verify(on_phase=lambda k, e: None, on_step=received.append)
+        verify(100, "DIFF")
+        # Not the same object -- _make_verify wraps it in a "▸ verify: " tag --
+        # but calling it must still reach the original sink with the tagged text.
+        seen["on_step"]("apply patch")
+        assert received == ["▸ verify: apply patch"]
+    finally:
+        learn_loop._default_verify = orig
+
+
+def test_make_grade_forwards_on_step_to_default_grade():
+    from learn_loop import _make_grade
+    import learn_loop
+    seen = {}
+    orig = learn_loop._default_grade
+    def fake(bug, diff, on_step=None):
+        seen["on_step"] = on_step
+        return {"label": "oracle_confirmed"}
+    learn_loop._default_grade = fake
+    try:
+        received = []
+        grade = _make_grade(on_phase=lambda k, e: None, on_step=received.append)
+        grade(_bug(100), "DIFF")
+        seen["on_step"]("build agent container")
+        assert received == ["▸ oracle: build agent container"]
+    finally:
+        learn_loop._default_grade = orig
+
+
+def test_default_verify_forwards_on_step_to_verify_fix(monkeypatch):
+    import learn_loop
+    import verify_fix
+    seen = {}
+
+    def fake_verify(bug_id, quiet=False, on_step=None):
+        seen["on_step"] = on_step
+        return {"classification": "still_crashes"}
+
+    monkeypatch.setattr(verify_fix, "verify", fake_verify)
+    def sink(msg):
+        pass
+    learn_loop._default_verify(7, "--- a/x\n+++ b/x\n", on_step=sink)
+    assert seen["on_step"] is sink
+
+
+def test_default_grade_forwards_on_step_to_differential_oracle(monkeypatch):
+    import learn_loop
+    import differential_oracle
+    seen = {}
+
+    def fake_grade(bug, diff, on_step=None):
+        seen["on_step"] = on_step
+        return {"label": "oracle_confirmed"}
+
+    monkeypatch.setattr(differential_oracle, "grade", fake_grade)
+    def sink(msg):
+        pass
+    learn_loop._default_grade(_bug(100), "DIFF", on_step=sink)
+    assert seen["on_step"] is sink
 
 
 # --- exhausted-bug path + per-bug crash isolation -----------------------------

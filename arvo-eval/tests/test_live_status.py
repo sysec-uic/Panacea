@@ -76,3 +76,21 @@ def test_abort_banner_shown_after_q():
     assert "aborting" not in _render_text(status)
     status._handle_key("q")
     assert "aborting" in _render_text(status)
+
+
+def test_raw_panel_shows_the_newest_line_not_just_the_oldest():
+    # Regression: the raw feed keeps the newest 20 lines (raw[-20:]), but the
+    # panel used to be given height=12 (~10 visible content rows) -- Rich
+    # silently crops overflow from the BOTTOM, so it showed only the OLDEST 10
+    # of those 20 lines and hid the newest ones entirely. That looked exactly
+    # like "on_step's messages never show up live", when they'd actually been
+    # delivered on time and were just cropped out of view. The panel height
+    # must fit every line raw[-20:] can produce.
+    status = _status()
+    status._handle_key("v")   # show_raw
+    for i in range(1, 21):
+        status.feed_raw(f"line {i}")
+    text = _render_text(status)
+    # The newest line is the one that was invisible under the old height=12 --
+    # confirm it's actually rendered, not cropped off the bottom.
+    assert "line 20" in text

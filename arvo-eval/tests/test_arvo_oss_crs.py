@@ -1,6 +1,8 @@
 """Compose-file selection, preflight reachability, and token-count parsing."""
 import json
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -408,6 +410,54 @@ def test_reader_thread_is_joined_before_returning():
     # By the time the call returns, every line must already be collected --
     # not "eventually" on some still-running background thread.
     assert received == ["a", "b", "c"]
+
+
+class _SlowStdout:
+    """A stdout stand-in whose readline() blocks until the test explicitly
+    releases the next line -- lets a test deterministically control exactly
+    when the background drain thread produces output, instead of racing real
+    wall-clock sleeps against the join timeout."""
+
+    def __init__(self, lines):
+        self._lines = list(lines)
+        self._idx = 0
+        self.release = threading.Event()
+
+    def readline(self):
+        if self._idx >= len(self._lines):
+            return ""
+        self.release.wait()
+        self.release.clear()
+        line = self._lines[self._idx] + "\n"
+        self._idx += 1
+        return line
+
+
+def test_late_lines_after_drain_timeout_are_not_delivered():
+    # Regression: if the drain thread is still catching up on a final burst of
+    # output when the join gives up (docker compose teardown logs, etc.), the
+    # caller moves on to the NEXT phase while that background thread keeps
+    # calling on_line -- so its stale output visually bleeds into whatever the
+    # panel shows next. Once _run_agent_with_timeout stops waiting, it must
+    # stop delivering, even though the thread is still alive.
+    proc = FakeProc([0])
+    proc.stdout = _SlowStdout(["late line"])
+    received = []
+
+    # proc.wait() returns immediately (FakeProc), but the drain thread's first
+    # readline() blocks on the Event, which the test never releases during the
+    # call -- so the tiny drain_timeout expires before any line is read.
+    arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
+        popen=lambda cmd, cwd, **kw: proc, on_line=received.append,
+        drain_timeout=0.05)
+    assert received == []   # gave up waiting before the line arrived
+
+    # The background thread is still alive and will now produce its line --
+    # confirm it does NOT reach on_line once the gate has closed.
+    proc.stdout.release.set()
+    time.sleep(0.2)   # let the (still-running, harmless) daemon thread run
+    assert received == []
 
 
 def test_terminate_crs_run_force_removes_live_containers():

@@ -130,16 +130,24 @@ class PhaseTracker:
         self.status.set_phases(list(self._phases))
 
 
-def pass_tallies(ledger_path):
+def pass_tallies(learn_dir):
     """[Tally("control", verified, total), Tally("treatment", ...)] for the panel's
-    footer line, straight from the ledger -- no new bookkeeping, just counting."""
+    footer line -- always both passes, so the footer compares the whole campaign
+    regardless of which pass is currently running.
+
+    Control and treatment write separate ledger.<pass>.jsonl files (see the
+    per-pass ledger split), so this reads both from `learn_dir` directly instead
+    of taking a single ledger_path -- passing the old shared ledger.jsonl here
+    would silently show the other pass as 0/0 forever, since that file no longer
+    receives writes for it at all."""
     from live_status import Tally
-    try:
-        records = read_records(ledger_path)
-    except (OSError, ValueError):
-        records = []
+    learn_dir = Path(learn_dir)
     tallies = []
     for pass_name in ("control", "treatment"):
+        try:
+            records = read_records(learn_dir / f"ledger.{pass_name}.jsonl")
+        except (OSError, ValueError):
+            records = []
         rows = [r for r in records if r.get("pass") == pass_name]
         verified = sum(1 for r in rows if r.get("classification") == "verified_correct")
         tallies.append(Tally(pass_name, verified, len(rows)))
@@ -157,18 +165,18 @@ def playbook_stat(state_path):
     return {"playbook": f"v{state.get('version', 0)} · {len(heuristics)} heuristics"}
 
 
-def _default_verify(bug_id, diff, quiet=False):
+def _default_verify(bug_id, diff, quiet=False, on_step=None):
     """Real verification: rebuild in a fresh -vul container, re-run the PoC, run the
     correctness gate. verify_fix reads results/<pass>/<id>/patch.diff, which
-    _default_agent bridges from the OSS-CRS patch naming. `quiet` is passed straight
-    through to verify_fix.verify -- see _make_verify."""
+    _default_agent bridges from the OSS-CRS patch naming. `quiet`/`on_step` are
+    passed straight through to verify_fix.verify -- see _make_verify."""
     if not diff.strip():
         return {"classification": "no_changes"}
     import verify_fix
-    return verify_fix.verify(bug_id, quiet=quiet)
+    return verify_fix.verify(bug_id, quiet=quiet, on_step=on_step)
 
 
-def _make_verify(on_phase=None):
+def _make_verify(on_phase=None, on_step=None):
     """Wrap _default_verify with "verify" phase start/done timing for the live status
     panel. verify_fix knows nothing about phases itself -- this just brackets the
     (already synchronous, already slow) call, same as _make_agent does for
@@ -179,12 +187,23 @@ def _make_verify(on_phase=None):
     Also passes quiet=True through to verify_fix (whenever a panel is actually up,
     i.e. on_phase is given) so its own prints don't land straight in the terminal
     and corrupt the panel's redraw -- the same reason arvo_oss_crs.py suppresses its
-    own prints via `_log`/`live_mode` for the prepare/build/agent phases."""
+    own prints via `_log`/`live_mode` for the prepare/build/agent phases.
+
+    `on_step`, given as status.feed_raw by the live-UI caller, gives the raw panel
+    real insight into verify_fix's apply/compile/PoC/test steps instead of a bare
+    spinner for however long the whole blocking call takes. Tagged with a
+    "▸ verify: " prefix so these synthesized status lines are visually
+    distinguishable from the raw OSS-CRS subprocess output sharing the same feed."""
+    def _tagged_step(msg):
+        if on_step is not None:
+            on_step(f"▸ verify: {msg}")
+
     def verify(bug_id, diff):
         if on_phase is not None:
             on_phase("verify", "start")
         try:
-            return _default_verify(bug_id, diff, quiet=on_phase is not None)
+            return _default_verify(bug_id, diff, quiet=on_phase is not None,
+                                   on_step=_tagged_step if on_step is not None else None)
         finally:
             if on_phase is not None:
                 on_phase("verify", "done")
@@ -202,20 +221,31 @@ def _default_contrastive(bug, rejected_diff, accepted_diff, rejected_verdict):
                                          accepted_diff=accepted_diff, rejected_verdict=rejected_verdict)
 
 
-def _default_grade(bug, diff):
+def _default_grade(bug, diff, on_step=None):
     from differential_oracle import grade
-    return grade(bug, diff)
+    return grade(bug, diff, on_step=on_step)
 
 
-def _make_grade(on_phase=None):
+def _make_grade(on_phase=None, on_step=None):
     """Wrap _default_grade with "grade" phase start/done timing, mirroring
     _make_verify. Only fires once per bug -- run_pass calls grade() a single time,
-    after a solve -- so the row stays pending on bugs that never got fixed."""
+    after a solve -- so the row stays pending on bugs that never got fixed.
+
+    `on_step`, given as status.feed_raw by the live-UI caller, surfaces the
+    oracle's build/start-container/PoC/probe steps in the raw panel -- see
+    differential_oracle.grade's on_step docstring. Tagged with a "▸ oracle: "
+    prefix, mirroring _make_verify's "▸ verify: " tag, so these are visually
+    distinguishable from the raw OSS-CRS subprocess output sharing the same feed."""
+    def _tagged_step(msg):
+        if on_step is not None:
+            on_step(f"▸ oracle: {msg}")
+
     def grade(bug, diff):
         if on_phase is not None:
             on_phase("grade", "start")
         try:
-            return _default_grade(bug, diff)
+            return _default_grade(bug, diff,
+                                  on_step=_tagged_step if on_step is not None else None)
         finally:
             if on_phase is not None:
                 on_phase("grade", "done")
@@ -472,13 +502,13 @@ def main():
         idx = next((i for i, b in enumerate(bugs) if b["localId"] == bug_id), None)
         status.position = (idx + 1, len(bugs_ids)) if idx is not None else None
         status.subject = f"bug {bug_id} · {pass_name} · attempt {n}/{max_attempts}"
-        status.set_tallies(pass_tallies(ledger_path))
+        status.set_tallies(pass_tallies(learn_dir))
         status.set_stats(playbook_stat(state_path) if inject_enabled else {})
 
     agent = _make_agent(abort_controller=controller, on_phase=tracker.on_phase,
                         before_attempt=before_attempt, on_line=status.feed_raw)
-    verify = _make_verify(on_phase=tracker.on_phase)
-    grade = _make_grade(on_phase=tracker.on_phase)
+    verify = _make_verify(on_phase=tracker.on_phase, on_step=status.feed_raw)
+    grade = _make_grade(on_phase=tracker.on_phase, on_step=status.feed_raw)
 
     old_sigint = signal.signal(signal.SIGINT, lambda signum, frame: controller.abort())
     try:

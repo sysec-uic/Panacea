@@ -176,20 +176,47 @@ Priority order, per explicit decisions — don't reorder without checking in:
    into the run, the agent kept going on overage and submitted a real patch 23min
    later, but the whole attempt still got discarded as `"interrupted"` (no verify, no
    ledger entry) — had to be manually recovered. Check for a non-empty diff first.
-8. **Report verify/oracle progress into the live status panel's raw feed** (lower
-   priority, added 2026-07-22 as a follow-on to #2 above) — build/agent already
-   stream real subprocess output into the `v`-toggled raw panel via `on_line`, but
-   verify and the oracle currently give zero insight beyond a spinner + elapsed
-   time once their phase goes active: `verify_fix.run_check` and
-   `differential_oracle.grade` are blocking `subprocess.run`/`docker_exec` calls
-   with no callback hook at all. Plan: add an optional `on_step(msg)` param
-   (default `None`, so every existing caller — CLI entry points, check-patch,
-   tests — is unaffected) to both, firing a short message before each already-
-   identifiable step (verify: apply patch → compile → run PoC → run `rake test`;
-   oracle: build agent container → start fix container → run PoC → check binary →
-   build/read probe goldens → run each of the 6 probes, "probe N/6"). Thread
-   `status.feed_raw` through as that `on_step` in `_make_verify`/`_make_grade`.
-   Unlike #2, this DOES require touching `verify_fix.py`/`differential_oracle.py`.
+8. ~~Report verify/oracle progress into the live status panel's raw feed~~ — done
+   2026-07-23. Added an optional `on_step(msg)` param (default `None`) to
+   `verify_fix.run_check`/`verify` and `differential_oracle.grade`, firing before
+   each identifiable step — verify: apply patch → compile → run PoC → run
+   `rake test` (skipped when the test step doesn't apply); oracle: build agent
+   container → start fix container → run PoC → check binary → build/read probe
+   goldens → "probe N/M" per probe script. `_make_verify`/`_make_grade` in
+   `learn_loop.py` now accept `on_step` too and thread it through
+   `_default_verify`/`_default_grade`; `main()`'s `LEARN_LIVE_UI=1` branch passes
+   `status.feed_raw`. Every existing caller (check-patch, CLI entry points, tests)
+   is unaffected since the param defaults to `None`. 9 new tests confirm both the
+   step ordering in `run_check`/`grade` and that `on_step` actually reaches them
+   through `_make_verify`/`_make_grade`/`_default_verify`/`_default_grade` (not
+   just accepted and dropped). 308 total pass.
+
+   Also found live while smoke-testing this: `pass_tallies` still read one
+   `ledger_path` and split it by `pass` — stale from before item #3's per-pass
+   ledger split, so the panel's footer showed the other pass as 0/0 forever.
+   Fixed to read both `ledger.<pass>.jsonl` files from `learn_dir` directly.
+
+   Also found live: watching a real treatment run, the "running agent" phase's
+   background drain thread (`_drain` in `_run_agent_with_timeout`) sometimes
+   couldn't finish delivering a final burst of subprocess output (docker compose
+   teardown logs) within its 5s join cap, so it kept calling `on_line` after the
+   caller had already moved on to the verify/oracle phase — stale agent output
+   visually bled into the next phase's raw feed. Fixed with a `gate` flag: once
+   `_run_agent_with_timeout` stops waiting (join succeeds or times out), any
+   further lines the (still-running, harmless) drain thread reads are dropped
+   instead of delivered. Didn't just lengthen/remove the join timeout — docker
+   compose can leave a grandchild process holding the pipe open, so blocking
+   indefinitely risked hanging the whole campaign instead of a cosmetic overlap.
+   Also tagged verify/oracle's own `on_step` messages with a "▸ verify: "/
+   "▸ oracle: " prefix (in `_make_verify`/`_make_grade`) so they're visually
+   distinguishable from raw OSS-CRS subprocess lines sharing the same feed. 4
+   more new tests (312 total pass).
+
+   Also found live: `live_status.py`'s raw panel kept the newest 20 lines but
+   rendered them in a `height=12` box (~10 visible rows) — Rich crops overflow
+   from the bottom, so new lines (including verify/oracle's own) were delivered
+   fine but invisible until the feed stopped growing. Fixed by growing the box
+   to `height=22`. 1 more test (313 total pass).
 9. **Archive each attempt's run logs before the next overwrites them** — found
    2026-07-22 while comparing control vs treatment on `472003599`: control took 3
    attempts, but `results/control/472003599/` (`oss_crs_claude_stdout.log`,
@@ -235,6 +262,19 @@ Priority order, per explicit decisions — don't reorder without checking in:
    local-model runs select the `openai` backend whenever `OPENAI_BASE_URL` is set,
    so `ClaudeCLIClient`/`CLICallError` never enter that path. 5 new tests (299
    total pass).
+11. **Let the live status panel show past attempts, not just the current one.**
+    Idea from the user, 2026-07-23: pressing a digit key 1-5 (matching
+    `max_attempts`) would let the panel jump back and show what happened during
+    that attempt. Motivated by a real run of `455612769` (control): attempt 1 got
+    rejected and the loop moved on to attempt 2, but there was no way to see WHY —
+    the raw feed only shows a continuous rolling stream (`LiveStatus._raw`, a
+    `deque(maxlen=500)`), with no marker for where one attempt's output ends and
+    the next begins, and nothing lets you scroll back to a specific attempt's
+    slice once you're watching a later one. Likely needs: recording attempt
+    boundaries as they happen (e.g. an index/offset into `_raw`, or splitting into
+    a `dict[attempt_num, deque]`), a key handler for digits 1-5 alongside the
+    existing `v`/`q`, and a way to show which attempt is currently being viewed vs
+    "live" in the render. Not designed yet — just captured so it isn't lost.
 
 **Declined for now, to avoid disturbing the running experiment:** raising the
 3000-char playbook compression cap, and the retrieval-based playbook redesign
@@ -246,11 +286,17 @@ thing). Revisit after the current 30-bug run completes, not mid-experiment.
 if a real abort ever fires, every later attempt in that process silently self-aborts).
 Not causing active harm; not decided whether it needs fixing.
 
-**Unconfirmed, worth asking about:** teammate may have added a separate heuristic-
-learning setup that injects scripts rather than a markdown playbook — possibly worth
-comparing against the same ~20-bug set this experiment settles on. Not yet understood
-well enough to act on; get details before assuming it's related to the check-patch
-auto-submit feature in #1.
+**Confirmed 2026-07-23 (was "unconfirmed"):** the teammate's "script" setup is
+`orientation.py` — a crash-trace parser that renders an `ORIENTATION.md` briefing
+(sanitizer root-cause frame, call chain) and inlines it ahead of `HEURISTICS.md`.
+Already merged into `main` and this branch (via `fix/verify-pipeline-e2e`); gated
+behind `OSS_CRS_ORIENT=1` (off by default) and applied to BOTH passes by design —
+it's a harness signal, not the playbook under test, so it must not skew the
+control/treatment comparison. Nothing to build: running a "script bugs" comparison
+just means re-running the same ~20-bug set with `OSS_CRS_ORIENT=1` set and diffing
+against the runs without it. Not urgent — user's plan (2026-07-23) is next-2-todo-
+items → verify via a real bug run → push → notify teammate → disk cleanup → data
+analysis first, this after.
 
 ---
 
