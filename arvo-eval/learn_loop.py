@@ -420,13 +420,23 @@ def main():
     base = Path(__file__).parent
     pb_dir = base / "playbook"
     learn_dir = base / "results" / "learn"
-    ledger_path = learn_dir / "ledger.jsonl"
-    project_dir_for = lambda bid: Path.home() / ".arvo-oss-crs" / str(bid) / "project"
 
     pass_name = os.environ.get("LEARN_PASS", "treatment")
+    # Pin LEARN_PASS in-process so every downstream path helper that keys on it
+    # (arvo_oss_crs.bug_workdir, verify_fix.results_dir) sees the SAME pass this
+    # loop chose -- otherwise a run started without LEARN_PASS exported would have
+    # the loop default to "treatment" while those helpers defaulted to "" (flat),
+    # splitting the agent's project tree from where injection/verify look for it.
+    os.environ["LEARN_PASS"] = pass_name
+    import arvo_oss_crs
+    # One source of truth for the per-bug project dir: the same helper the agent
+    # run uses, so injection always targets the exact tree the agent edits.
+    project_dir_for = lambda bid: arvo_oss_crs.bug_workdir(bid) / "project"
+
     inject_enabled = pass_name == "treatment"
     max_attempts = int(os.environ.get("LEARN_MAX_ATTEMPTS", "5"))
     state_path = pb_dir / f"playbook_state_{pass_name}.json"
+    ledger_path = learn_dir / f"ledger.{pass_name}.jsonl"
     print(f"[learn_loop] pass={pass_name} inject={inject_enabled} "
           f"bugs={len(bugs)} max_attempts={max_attempts}")
     checkpoint_path_for = lambda bid: RESULTS_BASE / pass_name / str(bid) / "attempts.jsonl"
