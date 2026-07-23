@@ -541,3 +541,22 @@ def test_extract_root_cause(tmp_path):
     log.write_text("\n".join(json.dumps(x) for x in lines))
     assert a.extract_root_cause(log).startswith("The set kset_put path")
     assert a.extract_root_cause(tmp_path / "missing.log") == ""
+
+
+def test_build_forced_edit_directive():
+    import arvo_oss_crs as a
+    out = a.build_forced_edit_directive(
+        project="mruby", root_cause="Missing write barrier in kset_put.",
+        orientation="# Crash orientation\nClass: heap-use-after-free")
+    # Mandate is first and unmissable
+    assert out.lstrip().startswith("# FORCED EDIT")
+    idx_mandate = out.index("only task")
+    idx_repo = out.index("/work/agent/clean-src/mruby")
+    assert idx_mandate < idx_repo               # mandate before mechanics
+    assert "Missing write barrier in kset_put." in out   # agent's own words fed back
+    assert "check-patch" in out
+    assert "Crash orientation" in out
+    # Empty analysis is safe: still a valid directive standing on crash + recipe
+    out2 = a.build_forced_edit_directive(project="mruby", root_cause="", orientation="")
+    assert out2.lstrip().startswith("# FORCED EDIT")
+    assert "You already concluded" not in out2

@@ -252,6 +252,33 @@ def check_patch_instruction(project: str) -> str:
     )
 
 
+def build_forced_edit_directive(*, project: str, root_cause: str, orientation: str) -> str:
+    """The Phase-2 injected HEURISTICS.md content: a narrow 'make the edit now' directive.
+    Deliberately omits the full playbook and any 'read the codebase' affordance -- Phase 2
+    is about converting a stated diagnosis into one edit, not informing a fresh look."""
+    repo = f"/work/agent/clean-src/{project}"
+    parts = [
+        "# FORCED EDIT -- your only task now",
+        "You already investigated this crash. Do NOT investigate further and do NOT "
+        "re-read the codebase. Make the ONE source edit your analysis points to and "
+        "validate it with check-patch. That is the entire and only task.",
+    ]
+    if orientation.strip():
+        parts.append(orientation.strip())
+    if root_cause.strip():
+        parts.append("## You already concluded\n" + root_cause.strip())
+    parts.append(
+        "## Make the edit and validate\n"
+        f"Edit the source in `{repo}` (already a git repo -- do NOT run `git init`). If "
+        "it is not present yet, run `download-source target-source /work/agent/clean-src` "
+        "first. Then, from that repo:\n"
+        f"    cd {repo} && bash \"$OSS_CRS_SHARED_DIR/check-patch\"\n"
+        "When check-patch prints PASS you are DONE: the validated patch is recorded and "
+        "submitted for you. Do NOT hand-write a diff or write to /patches/."
+    )
+    return "\n\n".join(parts)
+
+
 def _check_patch_enabled() -> bool:
     return os.environ.get("OSS_CRS_CHECK_PATCH") == "1"
 
