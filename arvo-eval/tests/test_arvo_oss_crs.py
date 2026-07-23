@@ -504,3 +504,13 @@ def test_agent_edit_count(tmp_path):
     log.write_text("\n".join(json.dumps(x) if isinstance(x, dict) else x for x in lines))
     assert a.agent_edit_count(log) == 2
     assert a.agent_edit_count(tmp_path / "missing.log") == 0
+
+
+def test_find_agent_stdout_log(tmp_path):
+    import arvo_oss_crs as a
+    run_dir = tmp_path / "run"
+    p = run_dir / "crs/crs-claude-code/proj/LOG_DIR/mruby_fuzzer/agent/claude_stdout.log"
+    p.parent.mkdir(parents=True)
+    p.write_text("{}")
+    assert a.find_agent_stdout_log(run_dir) == p
+    assert a.find_agent_stdout_log(tmp_path / "empty") is None

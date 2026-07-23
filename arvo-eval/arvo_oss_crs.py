@@ -364,9 +364,18 @@ def resolve_autosubmit_patch(*, collected: list, check_passed: bool,
     return autosubmit_diff
 
 
+def find_agent_stdout_log(run_dir: "Path") -> "Path | None":
+    """Host path of the agent's claude_stdout.log JSONL stream for a run. Written live
+    during the run (bind-mounted LOG_DIR) so it is readable mid-run and after. Newest
+    wins if a run somehow has more than one."""
+    logs = list(run_dir.glob("crs/crs-claude-code/*/LOG_DIR/*/agent/claude_stdout.log"))
+    return max(logs, key=lambda p: p.stat().st_mtime) if logs else None
+
+
 def copy_session_files(run_dir: Path, output_dir: Path) -> None:
     """Copy claude_stdout.log to output_dir."""
-    for log in run_dir.glob("crs/crs-claude-code/*/LOG_DIR/*/agent/claude_stdout.log"):
+    log = find_agent_stdout_log(run_dir)
+    if log is not None:
         shutil.copy2(log, output_dir / "oss_crs_claude_stdout.log")
 
 
