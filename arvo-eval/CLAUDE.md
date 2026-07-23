@@ -28,7 +28,7 @@ the playbook. The holdout is chronological — a bug never sees its own lesson.
 | `injector.py` | Writes `HEURISTICS.md` into the per-bug project dir |
 | `extract_heuristic.py` | LLM call to extract a plain success lesson |
 | `contrastive_extract.py` | LLM call to extract a Don't/Do contrastive lesson (failed-then-succeeded) |
-| `ledger.py` | Append/read `results/learn/ledger.jsonl` |
+| `ledger.py` | Append/read `results/learn/ledger.<pass>.jsonl` |
 | `llm.py` | LLM backend: prefers Claude Code CLI (`claude -p`), falls back to API key or local model |
 | `mruby_bugs.py` | Returns the 30 mruby bug IDs in chronological (localId) order from `arvo_new.db` |
 
@@ -130,26 +130,53 @@ Priority order, per explicit decisions — don't reorder without checking in:
    `differential_oracle.py` was touched — they stay pure Docker-only functions with
    no UI awareness. "verify fix" only activates on attempts with a real diff to
    check; "differential oracle" only activates once per bug, after a solve.
-3. **`detect_cyber_refusal`** — mirror `detect_usage_limit` (`arvo_oss_crs.py:284`),
+3. ~~Merge teammate's `fix/verify-pipeline-e2e` follow-on commits~~ — done 2026-07-23.
+   Found on `origin/fix/verify-pipeline-e2e` (not yet in `origin/main`): a per-pass
+   working-dir/ledger split (`bug_workdir`, `ledger.<pass>.jsonl`) and, more
+   importantly, a real bug fix — `find_target_source_dir` used global max-mtime to
+   pick the agent's source dir, which the never-cleaned OSS-CRS workdir made
+   unreliable once other builds/check-patch rebuilds touched other dirs; a
+   treatment run could silently get no `HEURISTICS.md` and run as if it were
+   control, with no error. Fixed by pinning to a before-build snapshot + build-start
+   timestamp instead of mtime. Audited our own on-disk treatment logs before
+   merging: grepped every `oss_crs_claude_stdout.log` we have for `HEURISTICS`
+   mentions in the agent's own transcript — all 22 show at least 2, so none of our
+   historical treatment runs appear to have been silently degraded. Merge conflicts
+   in `arvo_oss_crs.py`/`learn_loop.py` were both in the `build-target` region (kept
+   our `_log`/`_phase`/`_run_agent_with_timeout` UI wrapping, added their
+   ts_before/build_start snapshot around it); fixed one merge-introduced bug where
+   `ledger_path` was left as a bare undefined name inside `main()`'s live-UI branch.
+   Migrated our existing `results/learn/ledger.jsonl` (20 control + 21 treatment) into
+   `ledger.control.jsonl`/`ledger.treatment.jsonl` by the existing `pass` field: old
+   file backed up, not deleted. 294 tests pass.
+4. **`detect_cyber_refusal`** — mirror `detect_usage_limit` (`arvo_oss_crs.py:284`),
    surface Anthropic cyber-safeguard refusals as their own ledger field instead of
    silently blending into `no_changes`. Motivated by `462331852` (2026-07-20): its
    first control attempts got refused mid-cleanup *after* already root-causing the bug
    and building a working patch — the ledger currently can't distinguish that from a
    genuine dead end.
-4. **Hoist `maybe_compress` out of the per-attempt retry loop** — `learn_loop.py`'s
+5. **Hoist `maybe_compress` out of the per-attempt retry loop** — `learn_loop.py`'s
    `attempt_agent` closure recomputes the compression LLM call fresh on every retry of
    a bug, even though the playbook state doesn't change across a bug's attempts. Waste
-   that compounds on hard bugs burning multiple retries.
-5. **Possible `usage_exhausted` ledger classification** — for bugs whose attempts all
+   that compounds on hard bugs burning multiple retries. Also causes a visible UI gap
+   (noticed 2026-07-22 on a fresh treatment run of `472003599`): `attempt_agent` calls
+   `maybe_compress(render_playbook(...))` on line 285, BEFORE calling `agent()` on line
+   289 — and it's `agent()` (via `_make_agent`'s `before_attempt` wrapper) that resets
+   the phase tracker / sets subject+position+tallies+stats for this bug. So on treatment
+   (where the playbook is now well past the 3000-char compression cap and every attempt
+   pays for a real LLM call), the panel sits blank for that call's duration before the
+   bug's phases even appear — most visible on the very first bug of a run. Worth adding
+   a "preparing playbook" phase around this call when the hoist happens.
+6. **Possible `usage_exhausted` ledger classification** — for bugs whose attempts all
    get cut off by the session usage limit instead of reaching a real `no_changes`
    verdict (e.g. `455612769`, 2026-07-21). Not the same as a genuine dead end — still
    useful data, shouldn't undercount fix rate.
-6. **Possible fix: `repair_loop.py:94` checks `usage_limit` before checking for a
+7. **Possible fix: `repair_loop.py:94` checks `usage_limit` before checking for a
    diff** — on `455612769` (treatment, 2026-07-21) a rate-limit rejection hit ~28min
    into the run, the agent kept going on overage and submitted a real patch 23min
    later, but the whole attempt still got discarded as `"interrupted"` (no verify, no
    ledger entry) — had to be manually recovered. Check for a non-empty diff first.
-7. **Report verify/oracle progress into the live status panel's raw feed** (lower
+8. **Report verify/oracle progress into the live status panel's raw feed** (lower
    priority, added 2026-07-22 as a follow-on to #2 above) — build/agent already
    stream real subprocess output into the `v`-toggled raw panel via `on_line`, but
    verify and the oracle currently give zero insight beyond a spinner + elapsed
@@ -163,6 +190,39 @@ Priority order, per explicit decisions — don't reorder without checking in:
    build/read probe goldens → run each of the 6 probes, "probe N/6"). Thread
    `status.feed_raw` through as that `on_step` in `_make_verify`/`_make_grade`.
    Unlike #2, this DOES require touching `verify_fix.py`/`differential_oracle.py`.
+9. **Archive each attempt's run logs before the next overwrites them** — found
+   2026-07-22 while comparing control vs treatment on `472003599`: control took 3
+   attempts, but `results/control/472003599/` (`oss_crs_claude_stdout.log`,
+   `oss_crs_patch_*.diff`, `oss_crs_result.json`, `patch.diff`, `verification.json`)
+   is the SAME fixed path every attempt (`_agent_results_dir(bug_id)` in
+   `learn_loop.py`, matched independently by `verify_fix.results_dir()`), so only
+   attempt 3's files survived — attempts 1-2's logs/patches/verification are gone,
+   nothing to inspect after the fact. Plan: archive into
+   `results/<pass>/<bug_id>/attempt_logs/attempt_<n>/` from inside `run_pass`'s
+   `on_attempt` callback (repair_with_retries only calls this for a REAL,
+   checkpointed attempt — never one cut short by a usage cap or abort — so
+   `record["attempt"]` is always a genuine number and every archived folder
+   corresponds to an actual repair_loop record). Also write that `record` itself as
+   `record.json` alongside the copied files, since `verify_fix.verify()` is skipped
+   entirely for a no-diff attempt and would otherwise leave a stale
+   `verification.json` in the archive. No changes needed to `arvo_oss_crs.py` or
+   `verify_fix.py` — pure archiving glue in `learn_loop.py`, same spirit as
+   `_make_verify`/`_make_grade`. Applies to every run (control + treatment, live UI
+   or not) — this is a retry-mechanics gap, not something specific to the panel.
+10. **`llm.py`'s retry logic never retries the CLI backend** — `with_retries`/
+   `_is_retriable` only recognize a failure as retriable via `exc.status_code`,
+   which only exists on raw `anthropic` SDK exceptions. `ClaudeCLIClient` (the
+   backend actually in use here, since this project runs on OAuth via `claude -p`)
+   raises plain `RuntimeError`/`subprocess.TimeoutExpired` with no `status_code` at
+   all, so none of ITS failures ever get retried, no matter how transient. Declined
+   2026-07-22 the first time this surfaced (`472003599` treatment: `claude -p`
+   returned `is_error: true` with no explanatory code); hit again the same day in a
+   different shape (`472140765` treatment: the CLI call just hung and blew the
+   hardcoded 600s subprocess timeout in `ClaudeCLIClient`). Both crashed
+   `maybe_compress` before the agent ever ran (see #4 — it's called before
+   `agent()`/`before_attempt`), got caught by crash isolation as a generic `error`
+   verdict, and needed the ledger line manually deleted + the bug re-run. Now
+   tracked instead of re-declined, having hit twice.
 
 **Declined for now, to avoid disturbing the running experiment:** raising the
 3000-char playbook compression cap, and the retrieval-based playbook redesign
@@ -184,7 +244,8 @@ auto-submit feature in #1.
 
 ## Ledger
 
-`results/learn/ledger.jsonl` — one JSON record per bug per pass. Git-ignored (local only).
+`results/learn/ledger.control.jsonl` / `ledger.treatment.jsonl` — one JSON record per bug,
+one file per pass. Git-ignored (local only).
 
 Key fields:
 - `classification`: `verified_correct` | `no_changes` | `still_crashes` | etc.

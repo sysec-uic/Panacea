@@ -20,7 +20,7 @@ questions, how the pieces fit together). This file is the runbook.
 | `llm.py` | LLM backend used by the extractor/curator/grader (Claude Code CLI, API key, or local model) |
 | `check_server.py` | Host-side responder for the agent's in-turn self-check (in progress) |
 | `mruby_bugs.py` / `build_instance.py` | Bug ordering and per-bug ARVO instance loading |
-| `results/` | Git-ignored. Per-bug outputs and `results/learn/ledger.jsonl` |
+| `results/` | Git-ignored. Per-bug outputs and `results/learn/ledger.<pass>.jsonl` |
 | `playbook/` | Tracked. Accumulated `playbook_state_<pass>.json` per pass |
 | `tests/` | Pure-logic unit tests, no Docker/network |
 | [`legacy/`](legacy/README.md) | Pre-`learn_loop.py` single-bug runner (mini-SWE-agent). Superseded; kept for reference |
@@ -64,11 +64,11 @@ ARVO images don't match OSS-Fuzz's expected project format, so `arvo_oss_crs.py`
 
 ### Token counts
 
-Token usage is captured automatically per bug in `results/learn/ledger.jsonl` (the `tokens`
+Token usage is captured automatically per bug in `results/learn/ledger.<pass>.jsonl` (the `tokens`
 field). To view a summary across all runs:
 
 ```bash
-cat results/learn/ledger.jsonl | python3 -c "
+cat results/learn/ledger.control.jsonl results/learn/ledger.treatment.jsonl | python3 -c "
 import json, sys
 print(f'{'BUG_ID':<15} {'INPUT':>8} {'OUTPUT':>8} {'CACHE_READ':>12} {'CACHE_WRITE':>12}')
 for line in sys.stdin:
@@ -236,7 +236,7 @@ ARVO_DB_PATH=arvo_new.db LEARN_PASS=control   python3 learn_loop.py
 ARVO_DB_PATH=arvo_new.db LEARN_PASS=treatment python3 learn_loop.py
 ```
 
-Per-run records accumulate in `results/learn/ledger.jsonl`. The accumulated playbook
+Per-run records accumulate in `results/learn/ledger.<pass>.jsonl`. The accumulated playbook
 state is `playbook/playbook_state_<pass>.json`.
 
 **Local model:** `llm.py` reads `LLM_MODEL` and `LLM_BASE_URL` from the environment, so
@@ -286,9 +286,8 @@ accumulated playbook exists) between the two passes:
 ```bash
 PYTHONPATH=. python3 -c "
 from ledger import read_records
-r = read_records('results/learn/ledger.jsonl')
 for p in ('control','treatment'):
-    rows = [x for x in r if x['pass']==p]
+    rows = read_records(f'results/learn/ledger.{p}.jsonl')
     tail = rows[len(rows)//3:]   # later two-thirds
     ok = sum(1 for x in tail if x['classification']=='verified_correct')
     print(p, 'tail verified_correct:', ok, '/', len(tail))
