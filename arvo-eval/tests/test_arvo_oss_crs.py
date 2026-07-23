@@ -757,7 +757,7 @@ def test_run_agent_recon_phase_probe_error_does_not_leak():
     assert proc.killed and torn == [True]
 
 
-def test_run_agent_phases_flag_off_probes_once(monkeypatch):
+def test_run_agent_phases_flag_off_does_not_probe(monkeypatch):
     import arvo_oss_crs as a
     monkeypatch.delenv("OSS_CRS_FORCE_EDIT", raising=False)
     calls = {"n": 0}
@@ -768,6 +768,37 @@ def test_run_agent_phases_flag_off_probes_once(monkeypatch):
         single=lambda cmd, cwd, to: False,
         recon=lambda **k: (_ for _ in ()).throw(AssertionError("recon must not run")),
         inject_forced=lambda *a_, **k: True, edit_probe=probe)
-    assert calls["n"] == 1                # probed exactly once
-    assert res["phase2_edits"] == 2
-    assert res["edit_phase"] is None      # flag off -> no phase label
+    assert calls["n"] == 0                    # feature off -> two-pass fields meaningless
+    assert res["phase2_edits"] is None
+    assert res["phase1_edits"] is None
+    assert res["edit_phase"] is None          # flag off -> no phase label
+
+
+def test_run_agent_phases_calls_handoff_between_inject_and_phase2(monkeypatch):
+    import arvo_oss_crs as a
+    monkeypatch.setenv("OSS_CRS_FORCE_EDIT", "1")
+    events = []
+    a.run_agent_phases(
+        run_cmd=["run"], cwd=".", sanitizer="address", bug={"localId": 1},
+        project="mruby", hard_cap=7200, newer_than=None, exclude=(),
+        single=lambda cmd, cwd, to: events.append("single") or False,
+        recon=lambda **k: (False, True),
+        inject_forced=lambda *a_, **k: events.append("inject") or True,
+        edit_probe=lambda: 0,
+        on_forced_handoff=lambda: events.append("recycle"),
+        phase1_elapsed_override=1800)
+    assert events == ["inject", "recycle", "single"]
+
+
+def test_run_agent_phases_no_handoff_when_not_forced(monkeypatch):
+    import arvo_oss_crs as a
+    monkeypatch.setenv("OSS_CRS_FORCE_EDIT", "1")
+    called = []
+    a.run_agent_phases(
+        run_cmd=["run"], cwd=".", sanitizer="address", bug={"localId": 1},
+        project="mruby", hard_cap=7200, newer_than=None, exclude=(),
+        single=lambda cmd, cwd, to: False,
+        recon=lambda **k: (False, False),          # recon made edits -> not forced
+        inject_forced=lambda *a_, **k: True, edit_probe=lambda: 2,
+        on_forced_handoff=lambda: called.append(1), phase1_elapsed_override=1800)
+    assert called == []

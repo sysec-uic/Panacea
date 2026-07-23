@@ -626,6 +626,17 @@ def terminate_crs_run(*, run=subprocess.run) -> list[str]:
     return ids
 
 
+def prune_docker_networks(*, run=subprocess.run) -> None:
+    """Reclaim docker networks between the two forced-edit passes. Each oss-crs run
+    leaks ~2 networks and the address pool can exhaust mid-bug now that FORCE_EDIT
+    launches a second run per bug -> a failed compose network reads as a false
+    no_changes. Best-effort; never fails the run."""
+    try:
+        run(["docker", "network", "prune", "-f"], capture_output=True, text=True)
+    except Exception:
+        pass
+
+
 def _run_agent_with_timeout(cmd, *, cwd, timeout, run=subprocess.run,
                             teardown=None) -> bool:
     """Run the CRS agent subprocess under `timeout`. Returns whether it timed out.
@@ -691,6 +702,7 @@ def _run_agent_recon_phase(cmd, *, cwd, hard_cap, recon_cap, edit_probe,
 
 def run_agent_phases(*, run_cmd, cwd, sanitizer, bug, project, hard_cap,
                      newer_than, exclude, single, recon, inject_forced, edit_probe,
+                     on_forced_handoff=lambda: None,
                      phase1_elapsed_override=None, now=time.monotonic):
     """Decide and drive the recon/forced-edit passes. All side-effecting steps are passed
     in so this is unit-testable:
@@ -698,13 +710,13 @@ def run_agent_phases(*, run_cmd, cwd, sanitizer, bug, project, hard_cap,
       recon(**kw) -> (timed_out, forced)          (Phase-1 poll runner)
       inject_forced(sanitizer, bug, project, newer_than, exclude) -> bool
       edit_probe() -> int                         (edit count for the current run)
+      on_forced_handoff() -> None                 (recycle check service + prune networks;
+                                                    called once on the forced path only)
     Returns a dict of forced-edit fields for the summary/ledger."""
     if not _force_edit_enabled():
         timed_out = single(run_cmd, cwd, hard_cap)
-        edits = edit_probe()
         return {"timed_out": timed_out, "forced_edit_triggered": False,
-                "phase1_edits": None, "phase2_edits": edits,
-                "edit_phase": None}   # feature off -> no two-pass phase ran
+                "phase1_edits": None, "phase2_edits": None, "edit_phase": None}
 
     t0 = now()
     timed_out, forced = recon(cmd=run_cmd, cwd=cwd, hard_cap=hard_cap,
@@ -718,11 +730,12 @@ def run_agent_phases(*, run_cmd, cwd, sanitizer, bug, project, hard_cap,
                 "edit_phase": "recon" if phase1_edits else None}
 
     inject_forced(sanitizer, bug, project, newer_than, exclude)
+    on_forced_handoff()
     timed_out = single(run_cmd, cwd, phase2_timeout(hard_cap, phase1_elapsed))
     phase2_edits = edit_probe()
     return {"timed_out": timed_out, "forced_edit_triggered": True,
             "phase1_edits": phase1_edits, "phase2_edits": phase2_edits,
-            "edit_phase": "forced" if phase2_edits else "recon"}
+            "edit_phase": "forced" if phase2_edits else ("recon" if phase1_edits else None)}
 
 
 def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
@@ -791,30 +804,52 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     # Holds the exact diff of the latest check-patch PASS, so a validated fix the agent
     # never wrote to /patches/ can still be submitted (see resolve_autosubmit_patch).
     check_autosubmit = output_dir / ".check_passed.diff"
-    check_stop = check_thread = None
-    if _check_patch_enabled():
-        import threading
-        import check_server
-        from build_instance import build_instance
+    import threading
+    import check_server
+    from build_instance import build_instance
+    # Warm the -vul instance metadata once; reused across the recon and forced passes.
+    _instance = build_instance(bug) if _check_patch_enabled() else None
+    # Mutable holder so the finally joins the CURRENT service thread (Phase 2 restarts it).
+    _svc = {"thread": None, "stop": None}
+
+    def _start_check_service():
+        if not _check_patch_enabled():
+            return
         # Fresh marker + saved diff per run: only a PASS from THIS run should let a
         # submission through, and only THIS run's validated diff can be promoted.
         check_marker.unlink(missing_ok=True)
         check_autosubmit.unlink(missing_ok=True)
-        check_stop = threading.Event()
+        stop = threading.Event()
         # Only latch a SHARED_DIR created after now, so a stale dir from a prior/killed
         # run can't win the newest-by-mtime race (observed live: the responder attached
         # to a dead campaign's channel and the agent got no working check-patch).
         svc_start = time.time()
-        check_thread = threading.Thread(
+        t = threading.Thread(
             target=check_server.run_service,
-            args=(bug, build_instance(bug), bug["project"]),
+            args=(bug, _instance, bug["project"]),
             kwargs={"find_dir": lambda: find_shared_dir(sanitizer, newer_than=svc_start),
-                    "stop": check_stop.is_set, "marker_path": check_marker,
+                    "stop": stop.is_set, "marker_path": check_marker,
                     "autosubmit_path": check_autosubmit},
             daemon=True)
-        check_thread.start()
+        t.start()
+        _svc["thread"], _svc["stop"] = t, stop
         print(f"[{bug_id}] check-patch self-check service running (OSS_CRS_CHECK_PATCH=1)")
 
+    def _stop_check_service():
+        if _svc["stop"] is not None:
+            _svc["stop"].set()
+        if _svc["thread"] is not None:
+            _svc["thread"].join(timeout=30)
+
+    def _recycle_for_phase2():
+        # Between the killed Phase 1 and Phase 2: give Phase 2 a fresh compose-network
+        # budget and a check service latched to ITS new SHARED_DIR (the old thread is
+        # bound to Phase-1's torn-down dir and will never serve Phase 2).
+        _stop_check_service()
+        prune_docker_networks()
+        _start_check_service()
+
+    _start_check_service()
     run_start = time.time()
     run_cmd = [*base, "run", *compose_args,
                "--fuzz-proj-path", str(project_dir),
@@ -831,12 +866,11 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
             single=lambda cmd, cwd, to: _run_agent_with_timeout(cmd, cwd=cwd, timeout=to),
             recon=_recon,
             inject_forced=inject_forced_edit,
-            edit_probe=lambda: _live_edit_count(sanitizer))
+            edit_probe=lambda: _live_edit_count(sanitizer),
+            on_forced_handoff=_recycle_for_phase2)
         timed_out = phase_info["timed_out"]
     finally:
-        if check_stop is not None:
-            check_stop.set()
-            check_thread.join(timeout=30)
+        _stop_check_service()
     run_elapsed = time.time() - run_start
     if timed_out:
         print(f"[{bug_id}] Agent run hit the {timeout:.0f}s cap after {run_elapsed:.0f}s; "
