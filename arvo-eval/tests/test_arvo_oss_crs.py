@@ -284,6 +284,34 @@ def test_find_shared_dir_ignores_dirs_older_than_reference(tmp_path, monkeypatch
     assert arvo_oss_crs.find_shared_dir("asan", newer_than=ref) == current
 
 
+def test_find_target_source_dir_isolates_current_build(tmp_path, monkeypatch):
+    # Injection race guard: the workdir accumulates a target-source per build across every
+    # run and never cleans them; picking the global max-mtime landed HEURISTICS.md in the
+    # wrong run's dir -- the agent saw "No HEURISTICS.md" and treatment silently degraded to
+    # control. Isolate THIS run's freshly-built dir via a before-snapshot (exclude) + the
+    # build-start time (newer_than), so a stale dir can't win even if something bumps its mtime.
+    import os as _os
+    monkeypatch.setattr(arvo_oss_crs, "OSS_CRS_DIR", tmp_path)
+    base = tmp_path / ".oss-crs-workdir" / "crs_compose"
+
+    def mk(build, mtime):
+        p = base / "c1" / "memory" / "builds" / build / "targets" / "t" / "target-source"
+        p.mkdir(parents=True)
+        _os.utime(p, (mtime, mtime))
+        return p
+
+    stale = mk("old", 1000)                       # a prior run's leftover dir
+    before = set(arvo_oss_crs._target_source_glob("msan"))
+    build_start = 2000
+    current = mk("new", 3000)                      # this run's freshly built dir
+    _os.utime(stale, (9000, 9000))                # noisy workdir bumps the stale dir's mtime
+    # Filtered: must select THIS build's dir despite the stale dir now being mtime-newest.
+    assert arvo_oss_crs.find_target_source_dir(
+        "msan", newer_than=build_start, exclude=before) == current
+    # Unfiltered global-max picks the wrongly-touched stale dir -- the original bug.
+    assert arvo_oss_crs.find_target_source_dir("msan") == stale
+
+
 def _write_log(tmp_path, records):
     p = tmp_path / "claude_stdout.log"
     p.write_text("\n".join(json.dumps(r) for r in records) + "\n")
@@ -416,7 +444,7 @@ def test_check_patch_instruction_is_project_parameterized():
 def test_inject_orientation_inlines_briefing_into_heuristics(tmp_path, monkeypatch):
     import arvo_oss_crs
     monkeypatch.setenv("OSS_CRS_ORIENT", "1")
-    monkeypatch.setattr(arvo_oss_crs, "find_target_source_dir", lambda san: tmp_path)
+    monkeypatch.setattr(arvo_oss_crs, "find_target_source_dir", lambda san, newer_than=None, exclude=(): tmp_path)
     (tmp_path / "HEURISTICS.md").write_text("EXISTING PLAYBOOK\n")
     bug = {
         "localId": 439494108, "project": "mruby",
@@ -442,7 +470,7 @@ def test_inject_orientation_inlines_briefing_into_heuristics(tmp_path, monkeypat
 def test_inject_orientation_disabled_by_default(tmp_path, monkeypatch):
     import arvo_oss_crs
     monkeypatch.delenv("OSS_CRS_ORIENT", raising=False)
-    monkeypatch.setattr(arvo_oss_crs, "find_target_source_dir", lambda san: tmp_path)
+    monkeypatch.setattr(arvo_oss_crs, "find_target_source_dir", lambda san, newer_than=None, exclude=(): tmp_path)
     bug = {"localId": 1, "project": "mruby", "crash_type": "x", "crash_output": "==ERROR: ..."}
     assert arvo_oss_crs.inject_orientation("address", bug) is False
     assert not (tmp_path / "ORIENTATION.md").exists()
