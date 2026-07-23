@@ -616,3 +616,69 @@ def test_inject_forced_edit_returns_false_when_no_target_source(monkeypatch):
     ok = a.inject_forced_edit("address", {"localId": 1, "project": "mruby",
                                           "crash_output": "", "crash_type": ""}, "mruby")
     assert ok is False
+
+
+def test_run_agent_recon_phase_forces_when_zero_edits():
+    import arvo_oss_crs as a
+
+    class FakeProc:
+        def __init__(self): self.killed = False
+        def poll(self): return None        # never exits on its own
+        def kill(self): self.killed = True
+        def wait(self, timeout=None): return 0
+
+    proc = FakeProc()
+    torn = []
+    clock = {"t": 0.0}
+    def fake_now(): clock["t"] += 10; return clock["t"]   # +10s per poll
+    timed_out, forced = a._run_agent_recon_phase(
+        ["run"], cwd=".", hard_cap=100, recon_cap=30,
+        edit_probe=lambda: 0,                  # agent made no edits
+        popen=lambda cmd, cwd: proc,
+        teardown=lambda: torn.append(True),
+        now=fake_now, sleep=lambda s: None)
+    assert (timed_out, forced) == (False, True)
+    assert proc.killed and torn == [True]
+
+
+def test_run_agent_recon_phase_lets_worker_run_to_hard_cap():
+    import arvo_oss_crs as a
+
+    class FakeProc:
+        def __init__(self): self.killed = False
+        def poll(self): return None
+        def kill(self): self.killed = True
+        def wait(self, timeout=None): return 0
+
+    proc = FakeProc()
+    clock = {"t": 0.0}
+    def fake_now(): clock["t"] += 10; return clock["t"]
+    timed_out, forced = a._run_agent_recon_phase(
+        ["run"], cwd=".", hard_cap=100, recon_cap=30,
+        edit_probe=lambda: 3,                  # already editing at the recon mark
+        popen=lambda cmd, cwd: proc,
+        teardown=lambda: None,
+        now=fake_now, sleep=lambda s: None)
+    # editing -> not forced; runs until hard_cap -> timed_out
+    assert (timed_out, forced) == (True, False)
+    assert proc.killed
+
+
+def test_run_agent_recon_phase_natural_exit():
+    import arvo_oss_crs as a
+
+    class FakeProc:
+        def __init__(self): self.calls = 0
+        def poll(self):
+            self.calls += 1
+            return None if self.calls < 2 else 0   # exits on the 2nd poll
+        def kill(self): pass
+        def wait(self, timeout=None): return 0
+
+    clock = {"t": 0.0}
+    def fake_now(): clock["t"] += 10; return clock["t"]
+    timed_out, forced = a._run_agent_recon_phase(
+        ["run"], cwd=".", hard_cap=100, recon_cap=30,
+        edit_probe=lambda: 0, popen=lambda cmd, cwd: FakeProc(),
+        teardown=lambda: None, now=fake_now, sleep=lambda s: None)
+    assert (timed_out, forced) == (False, False)

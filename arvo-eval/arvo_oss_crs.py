@@ -642,6 +642,37 @@ def _run_agent_with_timeout(cmd, *, cwd, timeout, run=subprocess.run,
         return True
 
 
+def _run_agent_recon_phase(cmd, *, cwd, hard_cap, recon_cap, edit_probe,
+                           popen=subprocess.Popen, teardown=None,
+                           now=time.monotonic, sleep=time.sleep,
+                           poll_interval=15) -> tuple[bool, bool]:
+    """Run the Phase-1 (recon) agent. Returns (timed_out, forced).
+
+    At `recon_cap` elapsed, check `edit_probe()` exactly once:
+      * 0 edits  -> kill + teardown, return (False, True)  [hand off to forced pass]
+      * >0 edits -> the agent is productively editing; do NOT interrupt, keep running to
+                    `hard_cap`.
+    Natural exit before any cap -> (False, False). Reaching `hard_cap` -> kill + teardown,
+    (True, False). `hard_cap`/`recon_cap` are seconds; None hard_cap = no hard cap."""
+    teardown = teardown or terminate_crs_run
+    proc = popen(cmd, cwd=cwd)
+    start = now()
+    checked_recon = False
+    while True:
+        if proc.poll() is not None:
+            return (False, False)
+        elapsed = now() - start
+        if not checked_recon and elapsed >= recon_cap:
+            checked_recon = True
+            if edit_probe() == 0:
+                proc.kill(); proc.wait(); teardown()
+                return (False, True)
+        if hard_cap is not None and elapsed >= hard_cap:
+            proc.kill(); proc.wait(); teardown()
+            return (True, False)
+        sleep(poll_interval)
+
+
 def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     """Run crs-claude-code on one ARVO bug. Returns a summary dict."""
     bug = load_bug(bug_id)
