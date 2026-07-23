@@ -594,3 +594,25 @@ def test_inject_forced_edit_overwrites_target_source(tmp_path, monkeypatch):
     assert written.lstrip().startswith("# FORCED EDIT")
     assert "OLD PLAYBOOK CONTENT" not in written          # overwritten, not appended
     assert "kset_put stores keys" in written              # agent's diagnosis fed back
+
+
+def test_edit_helpers_tolerate_non_object_json_lines(tmp_path):
+    import arvo_oss_crs as a, json
+    log = tmp_path / "claude_stdout.log"
+    log.write_text("\n".join([
+        "null", "42", "[1, 2, 3]",
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Edit", "input": {"file_path": "a.c"}}]}}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Root cause: missing write barrier. " * 8}]}}),
+    ]))
+    assert a.agent_edit_count(log) == 1          # does not raise on null/42/list
+    assert a.extract_root_cause(log).startswith("Root cause")
+
+
+def test_inject_forced_edit_returns_false_when_no_target_source(monkeypatch):
+    import arvo_oss_crs as a
+    monkeypatch.setattr(a, "find_target_source_dir", lambda san, newer_than=None, exclude=(): None)
+    ok = a.inject_forced_edit("address", {"localId": 1, "project": "mruby",
+                                          "crash_output": "", "crash_type": ""}, "mruby")
+    assert ok is False

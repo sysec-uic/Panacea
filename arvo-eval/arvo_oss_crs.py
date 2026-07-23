@@ -393,8 +393,9 @@ def inject_forced_edit(sanitizer: str, bug: dict, project: str,
                                             orientation=orientation)
     dest = target_source / "HEURISTICS.md"
     dest.write_text(directive)
+    ok = dest.exists() and dest.read_text() == directive
     print(f"[{bug['localId']}] Injected FORCED-EDIT directive ({len(directive)} bytes, "
-          f"root_cause={len(root_cause)}B) into {dest}")
+          f"verified={ok}, root_cause={len(root_cause)}B) into {dest}")
     return True
 
 
@@ -425,7 +426,7 @@ def resolve_autosubmit_patch(*, collected: list, check_passed: bool,
     return autosubmit_diff
 
 
-def find_agent_stdout_log(run_dir: "Path") -> "Path | None":
+def find_agent_stdout_log(run_dir: Path) -> Path | None:
     """Host path of the agent's claude_stdout.log JSONL stream for a run. Written live
     during the run (bind-mounted LOG_DIR) so it is readable mid-run and after. Newest
     wins if a run somehow has more than one."""
@@ -484,11 +485,12 @@ def parse_token_counts(log_path: Path) -> dict:
     }
 
 
-EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "str_replace", "str_replace_editor"}
+# Edit-family tool_use names this Claude Code CLI emits (MultiEdit kept for older CLI builds).
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit"}
 
 
-def agent_edit_count(log_path: "Path") -> int:
-    """Count edit-family tool_use events (Edit/Write/MultiEdit/str_replace) in a
+def agent_edit_count(log_path: Path) -> int:
+    """Count edit-family tool_use events (Edit/Write/MultiEdit) in a
     claude_stdout.log JSONL stream. Missing/unreadable file or malformed lines -> those
     contribute 0, so the worst case is under-counting to 0 ('treat as no edits')."""
     n = 0
@@ -501,6 +503,8 @@ def agent_edit_count(log_path: "Path") -> int:
             obj = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(obj, dict):
+            continue
         content = obj.get("message", {}).get("content")
         if isinstance(content, list):
             for b in content:
@@ -510,7 +514,7 @@ def agent_edit_count(log_path: "Path") -> int:
     return n
 
 
-def extract_root_cause(log_path: "Path", min_len: int = 200) -> str:
+def extract_root_cause(log_path: Path, min_len: int = 200) -> str:
     """Return the agent's last substantial (>= min_len chars) assistant text block from
     the stream log, stripped. Empty string if none / unreadable. This is the agent's own
     diagnosis, fed back verbatim into the forced-edit directive -- the harness never
@@ -524,6 +528,8 @@ def extract_root_cause(log_path: "Path", min_len: int = 200) -> str:
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
             continue
         content = obj.get("message", {}).get("content")
         if isinstance(content, list):
@@ -592,8 +598,8 @@ def _run_timeout() -> float | None:
     return float(v) if v else None
 
 
-def phase2_timeout(hard_cap: "float | None", phase1_elapsed: float,
-                   floor: float = 900.0) -> "float | None":
+def phase2_timeout(hard_cap: float | None, phase1_elapsed: float,
+                   floor: float = 900.0) -> float | None:
     """Wall-clock cap for the forced-edit pass: whatever remains of the hard per-run cap
     after Phase 1, but never less than `floor` so a forced pass always gets a usable
     budget. No hard cap -> no Phase-2 cap."""
