@@ -209,20 +209,32 @@ Priority order, per explicit decisions — don't reorder without checking in:
    `verify_fix.py` — pure archiving glue in `learn_loop.py`, same spirit as
    `_make_verify`/`_make_grade`. Applies to every run (control + treatment, live UI
    or not) — this is a retry-mechanics gap, not something specific to the panel.
-10. **`llm.py`'s retry logic never retries the CLI backend** — `with_retries`/
-   `_is_retriable` only recognize a failure as retriable via `exc.status_code`,
-   which only exists on raw `anthropic` SDK exceptions. `ClaudeCLIClient` (the
-   backend actually in use here, since this project runs on OAuth via `claude -p`)
-   raises plain `RuntimeError`/`subprocess.TimeoutExpired` with no `status_code` at
-   all, so none of ITS failures ever get retried, no matter how transient. Declined
-   2026-07-22 the first time this surfaced (`472003599` treatment: `claude -p`
-   returned `is_error: true` with no explanatory code); hit again the same day in a
-   different shape (`472140765` treatment: the CLI call just hung and blew the
-   hardcoded 600s subprocess timeout in `ClaudeCLIClient`). Both crashed
-   `maybe_compress` before the agent ever ran (see #4 — it's called before
-   `agent()`/`before_attempt`), got caught by crash isolation as a generic `error`
-   verdict, and needed the ledger line manually deleted + the bug re-run. Now
-   tracked instead of re-declined, having hit twice.
+10. ~~`llm.py`'s retry logic never retries the CLI backend~~ — done 2026-07-23.
+   `with_retries`/`_is_retriable` only recognized a failure as retriable via
+   `exc.status_code`, which only exists on raw `anthropic` SDK exceptions.
+   `ClaudeCLIClient` raised plain `RuntimeError`/`subprocess.TimeoutExpired` with no
+   `status_code` at all, so none of ITS failures ever got retried, no matter how
+   transient — bit us twice (`472003599`: `is_error: true` with no explanatory code;
+   `472140765`: a 600s CLI hang), both crashing `maybe_compress` before the agent
+   ever ran (see #5 — it's called before `agent()`/`before_attempt`) and needing a
+   manual ledger cleanup + re-run each time. Fix: added `CLICallError(RuntimeError)`,
+   changed `ClaudeCLIClient.create()`'s three failure sites to raise it instead of
+   plain `RuntimeError`, and extended `_is_retriable` to treat `CLICallError` and
+   `subprocess.TimeoutExpired` as retriable alongside the existing status-code check.
+   `CLICallError` subclasses `RuntimeError` so no existing `except RuntimeError`
+   caller needed to change. Also made the retry itself observable: `with_retries`
+   previously only printed on the 429 branch, so this exact class of retry would
+   have fired completely silently — added a matching print (exception type +
+   attempt + backoff) to the other branch too, same stderr/no-callback design as
+   the 429 print (curator/extractor callers have no live-UI awareness today, so
+   this carries the same, already-accepted stdout-during-live-panel risk as that
+   429 print always has — not a new risk class; properly routing it through
+   `status.feed_raw` would mean threading an `on_retry` callback through
+   `curator.py`/`extract_heuristic.py`/`contrastive_extract.py`, real scope that
+   overlaps with #8). Scoped to our own `claude_cli` backend only — teammate's
+   local-model runs select the `openai` backend whenever `OPENAI_BASE_URL` is set,
+   so `ClaudeCLIClient`/`CLICallError` never enter that path. 5 new tests (299
+   total pass).
 
 **Declined for now, to avoid disturbing the running experiment:** raising the
 3000-char playbook compression cap, and the retrieval-based playbook redesign
