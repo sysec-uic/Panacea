@@ -560,3 +560,13 @@ def test_build_forced_edit_directive():
     out2 = a.build_forced_edit_directive(project="mruby", root_cause="", orientation="")
     assert out2.lstrip().startswith("# FORCED EDIT")
     assert "You already concluded" not in out2
+
+
+def test_phase2_timeout():
+    import arvo_oss_crs as a
+    # Normal: hard cap 7200, phase1 ran 1800 -> 5400 remaining
+    assert a.phase2_timeout(7200, 1800) == 5400
+    # Floor protects a tiny remainder
+    assert a.phase2_timeout(7200, 7000, floor=900) == 900
+    # No hard cap -> no phase-2 cap
+    assert a.phase2_timeout(None, 1800) is None

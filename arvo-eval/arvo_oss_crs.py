@@ -558,6 +558,16 @@ def _run_timeout() -> float | None:
     return float(v) if v else None
 
 
+def phase2_timeout(hard_cap: "float | None", phase1_elapsed: float,
+                   floor: float = 900.0) -> "float | None":
+    """Wall-clock cap for the forced-edit pass: whatever remains of the hard per-run cap
+    after Phase 1, but never less than `floor` so a forced pass always gets a usable
+    budget. No hard cap -> no Phase-2 cap."""
+    if hard_cap is None:
+        return None
+    return max(hard_cap - phase1_elapsed, floor)
+
+
 def terminate_crs_run(*, run=subprocess.run) -> list[str]:
     """Force-remove any live OSS-CRS compose containers.
 
