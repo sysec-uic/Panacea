@@ -110,6 +110,15 @@ def wait_for_local_model(url: str = None, *, poll_seconds: float = 15.0,
 PROJECTS_DIR = Path.home() / ".arvo-oss-crs"   # stable per-bug project dirs live here
 RESULTS_DIR = Path(__file__).parent / "results"
 
+
+def bug_workdir(bug_id) -> Path:
+    """Per-bug agent working root, namespaced by LEARN_PASS so a control and a
+    treatment run of the same bug never share (and clobber) a project tree -- the
+    same isolation verify_fix.results_dir() already applies to the results dir.
+    Unset LEARN_PASS keeps the flat path for standalone single-bug runs."""
+    _pass = os.environ.get("LEARN_PASS", "")
+    return PROJECTS_DIR / _pass / str(bug_id) if _pass else PROJECTS_DIR / str(bug_id)
+
 SANITIZER_DIR = {"asan": "address", "msan": "memory", "ubsan": "undefined", "coverage": "coverage"}
 
 
@@ -161,15 +170,30 @@ def find_latest_run_dir(sanitizer: str) -> Path | None:
     return max(run_dirs, key=lambda p: p.stat().st_mtime)
 
 
-def find_target_source_dir(sanitizer: str) -> Path | None:
-    """Return the most recently modified target-source directory in the OSS-CRS workdir.
-
-    OSS-CRS extracts the bug's Docker image WORKDIR (/src) here; this is the
-    directory the agent runs in (cwd=source_dir in claude_code.py).
-    """
+def _target_source_glob(sanitizer: str) -> list[Path]:
+    """All target-source dirs for this sanitizer across the whole (never-cleaned) workdir."""
     base = OSS_CRS_DIR / ".oss-crs-workdir" / "crs_compose"
     sanitizer_dir = SANITIZER_DIR.get(sanitizer.lower(), sanitizer.lower())
-    dirs = list(base.glob(f"*/{sanitizer_dir}/builds/*/targets/*/target-source"))
+    return list(base.glob(f"*/{sanitizer_dir}/builds/*/targets/*/target-source"))
+
+
+def find_target_source_dir(sanitizer: str, newer_than: float | None = None,
+                           exclude: "set[Path] | tuple" = ()) -> Path | None:
+    """Return the target-source directory OSS-CRS extracted /src into for THIS run --
+    the dir the agent runs in (cwd=source_dir in claude_code.py), where injection must
+    drop HEURISTICS.md.
+
+    The workdir accumulates one target-source per build across every run and never cleans
+    them, so the old global-max-mtime pick landed HEURISTICS.md in a *different* run's dir
+    whenever another dir's mtime was fresher (builds, check-patch incremental rebuilds and
+    the warm check container all touch these) -- the agent then saw "No HEURISTICS.md" and
+    the treatment run silently degraded to control. `exclude` (a snapshot of the dirs that
+    existed BEFORE this run's build) plus `newer_than` (the build-start time) isolate the
+    freshly-built dir by path identity, immune to mtime churn. Returns None (caller warns
+    loudly) rather than guessing when no fresh dir is found."""
+    exclude = set(exclude)
+    dirs = [d for d in _target_source_glob(sanitizer)
+            if d not in exclude and (newer_than is None or d.stat().st_mtime > newer_than)]
     if not dirs:
         return None
     return max(dirs, key=lambda p: p.stat().st_mtime)
@@ -232,7 +256,8 @@ def _check_patch_enabled() -> bool:
     return os.environ.get("OSS_CRS_CHECK_PATCH") == "1"
 
 
-def inject_heuristics(project_dir: Path, sanitizer: str, bug_id: int, project: str) -> None:
+def inject_heuristics(project_dir: Path, sanitizer: str, bug_id: int, project: str,
+                      newer_than: float | None = None, exclude: "set[Path] | tuple" = ()) -> None:
     """Deliver the playbook (and, when enabled, the check-patch instruction) into the
     agent's source directory.
 
@@ -241,10 +266,14 @@ def inject_heuristics(project_dir: Path, sanitizer: str, bug_id: int, project: s
     target-source dir where the agent runs. The check-patch instruction is appended
     even when the playbook is empty, so the agent always learns the tool exists, and it
     names the project's own source tree (/src/<project>) so the agent edits in place.
-    """
-    target_source = find_target_source_dir(sanitizer)
+
+    `newer_than`/`exclude` pin the write to THIS run's freshly-built target-source (see
+    find_target_source_dir) -- without them the file intermittently landed in a stale
+    run's dir and the agent never saw it (treatment silently degraded to control)."""
+    target_source = find_target_source_dir(sanitizer, newer_than=newer_than, exclude=exclude)
     if target_source is None:
-        print(f"[{bug_id}] Warning: could not find target-source dir, skipping heuristics injection")
+        print(f"[{bug_id}] WARNING: no fresh target-source dir found -- HEURISTICS/check-patch "
+              f"guidance NOT injected; this run is effectively CONTROL. Skipping.")
         return
     src = project_dir / "HEURISTICS.md"
     text = src.read_text() if src.exists() else ""
@@ -252,23 +281,31 @@ def inject_heuristics(project_dir: Path, sanitizer: str, bug_id: int, project: s
         text += check_patch_instruction(project)
     if not text.strip():
         return
-    (target_source / "HEURISTICS.md").write_text(text)
-    print(f"[{bug_id}] Injected HEURISTICS.md into {target_source}")
+    dest = target_source / "HEURISTICS.md"
+    dest.write_text(text)
+    # Verify the write landed and is readable, and log the exact path so a missed
+    # injection is auditable from the campaign log rather than silent.
+    ok = dest.exists() and dest.read_text() == text
+    print(f"[{bug_id}] Injected HEURISTICS.md ({len(text)} bytes, verified={ok}) into {dest}")
 
 
-def inject_orientation(sanitizer: str, bug: dict) -> bool:
+def inject_orientation(sanitizer: str, bug: dict, newer_than: float | None = None,
+                       exclude: "set[Path] | tuple" = ()) -> bool:
     """Write ORIENTATION.md (parsed sanitizer trace) into the agent's source dir and
     prepend a pointer to HEURISTICS.md. Gated by OSS_CRS_ORIENT=1. Applied to both
     passes -- orientation is a harness signal, not the playbook under test -- so it
-    must not skew the control/treatment comparison. Returns True if it injected."""
+    must not skew the control/treatment comparison. Returns True if it injected.
+
+    `newer_than`/`exclude` pin it to THIS run's target-source, matching inject_heuristics,
+    so the briefing and playbook always land in the same dir the agent actually reads."""
     if os.environ.get("OSS_CRS_ORIENT") != "1":
         return False
     o = parse_crash_output(bug.get("crash_output") or "", bug.get("crash_type") or "", bug["project"])
     if o is None:
         return False
-    target_source = find_target_source_dir(sanitizer)
+    target_source = find_target_source_dir(sanitizer, newer_than=newer_than, exclude=exclude)
     if target_source is None:
-        print(f"[{bug['localId']}] Warning: no target-source dir, skipping orientation")
+        print(f"[{bug['localId']}] WARNING: no fresh target-source dir -- orientation NOT injected")
         return False
     briefing = render_orientation(o)
     # Keep ORIENTATION.md as an inspectable artifact, but deliver the briefing by
@@ -450,8 +487,9 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     bug = load_bug(bug_id)
     sanitizer = bug["sanitizer"].lower()
 
-    project_dir = PROJECTS_DIR / str(bug_id) / "project"
-    pov_path = PROJECTS_DIR / str(bug_id) / "poc"
+    workdir = bug_workdir(bug_id)
+    project_dir = workdir / "project"
+    pov_path = workdir / "poc"
     _pass = os.environ.get("LEARN_PASS", "")
     output_dir = RESULTS_DIR / _pass / str(bug_id) if _pass else RESULTS_DIR / str(bug_id)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -473,7 +511,15 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     base = ["uv", "run", "oss-crs"]
     compose_args = ["--compose-file", str(COMPOSE_FILE)]
 
+    # Snapshot the existing target-source dirs and the wall clock BEFORE the build, so
+    # injection can pin HEURISTICS.md to the dir THIS build creates (build-target makes a
+    # fresh builds/<id>/.../target-source each run) rather than the global newest -- the
+    # workdir accumulates these across every run and the old max-mtime pick misfired,
+    # silently degrading treatment to control. In --skip-build there's no fresh dir, so
+    # fall back to the global newest (ts_before empty, build_start None).
     if not skip_build:
+        ts_before = set(_target_source_glob(sanitizer))
+        build_start = time.time()
         print(f"[{bug_id}] Building target ({bug['project']})...")
         subprocess.run(
             [*base, "build-target", *compose_args,
@@ -483,10 +529,12 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
             check=True,
         )
     else:
+        ts_before, build_start = set(), None
         print(f"[{bug_id}] Skipping build (--skip-build set).")
 
-    inject_heuristics(project_dir, sanitizer, bug_id, bug["project"])
-    inject_orientation(sanitizer, bug)
+    inject_heuristics(project_dir, sanitizer, bug_id, bug["project"],
+                      newer_than=build_start, exclude=ts_before)
+    inject_orientation(sanitizer, bug, newer_than=build_start, exclude=ts_before)
 
     print(f"[{bug_id}] Running agent (harness: {bug['fuzz_target']})...")
     timeout = _run_timeout()
