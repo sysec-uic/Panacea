@@ -155,18 +155,24 @@ Priority order, per explicit decisions — don't reorder without checking in:
    first control attempts got refused mid-cleanup *after* already root-causing the bug
    and building a working patch — the ledger currently can't distinguish that from a
    genuine dead end.
-5. **Hoist `maybe_compress` out of the per-attempt retry loop** — `learn_loop.py`'s
-   `attempt_agent` closure recomputes the compression LLM call fresh on every retry of
-   a bug, even though the playbook state doesn't change across a bug's attempts. Waste
-   that compounds on hard bugs burning multiple retries. Also causes a visible UI gap
-   (noticed 2026-07-22 on a fresh treatment run of `472003599`): `attempt_agent` calls
-   `maybe_compress(render_playbook(...))` on line 285, BEFORE calling `agent()` on line
-   289 — and it's `agent()` (via `_make_agent`'s `before_attempt` wrapper) that resets
-   the phase tracker / sets subject+position+tallies+stats for this bug. So on treatment
-   (where the playbook is now well past the 3000-char compression cap and every attempt
-   pays for a real LLM call), the panel sits blank for that call's duration before the
-   bug's phases even appear — most visible on the very first bug of a run. Worth adding
-   a "preparing playbook" phase around this call when the hoist happens.
+5. ~~Hoist `maybe_compress` out of the per-attempt retry loop~~ — done 2026-07-23.
+   `run_pass` now computes `playbook_text` ONCE per bug (right where `attempt_agent`
+   used to recompute it on every retry) and every attempt's closure just reuses it,
+   only appending per-attempt feedback text (no LLM call) on top. Also closed the
+   UI gap this caused: a new optional `on_prepare(bug_id)` hook on `run_pass` fires
+   once per bug, only when `inject_enabled`, right before that (still potentially
+   slow, LLM-backed) compression call. `main()`'s `LEARN_LIVE_UI=1` branch wires it
+   to reset the phases to pending, set position/subject to "preparing playbook",
+   and feed a raw status line — deliberately NOT via `tracker.reset_for_bug`, which
+   also bumps the attempt counter; reusing it here would make the panel misreport
+   "attempt 2/N" the first time `before_attempt` actually fires for attempt 1. 4
+   new tests confirm compression runs exactly once per bug (not per attempt),
+   never fires on control, and `on_prepare` fires once per bug only when injecting
+   (321 total pass — one test-hygiene fix along the way: two of the new tests used
+   the existing guard-then-fix `retrying_agent` fixture without stubbing
+   `contrastive=`, so they fell through to a REAL LLM call via
+   `_default_contrastive` and took ~25s each; fixed by stubbing it, same as the
+   pre-existing contrastive test already did).
 6. **Possible `usage_exhausted` ledger classification** — for bugs whose attempts all
    get cut off by the session usage limit instead of reaching a real `no_changes`
    verdict (e.g. `455612769`, 2026-07-21). Not the same as a genuine dead end — still
@@ -217,25 +223,25 @@ Priority order, per explicit decisions — don't reorder without checking in:
    from the bottom, so new lines (including verify/oracle's own) were delivered
    fine but invisible until the feed stopped growing. Fixed by growing the box
    to `height=22`. 1 more test (313 total pass).
-9. **Archive each attempt's run logs before the next overwrites them** — found
-   2026-07-22 while comparing control vs treatment on `472003599`: control took 3
-   attempts, but `results/control/472003599/` (`oss_crs_claude_stdout.log`,
-   `oss_crs_patch_*.diff`, `oss_crs_result.json`, `patch.diff`, `verification.json`)
-   is the SAME fixed path every attempt (`_agent_results_dir(bug_id)` in
-   `learn_loop.py`, matched independently by `verify_fix.results_dir()`), so only
-   attempt 3's files survived — attempts 1-2's logs/patches/verification are gone,
-   nothing to inspect after the fact. Plan: archive into
-   `results/<pass>/<bug_id>/attempt_logs/attempt_<n>/` from inside `run_pass`'s
-   `on_attempt` callback (repair_with_retries only calls this for a REAL,
-   checkpointed attempt — never one cut short by a usage cap or abort — so
-   `record["attempt"]` is always a genuine number and every archived folder
-   corresponds to an actual repair_loop record). Also write that `record` itself as
-   `record.json` alongside the copied files, since `verify_fix.verify()` is skipped
-   entirely for a no-diff attempt and would otherwise leave a stale
-   `verification.json` in the archive. No changes needed to `arvo_oss_crs.py` or
-   `verify_fix.py` — pure archiving glue in `learn_loop.py`, same spirit as
-   `_make_verify`/`_make_grade`. Applies to every run (control + treatment, live UI
-   or not) — this is a retry-mechanics gap, not something specific to the panel.
+9. ~~Archive each attempt's run logs before the next overwrites them~~ — done
+   2026-07-23. Found 2026-07-22 comparing control vs treatment on `472003599`:
+   control took 3 attempts, but `results/control/472003599/`
+   (`oss_crs_claude_stdout.log`, `oss_crs_patch_*.diff`, `oss_crs_result.json`,
+   `patch.diff`, `verification.json`) is the SAME fixed path every attempt
+   (`_agent_results_dir(bug_id)`), so only attempt 3's files survived. New
+   `_archive_attempt(bug_id, record)` in `learn_loop.py` copies every plain file
+   out of that dir into `attempt_logs/attempt_<n>/` and writes `record` itself as
+   `record.json` alongside them (since `verify_fix.verify()` is skipped for a
+   no-diff attempt and would otherwise leave a stale `verification.json`
+   uncorrected in the archive — `record.json` is always attempt-accurate even
+   when the copied `verification.json` isn't). Wired into `run_pass`'s existing
+   `on_attempt` callback, right alongside the checkpoint write. Guards against
+   two real hazards: no-op when the results dir doesn't exist yet (a stub agent
+   in tests never creates one), and only copies files (not directories) so the
+   growing `attempt_logs/` archive can't recursively copy itself into itself on
+   the next attempt. No changes to `arvo_oss_crs.py`/`verify_fix.py` — pure
+   archiving glue, same spirit as `_make_verify`/`_make_grade`. Applies to every
+   run (control + treatment, live UI or not). 4 new tests (317 total pass).
 10. ~~`llm.py`'s retry logic never retries the CLI backend~~ — done 2026-07-23.
    `with_retries`/`_is_retriable` only recognized a failure as retriable via
    `exc.status_code`, which only exists on raw `anthropic` SDK exceptions.

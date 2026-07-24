@@ -8,7 +8,9 @@ learned only from SOLVED bugs, and added to the store AFTER the bug is evaluated
     accepted attempts (richer; warns future bugs off the dead end);
   - solved on the first try -> a plain success lesson.
 """
+import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -27,6 +29,33 @@ RESULTS_BASE = Path(__file__).parent / "results"
 def _agent_results_dir(bug_id):
     _pass = os.environ.get("LEARN_PASS", "")
     return RESULTS_BASE / _pass / str(bug_id) if _pass else RESULTS_BASE / str(bug_id)
+
+
+def _archive_attempt(bug_id, record):
+    """Copy this attempt's run files into attempt_logs/attempt_<n>/ before the
+    next attempt overwrites the fixed results dir every attempt shares
+    (_agent_results_dir(bug_id) -- oss_crs_claude_stdout.log, oss_crs_patch_*.diff,
+    oss_crs_result.json, patch.diff, verification.json). Without this, only the
+    LAST attempt's files survive a multi-attempt bug -- nothing to inspect for
+    earlier rejected attempts after the fact.
+
+    Also writes `record` itself as record.json alongside the copied files, since
+    verify_fix.verify() is skipped entirely for a no-diff attempt and would
+    otherwise leave a stale verification.json (from some earlier attempt) sitting
+    in the archive with nothing marking it as not belonging to this attempt.
+
+    A no-op if the results dir doesn't exist yet -- true for a bug whose agent
+    never actually ran (e.g. a stub `agent=` collaborator in tests), nothing to
+    archive in that case."""
+    results_dir = _agent_results_dir(bug_id)
+    if not results_dir.exists():
+        return
+    dest = results_dir / "attempt_logs" / f"attempt_{record['attempt']}"
+    dest.mkdir(parents=True, exist_ok=True)
+    for f in results_dir.iterdir():
+        if f.is_file():
+            shutil.copy2(f, dest / f.name)
+    (dest / "record.json").write_text(json.dumps(record, indent=2))
 
 
 def _default_agent(bug_id, project_dir, skip_build, abort_controller=None, on_phase=None,
@@ -256,7 +285,7 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
              project_dir_for, agent=_default_agent, verify=_default_verify,
              extract=_default_extract, contrastive=_default_contrastive,
              grade=_default_grade, max_attempts=5, skip_build=False,
-             checkpoint_path_for=None):
+             checkpoint_path_for=None, on_prepare=None):
     """Run one full pass over `bugs` (already in chronological order).
 
     Each bug gets up to `max_attempts` attempts; between them the agent is re-run with
@@ -270,6 +299,16 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
     whole `max_attempts` budget. Bug-level resume (the `done` set below) already covers a
     bug that's fully finished; this covers one still in progress. Off by default so
     existing callers/tests are unaffected.
+
+    The playbook (compressed if needed) is rendered ONCE per bug, not once per attempt --
+    it's holdout-filtered on `bug_id` and doesn't change across a bug's own retries, so
+    recomputing it (a real LLM call once compression kicks in) on every attempt was pure
+    waste that compounds on hard bugs burning multiple retries.
+
+    `on_prepare(bug_id)`, if given, fires once per bug right before that (potentially
+    slow, LLM-backed) compression call -- only when `inject_enabled`, since control never
+    compresses anything. Lets a live-status caller show something instead of sitting on
+    stale phase info from the previous bug for the call's duration.
     """
     state = load_state(state_path)
     # Resume: a bug already recorded in the ledger for this pass is done -- its
@@ -304,15 +343,25 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
                 print(f"[{bug_id}] resuming pass={pass_name} at attempt {len(resume_attempts) + 1} "
                       f"({len(resume_attempts)} attempt(s) already checkpointed)")
 
-            def on_attempt(record, _checkpoint_path=checkpoint_path):
+            def on_attempt(record, _checkpoint_path=checkpoint_path, _bug_id=bug_id):
                 if _checkpoint_path is not None:
                     tokens = dict(last_run.get("summary", {}).get("tokens", {}))
                     append_checkpoint(_checkpoint_path, {**record, "tokens": tokens})
+                _archive_attempt(_bug_id, record)
 
-            def attempt_agent(attempt_no, feedback, _bug_id=bug_id, _project_dir=project_dir):
-                # Render is holdout-filtered: only lessons from strictly-earlier bugs. Read at
-                # call time, so it reflects this bug's pre-update store.
-                text = maybe_compress(render_playbook(state, before_bug=_bug_id)) if inject_enabled else ""
+            # Render (holdout-filtered: only lessons from strictly-earlier bugs) and
+            # compress ONCE per bug, not once per attempt -- the playbook doesn't change
+            # across a bug's own retries, so recomputing this on every attempt paid for
+            # the same compression LLM call 3-5x over on a hard bug.
+            playbook_text = ""
+            if inject_enabled:
+                if on_prepare:
+                    on_prepare(bug_id)
+                playbook_text = maybe_compress(render_playbook(state, before_bug=bug_id))
+
+            def attempt_agent(attempt_no, feedback, _bug_id=bug_id, _project_dir=project_dir,
+                              _playbook_text=playbook_text):
+                text = _playbook_text
                 if feedback:
                     text = (text + "\n\n## Feedback on your previous attempt\n" + feedback).strip()
                 inject(text, _project_dir)
@@ -505,6 +554,19 @@ def main():
         status.set_tallies(pass_tallies(learn_dir))
         status.set_stats(playbook_stat(state_path) if inject_enabled else {})
 
+    def on_prepare(bug_id):
+        # Fires once per bug, before the (now-hoisted) playbook compression call --
+        # deliberately does NOT go through tracker.reset_for_bug, which also bumps
+        # the attempt counter; that must stay reserved for before_attempt's real
+        # attempt-1 reset, or this would make the panel misreport "attempt 2/N" the
+        # first time before_attempt actually fires for this bug.
+        from live_status import Phase
+        idx = next((i for i, b in enumerate(bugs) if b["localId"] == bug_id), None)
+        status.position = (idx + 1, len(bugs_ids)) if idx is not None else None
+        status.subject = f"bug {bug_id} · {pass_name} · preparing playbook"
+        status.set_phases([Phase(PHASE_LABELS[k]) for k in PHASE_ORDER])
+        status.feed_raw(f"[{bug_id}] preparing playbook (compressing if needed)...")
+
     agent = _make_agent(abort_controller=controller, on_phase=tracker.on_phase,
                         before_attempt=before_attempt, on_line=status.feed_raw)
     verify = _make_verify(on_phase=tracker.on_phase, on_step=status.feed_raw)
@@ -513,7 +575,7 @@ def main():
     old_sigint = signal.signal(signal.SIGINT, lambda signum, frame: controller.abort())
     try:
         with status:
-            run_pass(agent=agent, verify=verify, grade=grade, **common_kwargs)
+            run_pass(agent=agent, verify=verify, grade=grade, on_prepare=on_prepare, **common_kwargs)
     finally:
         signal.signal(signal.SIGINT, old_sigint)
 

@@ -134,6 +134,86 @@ def test_retry_learns_contrastively_from_own_attempts(tmp_path):
     assert captured["verdict"] == "fixed_tests_failed"
 
 
+def _stub_contrastive(bug, rejected_diff, accepted_diff, rejected_verdict):
+    # Avoids the real (network/CLI) LLM call _default_contrastive would otherwise
+    # make -- this bug's guard-then-fix shape always yields a contrastive_pair.
+    return {"trigger": "t", "wrong_approach": "guard", "correct_approach": "fix",
+            "lesson": "l", "how_to_apply": "a", "tags": ["t"], "confidence": "high",
+            "kind": "contrastive"}
+
+
+def test_maybe_compress_runs_once_per_bug_not_once_per_attempt(tmp_path, monkeypatch):
+    # Regression: attempt_agent used to call maybe_compress(render_playbook(...))
+    # fresh on every retry attempt, even though the playbook is holdout-filtered on
+    # bug_id alone and doesn't change across a bug's own attempts -- pure waste
+    # that compounds on a hard bug burning several retries (a real LLM call once
+    # compression kicks in).
+    import learn_loop
+    calls = {"n": 0}
+
+    def counting_compress(text):
+        calls["n"] += 1
+        return text
+
+    monkeypatch.setattr(learn_loop, "maybe_compress", counting_compress)
+
+    bugs = [{"localId": 300, "crash_type": "c", "sanitizer": "asan", "fuzz_target": "f", "crash_output": ""}]
+    result = run_pass(
+        bugs=bugs, pass_name="treatment", inject_enabled=True,
+        state_path=tmp_path / "state.json", ledger_path=tmp_path / "ledger.jsonl",
+        project_dir_for=lambda bid: tmp_path / f"proj-{bid}",
+        agent=retrying_agent, verify=retry_verify, contrastive=_stub_contrastive, max_attempts=5,
+        grade=_grade_stub("no_fix_available"),
+    )
+    assert result[0]["n_attempts"] == 2   # this bug genuinely took 2 attempts
+    assert calls["n"] == 1                # but compression only ran once
+
+
+def test_maybe_compress_not_called_at_all_on_control(tmp_path, monkeypatch):
+    import learn_loop
+    calls = {"n": 0}
+    monkeypatch.setattr(learn_loop, "maybe_compress", lambda text: (calls.__setitem__("n", calls["n"] + 1), text)[1])
+
+    bugs = [{"localId": 300, "crash_type": "c", "sanitizer": "asan", "fuzz_target": "f", "crash_output": ""}]
+    run_pass(
+        bugs=bugs, pass_name="control", inject_enabled=False,
+        state_path=tmp_path / "state.json", ledger_path=tmp_path / "ledger.jsonl",
+        project_dir_for=lambda bid: tmp_path / f"proj-{bid}",
+        agent=stub_agent, verify=stub_verify, max_attempts=5,
+        grade=_grade_stub("no_fix_available"),
+    )
+    assert calls["n"] == 0
+
+
+def test_on_prepare_fires_once_per_bug_before_the_attempt_loop(tmp_path):
+    # on_prepare must fire exactly once per bug (not once per attempt), and only
+    # when inject_enabled -- control never compresses anything, so there's
+    # nothing for it to announce.
+    calls = []
+    bugs = [{"localId": 300, "crash_type": "c", "sanitizer": "asan", "fuzz_target": "f", "crash_output": ""}]
+    run_pass(
+        bugs=bugs, pass_name="treatment", inject_enabled=True,
+        state_path=tmp_path / "state.json", ledger_path=tmp_path / "ledger.jsonl",
+        project_dir_for=lambda bid: tmp_path / f"proj-{bid}",
+        agent=retrying_agent, verify=retry_verify, contrastive=_stub_contrastive, max_attempts=5,
+        grade=_grade_stub("no_fix_available"), on_prepare=calls.append,
+    )
+    assert calls == [300]   # once, even though this bug took 2 attempts
+
+
+def test_on_prepare_never_fires_on_control(tmp_path):
+    calls = []
+    bugs = [{"localId": 300, "crash_type": "c", "sanitizer": "asan", "fuzz_target": "f", "crash_output": ""}]
+    run_pass(
+        bugs=bugs, pass_name="control", inject_enabled=False,
+        state_path=tmp_path / "state.json", ledger_path=tmp_path / "ledger.jsonl",
+        project_dir_for=lambda bid: tmp_path / f"proj-{bid}",
+        agent=stub_agent, verify=stub_verify, max_attempts=5,
+        grade=_grade_stub("no_fix_available"), on_prepare=calls.append,
+    )
+    assert calls == []
+
+
 def _bug(localId):
     return {"localId": localId, "crash_type": "c", "sanitizer": "asan",
             "fuzz_target": "f", "crash_output": ""}
@@ -472,6 +552,103 @@ def test_default_agent_reads_patch_from_this_runs_summary(tmp_path, monkeypatch)
     assert run["diff"] == "FRESH DIFF"
     # The verify bridge is refreshed from the fresh patch.
     assert (d / "patch.diff").read_text() == "FRESH DIFF"
+
+
+def test_archive_attempt_copies_files_and_writes_record(tmp_path, monkeypatch):
+    import learn_loop
+    monkeypatch.setattr(learn_loop, "RESULTS_BASE", tmp_path)
+    monkeypatch.delenv("LEARN_PASS", raising=False)
+    d = tmp_path / "42"
+    d.mkdir()
+    (d / "oss_crs_claude_stdout.log").write_text("transcript")
+    (d / "patch.diff").write_text("DIFF")
+    (d / "verification.json").write_text('{"classification": "still_crashes"}')
+
+    record = {"attempt": 1, "diff": "DIFF", "verdict": "still_crashes"}
+    learn_loop._archive_attempt(42, record)
+
+    archived = d / "attempt_logs" / "attempt_1"
+    assert (archived / "oss_crs_claude_stdout.log").read_text() == "transcript"
+    assert (archived / "patch.diff").read_text() == "DIFF"
+    assert (archived / "verification.json").exists()
+    import json
+    assert json.loads((archived / "record.json").read_text()) == record
+
+
+def test_archive_attempt_is_noop_when_results_dir_missing(tmp_path, monkeypatch):
+    # A bug whose agent never actually ran (e.g. a pure stub in a dry-run test)
+    # has no results dir at all -- nothing to archive, and must not raise.
+    import learn_loop
+    monkeypatch.setattr(learn_loop, "RESULTS_BASE", tmp_path)
+    monkeypatch.delenv("LEARN_PASS", raising=False)
+    learn_loop._archive_attempt(999, {"attempt": 1, "diff": "", "verdict": "no_changes"})
+    assert not (tmp_path / "999").exists()
+
+
+def test_archive_attempt_does_not_recursively_copy_its_own_archive_dir(tmp_path, monkeypatch):
+    # attempt_logs/ itself lives INSIDE the results dir being scanned -- a naive
+    # copy-everything would recurse into its own output on the second attempt.
+    import learn_loop
+    monkeypatch.setattr(learn_loop, "RESULTS_BASE", tmp_path)
+    monkeypatch.delenv("LEARN_PASS", raising=False)
+    d = tmp_path / "42"
+    d.mkdir()
+    (d / "patch.diff").write_text("DIFF1")
+    learn_loop._archive_attempt(42, {"attempt": 1, "diff": "DIFF1", "verdict": "still_crashes"})
+
+    (d / "patch.diff").write_text("DIFF2")
+    learn_loop._archive_attempt(42, {"attempt": 2, "diff": "DIFF2", "verdict": "verified_correct"})
+
+    assert (d / "attempt_logs" / "attempt_1" / "patch.diff").read_text() == "DIFF1"
+    assert (d / "attempt_logs" / "attempt_2" / "patch.diff").read_text() == "DIFF2"
+    # attempt_1's archive must not have gained a nested attempt_logs/ of its own.
+    assert not (d / "attempt_logs" / "attempt_1" / "attempt_logs").exists()
+
+
+def test_run_pass_archives_each_attempts_files_before_the_next_overwrites_them(tmp_path, monkeypatch):
+    # Regression: control took 3 attempts on a real bug (472003599) but only the
+    # LAST attempt's oss_crs_claude_stdout.log/patch.diff/etc. survived, because
+    # every attempt writes to the SAME fixed results dir. Confirms run_pass's
+    # on_attempt callback archives each attempt's files before agent() overwrites
+    # them on the next attempt.
+    import learn_loop
+    monkeypatch.setattr(learn_loop, "RESULTS_BASE", tmp_path)
+    monkeypatch.delenv("LEARN_PASS", raising=False)
+
+    results_dir = tmp_path / "300"
+    calls = {"n": 0}
+
+    def flaky_agent(bug_id, project_dir, skip_build):
+        calls["n"] += 1
+        results_dir.mkdir(parents=True, exist_ok=True)
+        # Simulate the real agent overwriting the SAME fixed path every attempt.
+        (results_dir / "oss_crs_claude_stdout.log").write_text(f"log for attempt {calls['n']}")
+        return {"diff": "FIX" if calls["n"] >= 2 else "GUARD", "trajectory_summary": "t"}
+
+    def flaky_verify(bug_id, diff):
+        if diff == "FIX":
+            return {"classification": "verified_correct", "make_test_ok": True}
+        return {"classification": "still_crashes", "run_output_tail": "boom"}
+
+    bugs = [{"localId": 300, "crash_type": "c", "sanitizer": "asan", "fuzz_target": "f", "crash_output": ""}]
+    run_pass(
+        bugs=bugs, pass_name="control", inject_enabled=False,
+        state_path=tmp_path / "state.json", ledger_path=tmp_path / "ledger.jsonl",
+        project_dir_for=lambda bid: tmp_path / f"proj-{bid}",
+        agent=flaky_agent, verify=flaky_verify, extract=stub_extract,
+        grade=_grade_stub("no_fix_available"), max_attempts=5,
+    )
+
+    attempt1 = results_dir / "attempt_logs" / "attempt_1"
+    attempt2 = results_dir / "attempt_logs" / "attempt_2"
+    assert (attempt1 / "oss_crs_claude_stdout.log").read_text() == "log for attempt 1"
+    assert (attempt2 / "oss_crs_claude_stdout.log").read_text() == "log for attempt 2"
+
+    import json
+    rec1 = json.loads((attempt1 / "record.json").read_text())
+    assert rec1["attempt"] == 1 and rec1["verdict"] == "still_crashes"
+    rec2 = json.loads((attempt2 / "record.json").read_text())
+    assert rec2["attempt"] == 2 and rec2["verdict"] == "verified_correct"
 
 
 def test_no_fix_learns_as_tests_only(dryrun_kwargs):
