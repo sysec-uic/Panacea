@@ -281,6 +281,20 @@ Priority order, per explicit decisions — don't reorder without checking in:
     a `dict[attempt_num, deque]`), a key handler for digits 1-5 alongside the
     existing `v`/`q`, and a way to show which attempt is currently being viewed vs
     "live" in the render. Not designed yet — just captured so it isn't lost.
+12. **Refresh `../EVALUATION.md` and the top-level `../README.md` status section
+    once the full 30-bug run is actually done.** Updated `EVALUATION.md` 2026-07-27
+    with a live in-progress snapshot (control 20/30, treatment 27/30 at the time —
+    5 bugs deliberately mid-rerun for the retry-cause investigation, not just
+    not-yet-attempted) and the reframed finding that token savings come from
+    retry-avoidance on a handful of bugs, not general per-attempt efficiency. That
+    snapshot will go stale again as soon as the remaining bugs finish — do a real
+    final pass once both arms hit their ceiling (30 minus the 3 permanent skips),
+    not before. Also fixed a real bug in `../README.md` while in there: it still
+    said `results/learn/ledger.jsonl` (the old pre-split filename); it's actually
+    `ledger.<pass>.jsonl` since the per-pass split (#3 above). The top-level
+    README's "Current status (2026-07-15)" section is also still stale (says
+    control 13/30, treatment 3/30) — left alone for now since it's a bigger
+    narrative rewrite, not a one-line fix; fold into this same pass.
 
 **Declined for now, to avoid disturbing the running experiment:** raising the
 3000-char playbook compression cap, and the retrieval-based playbook redesign

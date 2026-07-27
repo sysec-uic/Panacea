@@ -43,40 +43,65 @@ every bug.
 | **`n_attempts`** (solved bugs only) | Efficiency: how many of the 5 allowed attempts it took. Lower is better; watch whether treatment trends down relative to control as the playbook accumulates. |
 | **Token counts** (input, output, cache-read, cache-write) | Cost/effort proxy, recorded per bug in the ledger. Cache-read dominates and scales with conversation length (more tool calls, more retries), so it's a more sensitive efficiency signal than fix rate at this sample size. |
 
-## Current results (in progress, 2026-07-15)
+## Current results (in progress, snapshot 2026-07-27)
 
-The full 30-bug pass isn't finished for either arm yet. Numbers below cover the
-14 bugs both arms have completed **identically** (matched pairs), each
-independently re-verified under a corrected verification gate (see
-"Verification methodology" below):
+**This is a live snapshot, not a final result** -- both passes are still running,
+and as of this snapshot 5 bugs are deliberately excluded/mid-rerun (see below), not
+just not-yet-attempted. Numbers below cover the 20 bugs both arms have completed
+**identically** (matched pairs):
 
 | | Bugs confirmed | Fix rate | `oracle_confirmed` |
 |---|---|---|---|
-| **Control** | 14 / 30 | 14 / 14 (100%) | 14 / 14 |
-| **Treatment** | 14 / 30 | 14 / 14 (100%) | 14 / 14 |
+| **Control** | 20 / 30 | 20 / 20 (100%) | 20 / 20 |
+| **Treatment** | 27 / 30 | 27 / 27 (100%) | 26 / 27 |
 
-Both arms are still 100% fix rate with no failures recorded, so there's no
-fix-rate delta to report yet (a ceiling effect isn't surprising this early --
-these are individually well-scoped bugs). The signal so far is in effort, not
-outcome:
+Both arms remain at 100% fix rate on every bug either has actually completed.
+That's a real limitation worth stating plainly: with zero failures on either arm,
+this dataset so far can only speak to **efficiency** (attempts, tokens), not to
+whether the playbook changes whether a bug gets solved at all. (One control bug,
+`462331852`, is being re-run this session after exhausting all 5 attempts without
+a fix on a prior pass -- see the retry-mechanism note below.)
 
-| Metric (avg. per bug, matched pairs) | Control | Treatment |
+| Metric (avg. per bug, matched pairs, n=20) | Control | Treatment |
 |---|---|---|
-| Attempts | 1.29 | 1.00 |
-| Input tokens | 3,765 | 3,295 |
-| Output tokens | 857 | 903 |
-| Cache-read tokens | 2,656,600 | 2,475,208 |
-| Wall-clock | 778s | 657s |
+| Attempts | 1.25 | 1.00 |
+| Total tokens (sum, all 20) | 76,393,213 | 58,078,425 |
+| Mean tokens/bug | 3,819,661 | 2,903,921 |
 
-That gap isn't flat across the run -- it grows as the playbook accumulates
-content. Splitting the same 14 bugs at chronological position 10 (of 30):
-early on (positions 1-10, playbook has 0-9 heuristics) attempts go from 1.11
-to 1.00 and cache-read is essentially a wash (treatment is actually 1.3%
-*higher*, since the injected playbook adds fixed context weight before it's
-paid for itself). By position 11+ (playbook has 11+ heuristics), attempts go
-from 1.60 to 1.00 (-37%) and cache-read drops 15%. At n=5 for the late split,
-that trend is directional, not conclusive -- but it's the strongest evidence
-so far that the mechanism is doing something, not just adding noise.
+**Where the token gap actually comes from (new this snapshot):** splitting the
+20 matched bugs into "both arms solved in 1 attempt" (18 bugs) vs "at least one
+arm needed a retry" (2 bugs: `455612769`, `472567524`) shows the savings are NOT
+a general per-attempt efficiency gain. On the 18 one-shot-both bugs, treatment is
+actually very slightly *more* expensive in aggregate (control 45.9M vs treatment
+46.3M tokens -- essentially a coin flip, cheaper on 8/18). All of the net savings
+come from the handful of bugs where control needed extra attempts and treatment
+didn't. This reframes the mechanism: **the playbook isn't making individual
+attempts cheaper, it's preventing some bugs from needing a retry at all** -- closer
+to "pattern-matching against a known bug family" than "generally sharper
+reasoning."
+
+**Retry-cause investigation (new this snapshot):** manually reading archived
+per-attempt transcripts (a capability added 2026-07-23; earlier multi-attempt
+runs only kept the last attempt's logs) surfaced that "needed a retry" conflates
+several very different causes that the ledger's `n_attempts` field cannot
+currently distinguish:
+- a genuine Anthropic cyber-safeguard refusal, confirmed directly in two
+  transcripts (`462331852` attempt, `472567524` attempt 1 -- both control, both
+  triggered on ordinary, benign actions like decoding PoC bytes)
+- an apparent container OOM-kill (exit code 137) mid-verification on `462331852`,
+  after the agent had already root-caused the bug correctly and built what looks
+  like a working fix
+- a bug (`446362556`) that took 3 attempts on one run and 1 attempt on an
+  identical rerun -- a caution that `n_attempts` has real run-to-run
+  non-determinism, not just a fixed property of a given bug
+
+None of this has yet been done systematically across every retry in the dataset
+(it's manual transcript reading so far, not an automated classifier), so the
+efficiency numbers above should be read as **not yet corrected for
+refusal/infra-driven retries** -- the true "genuine reasoning" efficiency gap
+could be smaller, larger, or about the same once that's accounted for. Revisit
+this section once the full run is done and (if built) an automated
+attempt-failure classification exists.
 
 ## Verification methodology
 
