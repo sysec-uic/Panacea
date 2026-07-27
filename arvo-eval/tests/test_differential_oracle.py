@@ -172,3 +172,22 @@ def test_grade_divergent_on_poc_exit():
     res = grade(BUG, "diff", probes=[], script_texts=[], ops=ops)
     assert res["label"] == "divergent"
     assert res["divergences"][0] == {"probe": "poc", "kind": "exit"}
+
+
+def test_grade_reports_steps_in_order_via_on_step():
+    # Live-status raw feed hook: the oracle blocks on 4-6 slow docker steps with no
+    # other insight, so on_step must fire once per identifiable step, in order,
+    # including "probe N/M" for each of the two probe scripts here.
+    ops = FakeOps(agent={"poc": (0, "ok\n"), "A": (0, "a\n"), "B": (0, "b\n")},
+                  fix={"poc": (0, "ok\n"), "A": (0, "a\n"), "B": (0, "b\n")})
+    steps = []
+    grade(BUG, "diff", probes=[], script_texts=["A", "B"], ops=ops, on_step=steps.append)
+    assert steps == ["check fix image availability", "build agent container",
+                     "start fix container", "run PoC", "check binary",
+                     "build/read probe goldens", "probe 1/2", "probe 2/2"]
+
+
+def test_grade_without_on_step_does_not_raise():
+    ops = FakeOps(agent={"poc": (0, "ok\n")}, fix={"poc": (0, "ok\n")})
+    res = grade(BUG, "diff", probes=[], script_texts=[], ops=ops)
+    assert res["label"] == "oracle_confirmed"

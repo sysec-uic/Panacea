@@ -184,7 +184,7 @@ def apply_patch(exec_fn, project: str, diff: str):
     return result
 
 
-def run_check(bug, diff, exec_fn, *, project, run_tests=True) -> dict:
+def run_check(bug, diff, exec_fn, *, project, run_tests=True, on_step=None) -> dict:
     """Apply `diff` and classify the outcome, driving an ALREADY-PREPARED container
     through `exec_fn(command, input=None, timeout=...) -> CompletedProcess`.
 
@@ -193,7 +193,17 @@ def run_check(bug, diff, exec_fn, *, project, run_tests=True) -> dict:
     rebuilds) instead of paying a cold build each time. `verify()` uses it against a
     throwaway container; the agent `check-patch` tool uses it against a kept one.
     Returns the same verification dict shape `verify()` produces.
+
+    `on_step(msg)`, if given, fires a short message before each identifiable step
+    (apply patch, compile, run PoC, run rake test) -- the hook a live-status panel's
+    raw feed uses instead of the caller sitting on a spinner with zero insight for
+    however long each blocking exec_fn call takes. Defaults to None so every
+    existing caller (check-patch, CLI entry points, tests) is unaffected.
     """
+    def _step(msg):
+        if on_step is not None:
+            on_step(msg)
+
     v: dict = {}
     if not diff.strip():
         v["classification"] = "no_changes"
@@ -203,6 +213,7 @@ def run_check(bug, diff, exec_fn, *, project, run_tests=True) -> dict:
         v["harness_paths"] = changed_paths(diff)
         return v
 
+    _step("apply patch")
     apply_result = apply_patch(
         lambda cmd, patch: exec_fn(cmd, input=patch, timeout=60), project, diff)
     if apply_result.returncode != 0:
@@ -211,6 +222,7 @@ def run_check(bug, diff, exec_fn, *, project, run_tests=True) -> dict:
         return v
 
     # Cap ninja parallelism (see verify() note): guards the build VM from OOM.
+    _step("compile")
     exec_fn("sed -i 's#/depot_tools/ninja -C#/depot_tools/ninja -j3 -C#g' /src/build.sh 2>/dev/null || true",
             timeout=30)
     build_result = exec_fn(f"cd /src/{project} && {env_prefix(compile_env(bug))} compile",
@@ -221,6 +233,7 @@ def run_check(bug, diff, exec_fn, *, project, run_tests=True) -> dict:
         v["classification"] = "build_failed"
         return v
 
+    _step("run PoC")
     run_result = exec_fn("arvo", timeout=RUN_TIMEOUT)
     run_output = run_result.stdout + run_result.stderr
     v["run_output_tail"] = "\n".join(run_output.splitlines()[-30:])
@@ -229,6 +242,7 @@ def run_check(bug, diff, exec_fn, *, project, run_tests=True) -> dict:
     sanitizer = bug["sanitizer"].lower()
     make_test_ok = None
     if run_tests and not crashed(sanitizer, run_output) and run_result.returncode == 0 and project == "mruby":
+        _step("run rake test")
         test_result = exec_fn(mruby_test_cmd(bug), timeout=TEST_TIMEOUT)
         make_test_ok = test_result.returncode == 0
         v["make_test_ok"] = make_test_ok
@@ -271,19 +285,27 @@ def check_feedback(verification: dict) -> str:
     return f"FAIL: self-check returned {cls}."
 
 
-def save(instance: dict, verification: dict) -> dict:
+def save(instance: dict, verification: dict, quiet: bool = False) -> dict:
     out_path = results_dir(instance["instance_id"]) / "verification.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(verification, indent=2))
-    print(json.dumps(verification, indent=2))
+    if not quiet:
+        print(json.dumps(verification, indent=2))
 
-    classification = verification["classification"]
-    print(f"\n=== RESULT: {classification.upper()} ===")
-    print(f"Full details saved to {out_path}")
+        classification = verification["classification"]
+        print(f"\n=== RESULT: {classification.upper()} ===")
+        print(f"Full details saved to {out_path}")
     return verification
 
 
-def verify(bug_id: int, keep: bool = False) -> dict:
+def verify(bug_id: int, keep: bool = False, quiet: bool = False, on_step=None) -> dict:
+    """`quiet=True` (used by learn_loop's live status panel) still writes
+    verification.json but skips every print -- these would otherwise land straight
+    in the terminal, corrupting the panel's redraw the same way arvo_oss_crs.py's
+    own `_log`/`live_mode` suppression exists to prevent for prepare/build/agent.
+
+    `on_step`, if given, is passed straight through to run_check -- see its
+    docstring."""
     bug = load_bug(bug_id)
     instance = build_instance(bug)
     project = instance["project"]
@@ -295,13 +317,15 @@ def verify(bug_id: int, keep: bool = False) -> dict:
 
     if not diff.strip():
         verification["classification"] = "no_changes"
-        return save(instance, verification)
+        return save(instance, verification, quiet=quiet)
 
     if touches_harness(diff):
         verification["classification"] = "patch_touches_harness"
         verification["harness_paths"] = changed_paths(diff)
-        return save(instance, verification)
+        return save(instance, verification, quiet=quiet)
 
+    if on_step is not None:
+        on_step("start verify container")
     container = f"arvo-{instance['instance_id']}-verify"
     subprocess.run(["docker", "rm", "-f", container], capture_output=True)
     subprocess.run(
@@ -315,8 +339,8 @@ def verify(bug_id: int, keep: bool = False) -> dict:
         # with the agent's in-turn `check-patch` tool via run_check.
         exec_fn = lambda cmd, input=None, timeout=60: docker_exec(
             container, cmd, input=input, timeout=timeout)
-        verification.update(run_check(bug, diff, exec_fn, project=project))
-        return save(instance, verification)
+        verification.update(run_check(bug, diff, exec_fn, project=project, on_step=on_step))
+        return save(instance, verification, quiet=quiet)
     finally:
         if keep:
             verification["container"] = container

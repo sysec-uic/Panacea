@@ -64,8 +64,15 @@ MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "6"))
 
 def _is_retriable(exc) -> bool:
     """Detect by status_code so this covers anthropic.APIStatusError subclasses
-    (RateLimitError=429, InternalServerError=500, ...) and any error exposing one."""
-    return getattr(exc, "status_code", None) in RETRIABLE_STATUS
+    (RateLimitError=429, InternalServerError=500, ...) and any error exposing one.
+
+    ClaudeCLIClient has no status_code at all (it raises plain CLICallError/
+    subprocess.TimeoutExpired), so a transient CLI hiccup -- a hang, a non-JSON
+    response, an `is_error` payload -- would otherwise never be retried no matter
+    how transient. Treat those the same as a retriable API status."""
+    if getattr(exc, "status_code", None) in RETRIABLE_STATUS:
+        return True
+    return isinstance(exc, (CLICallError, subprocess.TimeoutExpired))
 
 
 def _rl_summary(exc) -> str:
@@ -118,7 +125,10 @@ def with_retries(fn, *, max_retries=MAX_RETRIES, is_retriable=_is_retriable,
                       f"retrying in {wait:.0f}s. {_rl_summary(exc)}", file=sys.stderr)
                 sleep(wait)
             else:
-                sleep(backoff(exc, attempt))
+                wait = backoff(exc, attempt)
+                print(f"[llm] {type(exc).__name__} (attempt {attempt + 1}/{max_retries + 1}): "
+                      f"{exc}; retrying in {wait:.0f}s.", file=sys.stderr)
+                sleep(wait)
             attempt += 1
 
 
@@ -178,6 +188,12 @@ class _CLIResponse:
         self.content = [_CLIBlock(text)]
 
 
+class CLICallError(RuntimeError):
+    """A ClaudeCLIClient failure (nonzero exit, non-JSON output, `is_error` payload).
+    Subclasses RuntimeError so existing `except RuntimeError` callers are unaffected;
+    exists so `_is_retriable` can single these out as retriable without status_code."""
+
+
 class ClaudeCLIClient:
     """Runs the extractor through the Claude Code CLI (`claude -p`) instead of the raw
     API, so a Pro/Max SUBSCRIPTION can drive it with no API key -- the same sanctioned
@@ -205,14 +221,14 @@ class ClaudeCLIClient:
         proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
                               timeout=self.timeout)
         if proc.returncode != 0:
-            raise RuntimeError(f"claude CLI exited {proc.returncode}: "
+            raise CLICallError(f"claude CLI exited {proc.returncode}: "
                                f"{(proc.stderr or proc.stdout).strip()[:500]}")
         try:
             data = json.loads(proc.stdout)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(f"claude CLI returned non-JSON: {proc.stdout[:500]}") from exc
+            raise CLICallError(f"claude CLI returned non-JSON: {proc.stdout[:500]}") from exc
         if data.get("is_error"):
-            raise RuntimeError(f"claude CLI reported an error: "
+            raise CLICallError(f"claude CLI reported an error: "
                                f"{data.get('result') or data.get('api_error_status')}")
         return _CLIResponse(data.get("result", ""))
 

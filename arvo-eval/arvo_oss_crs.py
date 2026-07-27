@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -391,6 +392,44 @@ def parse_token_counts(log_path: Path) -> dict:
     }
 
 
+def detect_usage_limit(log_path: Path) -> dict | None:
+    """Detect a Claude Code usage-cap cutoff in a claude_stdout.log.
+
+    Claude Code CLI emits a structured `rate_limit_event` when a call is rejected
+    for being over the cap, and/or ends the turn with a top-level `result` object
+    carrying `is_error: true, api_error_status: 429`. Either is a clean, explicit
+    signal from the CLI itself -- not a heuristic -- so callers can tell "the agent
+    got cut off by a usage cap" apart from "the agent genuinely produced nothing",
+    and avoid burning a real attempt slot on the former (see repair_loop.py).
+
+    Returns None if the log shows no usage-limit cutoff, else a dict with whatever
+    of `resets_at` (unix epoch, from rate_limit_info) and `resets_at_human` (the
+    CLI's own human-readable message, e.g. "You've hit your session limit ·
+    resets 9:50pm (UTC)") were found.
+    """
+    if not log_path.exists():
+        return None
+    hit = False
+    resets_at = None
+    resets_at_human = None
+    for line in log_path.read_text(errors="replace").splitlines():
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") == "rate_limit_event":
+            info = obj.get("rate_limit_info", {})
+            if info.get("status") == "rejected":
+                hit = True
+                resets_at = info.get("resetsAt", resets_at)
+        elif obj.get("type") == "result" and obj.get("api_error_status") == 429:
+            hit = True
+            resets_at_human = obj.get("result") or resets_at_human
+    if not hit:
+        return None
+    return {"resets_at": resets_at, "resets_at_human": resets_at_human}
+
+
 def _run_epoch(s: str) -> int:
     """OSS-CRS embeds a 10-digit epoch in run/build ids (test-1783442751bt,
     crs_compose_1783528430al-...); it orders disposables by age."""
@@ -449,41 +488,182 @@ def _run_timeout() -> float | None:
 
 
 def terminate_crs_run(*, run=subprocess.run) -> list[str]:
-    """Force-remove any live OSS-CRS compose containers.
+    """Force-remove any live OSS-CRS containers, both phases: the run phase
+    (`crs_compose_<runid>-...`, see oss-crs utils.py) and build-target
+    (`crs_<hash>-target_builder-run-<hash>`, a different naming scheme).
 
-    Killing the `uv run oss-crs` process on timeout only reaps that process --
-    docker-compose leaves its services running, and on the local-model box those
-    keep the GPU pegged. The compose project is named `crs_compose_<runid>` (see
-    oss-crs utils.py), so its containers all carry that name prefix; match and
-    remove them. Only invoked on the timeout path, so a serial campaign has at most
-    the one dead run to clean up."""
-    out = run(["docker", "ps", "-q", "--filter", "name=crs_compose"],
+    This is a SAFETY-NET SWEEP, not the primary teardown mechanism -- see
+    AbortController / _graceful_kill below, which signal the `uv run oss-crs`
+    process directly and let its own cli() (SIGTERM -> KeyboardInterrupt ->
+    _graceful_terminate in oss_crs/src/ui.py) gracefully stop its containers
+    itself. This just catches anything that somehow survives that."""
+    out = run(["docker", "ps", "-q", "--filter", "name=crs_compose",
+              "--filter", "name=target_builder"],
               capture_output=True, text=True)
     ids = out.stdout.split()
     if ids:
         run(["docker", "rm", "-f", *ids], capture_output=True, text=True)
-        print(f"[timeout] force-removed {len(ids)} live OSS-CRS containers")
+        print(f"[cleanup] force-removed {len(ids)} leftover OSS-CRS container(s)")
     return ids
 
 
-def _run_agent_with_timeout(cmd, *, cwd, timeout, run=subprocess.run,
-                            teardown=None) -> bool:
-    """Run the CRS agent subprocess under `timeout`. Returns whether it timed out.
+class AbortController:
+    """Lets an external caller (live_status.py's q-to-abort) signal whichever
+    OSS-CRS subprocess is CURRENTLY live -- a single run_oss_crs() call makes
+    multiple subprocess calls in turn (build-target, then run), so each one
+    registers itself here as it starts rather than binding to just one."""
 
-    On timeout, subprocess.run SIGKILLs the oss-crs process but its docker
-    containers survive, so tear them down before reporting. A clean finish (or no
-    cap) reports False and tears down nothing."""
-    teardown = teardown or terminate_crs_run
+    def __init__(self):
+        self.requested = threading.Event()
+        self._proc = None
+        self._lock = threading.Lock()
+
+    def register(self, proc) -> None:
+        with self._lock:
+            self._proc = proc
+
+    def unregister(self, proc) -> None:
+        with self._lock:
+            if self._proc is proc:
+                self._proc = None
+
+    def abort(self) -> None:
+        """Mark the abort and SIGTERM whatever subprocess is live right now."""
+        self.requested.set()
+        with self._lock:
+            proc = self._proc
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+
+
+def _graceful_kill(proc, timeout: float = 20) -> None:
+    """SIGTERM, wait, then SIGKILL if it hasn't exited in time -- mirrors OSS-CRS's
+    own _graceful_terminate (oss_crs/src/ui.py) so its internal cleanup gets a real
+    chance to run instead of being cut off by an immediate hard kill."""
+    proc.terminate()
     try:
-        run(cmd, cwd=cwd, check=False, timeout=timeout)
-        return False
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def _run_agent_with_timeout(cmd, *, cwd, timeout, popen=subprocess.Popen,
+                            teardown=None, abort_controller=None,
+                            check=False, on_line=None, drain_timeout=5) -> tuple[bool, bool]:
+    """Run an OSS-CRS subprocess under `timeout`. Returns (timed_out, aborted).
+
+    Uses Popen (not subprocess.run) so there's a live process handle to register
+    with `abort_controller` -- q-to-abort sends that process a real SIGTERM and
+    relies on OSS-CRS's own cli() to gracefully tear down its docker containers
+    itself (verified: it converts SIGTERM into a KeyboardInterrupt and calls its
+    own _graceful_terminate). `teardown` (terminate_crs_run by default) runs
+    afterward regardless, as a safety-net sweep for anything left behind.
+
+    `check=True` (build-target's semantics: a genuine build failure must still
+    raise) still raises CalledProcessError on a real failure, but not when the
+    nonzero exit was caused by our own abort.
+
+    `on_line(line)`, if given, is called for every line of the subprocess's
+    combined stdout+stderr as it arrives (read on a background thread so it can't
+    stall `.wait()`) -- the live-status panel's raw-output feed. ONLY in that case
+    is stdout/stderr piped at all; with on_line=None (every caller before this
+    feature) the child's output is inherited exactly as before, so default
+    behavior (and every existing test) is unaffected.
+
+    The drain thread is only joined with a bounded `drain_timeout` (not waited on
+    indefinitely): docker compose can leave a grandchild process holding the same
+    stdout pipe open, so in the worst case it never sees EOF at all, and blocking
+    forever on that would hang the whole campaign. But once we've given up
+    waiting, a `gate` flag is flipped so any lines the (still-running, harmless)
+    background thread reads AFTER that point are silently dropped instead of
+    delivered -- otherwise a slow final burst of output (e.g. compose teardown
+    logs) keeps trickling into the SAME raw feed after the caller has already
+    moved on to the next phase, visually overlapping with it.
+
+    stdin is always closed (DEVNULL), never inherited. Without this, the child
+    (and its own descendant processes, e.g. build-target's docker compose/buildx
+    chain) shares the real terminal's stdin fd with live_status's key-listener
+    thread (select()+os.read() in cbreak mode for v/q) -- two readers racing on the
+    same tty fd is exactly the kind of thing that can make a keystroke appear to
+    double-fire or drop. These are non-interactive batch subcommands (build-target,
+    run); they were never meant to read from stdin anyway."""
+    teardown = teardown or terminate_crs_run
+    popen_kwargs = {"stdin": subprocess.DEVNULL}
+    if on_line is not None:
+        popen_kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1)
+    proc = popen(cmd, cwd=cwd, **popen_kwargs)
+
+    reader_thread = None
+    if on_line is not None:
+        gate = {"open": True}
+
+        def _drain():
+            try:
+                for line in iter(proc.stdout.readline, ""):
+                    if gate["open"]:
+                        on_line(line.rstrip("\n"))
+            except Exception:
+                pass
+        reader_thread = threading.Thread(target=_drain, daemon=True)
+        reader_thread.start()
+
+    if abort_controller is not None:
+        abort_controller.register(proc)
+        if abort_controller.requested.is_set():
+            proc.terminate()   # abort raced in before we registered -- catch up
+    try:
+        proc.wait(timeout=timeout)
+        aborted = bool(abort_controller and abort_controller.requested.is_set())
+        if aborted:
+            teardown()
+            return False, True
+        if check and proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd)
+        return False, False
+    except subprocess.TimeoutExpired:
+        _graceful_kill(proc)
         teardown()
-        return True
+        return True, False
+    finally:
+        if abort_controller is not None:
+            abort_controller.unregister(proc)
+        if reader_thread is not None:
+            reader_thread.join(timeout=drain_timeout)
+            gate["open"] = False
 
 
-def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
-    """Run crs-claude-code on one ARVO bug. Returns a summary dict."""
+def run_oss_crs(bug_id: int, skip_build: bool = False, abort_controller=None,
+                on_phase=None, on_line=None) -> dict:
+    """Run crs-claude-code on one ARVO bug. Returns a summary dict.
+
+    `abort_controller` (an AbortController), if given, lets an external caller
+    (the live-status panel's q-to-abort) request that this run stop -- at any
+    point, build-target or run, since both phases register with it in turn.
+    See _run_agent_with_timeout for how the signal/teardown actually happens.
+
+    `on_phase(key, event)`, if given, is called with key in {"prepare", "build",
+    "agent"} and event in {"start", "done"} at each phase boundary -- the hook a
+    live-status panel uses to show real progress instead of raw log spam. Kept
+    string-based (not importing live_status's Phase/PhaseStatus) so this module
+    stays UI-agnostic; the caller translates.
+
+    `on_line(line)`, if given, receives the build-target/run subprocesses' output
+    line-by-line (see _run_agent_with_timeout) instead of it inheriting the
+    terminal directly. When either hook is active this function's OWN print()
+    status lines are also suppressed (via _log below) -- they'd otherwise print
+    directly into the middle of the live panel's redraw and corrupt the display."""
+    live_mode = on_phase is not None or on_line is not None
+
+    def _phase(key, event):
+        if on_phase is not None:
+            on_phase(key, event)
+
+    def _log(msg):
+        if not live_mode:
+            print(msg)
+
     bug = load_bug(bug_id)
     sanitizer = bug["sanitizer"].lower()
 
@@ -502,11 +682,13 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
 
     generate_fake_oss_fuzz_project(bug, project_dir)
 
+    _phase("prepare", "start")
     if not pov_path.exists():
-        print(f"[{bug_id}] Extracting POC from ARVO image...")
+        _log(f"[{bug_id}] Extracting POC from ARVO image...")
         extract_poc(bug_id, pov_path)
     else:
-        print(f"[{bug_id}] Using cached POC at {pov_path}")
+        _log(f"[{bug_id}] Using cached POC at {pov_path}")
+    _phase("prepare", "done")
 
     base = ["uv", "run", "oss-crs"]
     compose_args = ["--compose-file", str(COMPOSE_FILE)]
@@ -520,26 +702,39 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     if not skip_build:
         ts_before = set(_target_source_glob(sanitizer))
         build_start = time.time()
-        print(f"[{bug_id}] Building target ({bug['project']})...")
-        subprocess.run(
+        _log(f"[{bug_id}] Building target ({bug['project']})...")
+        _phase("build", "start")
+        _, build_aborted = _run_agent_with_timeout(
             [*base, "build-target", *compose_args,
              "--fuzz-proj-path", str(project_dir),
              "--incremental-build"],
             cwd=OSS_CRS_DIR,
+            timeout=None,
+            abort_controller=abort_controller,
             check=True,
+            on_line=on_line,
         )
+        _phase("build", "done")
+        if build_aborted:
+            _log(f"[{bug_id}] Build aborted by user.")
+            return {"bug_id": bug_id, "project": bug["project"], "elapsed_seconds": 0,
+                   "timed_out": False, "aborted": True, "check_required": _check_patch_enabled(),
+                   "check_passed": False, "usage_limit": None, "patches": 0, "patch_files": [],
+                   "tokens": {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
+                             "cache_write_tokens": 0}, "meta": {}}
     else:
         ts_before, build_start = set(), None
-        print(f"[{bug_id}] Skipping build (--skip-build set).")
+        _log(f"[{bug_id}] Skipping build (--skip-build set).")
 
     inject_heuristics(project_dir, sanitizer, bug_id, bug["project"],
                       newer_than=build_start, exclude=ts_before)
     inject_orientation(sanitizer, bug, newer_than=build_start, exclude=ts_before)
 
-    print(f"[{bug_id}] Running agent (harness: {bug['fuzz_target']})...")
+    _log(f"[{bug_id}] Running agent (harness: {bug['fuzz_target']})...")
+    _phase("agent", "start")
     timeout = _run_timeout()
     if timeout:
-        print(f"[{bug_id}] Wall-clock cap OSS_CRS_RUN_TIMEOUT={timeout:.0f}s in effect.")
+        _log(f"[{bug_id}] Wall-clock cap OSS_CRS_RUN_TIMEOUT={timeout:.0f}s in effect.")
 
     # In-turn self-check service (OSS_CRS_CHECK_PATCH=1): a background thread serves
     # the agent's check-patch requests against a warm -vul container for the duration
@@ -570,11 +765,11 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
                     "autosubmit_path": check_autosubmit},
             daemon=True)
         check_thread.start()
-        print(f"[{bug_id}] check-patch self-check service running (OSS_CRS_CHECK_PATCH=1)")
+        _log(f"[{bug_id}] check-patch self-check service running (OSS_CRS_CHECK_PATCH=1)")
 
     run_start = time.time()
     try:
-        timed_out = _run_agent_with_timeout(
+        timed_out, aborted = _run_agent_with_timeout(
             [*base, "run", *compose_args,
              "--fuzz-proj-path", str(project_dir),
              "--target-harness", bug["fuzz_target"],
@@ -582,16 +777,21 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
              "--incremental-build"],
             cwd=OSS_CRS_DIR,
             timeout=timeout,
+            abort_controller=abort_controller,
+            on_line=on_line,
         )
     finally:
         if check_stop is not None:
             check_stop.set()
             check_thread.join(timeout=30)
+    _phase("agent", "done")
     run_elapsed = time.time() - run_start
     if timed_out:
-        print(f"[{bug_id}] Agent run hit the {timeout:.0f}s cap after {run_elapsed:.0f}s; "
-              f"treating as a no-patch attempt. Any patch written before the cap is "
-              f"still collected below.")
+        _log(f"[{bug_id}] Agent run hit the {timeout:.0f}s cap after {run_elapsed:.0f}s; "
+             f"treating as a no-patch attempt. Any patch written before the cap is "
+             f"still collected below.")
+    if aborted:
+        _log(f"[{bug_id}] Run aborted by user after {run_elapsed:.0f}s.")
     run_dir = find_latest_run_dir(sanitizer)
     meta = {}
     patches = []
@@ -604,10 +804,10 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
         for i, patch_file in enumerate(patches):
             dest = output_dir / f"oss_crs_patch_{i}.diff"
             dest.write_bytes(patch_file.read_bytes())
-            print(f"[{bug_id}] Saved patch to {dest}")
+            _log(f"[{bug_id}] Saved patch to {dest}")
 
         copy_session_files(run_dir, output_dir)
-        print(f"[{bug_id}] Saved session files to {output_dir}")
+        _log(f"[{bug_id}] Saved session files to {output_dir}")
 
     n_patches = meta.get("totals", {}).get("artifacts", {}).get("patches", 0)
     patch_files = [str(output_dir / f"oss_crs_patch_{i}.diff") for i in range(len(patches))]
@@ -628,15 +828,21 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
               f"the validated diff ({dest}).")
 
     tokens = parse_token_counts(output_dir / "oss_crs_claude_stdout.log")
+    usage_limit = detect_usage_limit(output_dir / "oss_crs_claude_stdout.log")
+    if usage_limit:
+        _log(f"[{bug_id}] Usage limit hit"
+             + (f" ({usage_limit['resets_at_human']})" if usage_limit.get("resets_at_human") else ""))
     summary = {
         "bug_id": bug_id,
         "project": bug["project"],
         "elapsed_seconds": round(run_elapsed),
         "timed_out": timed_out,
+        "aborted": aborted,
         # check_required: enforcement is on; check_passed: the agent got a check-patch
         # PASS this run. The repair loop rejects a submission that is required-but-unchecked.
         "check_required": _check_patch_enabled(),
         "check_passed": check_marker.exists(),
+        "usage_limit": usage_limit,
         # auto_submitted: this run's patch is a check-patch-validated diff we promoted
         # because the agent earned a PASS but never wrote one to /patches/.
         "auto_submitted": auto_submitted,
@@ -651,8 +857,8 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
     cleanup_docker_images()
 
     (output_dir / "oss_crs_result.json").write_text(json.dumps(summary, indent=2))
-    print(f"[{bug_id}] Done. Patches: {n_patches}, elapsed: {run_elapsed:.0f}s, "
-          f"tokens: {tokens['input_tokens']} in / {tokens['output_tokens']} out")
+    _log(f"[{bug_id}] Done. Patches: {n_patches}, elapsed: {run_elapsed:.0f}s, "
+         f"tokens: {tokens['input_tokens']} in / {tokens['output_tokens']} out")
     return summary
 
 

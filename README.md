@@ -127,6 +127,6 @@ OSS_CRS_RUN_TIMEOUT=7200 \
 python3 learn_loop.py --limit 3
 ```
 
-Results accumulate in `arvo-eval/results/learn/ledger.jsonl`; the accumulated playbook of
-learned lessons is under `arvo-eval/playbook/` (committed only as a finished snapshot, not
-mid-experiment).
+Results accumulate in `arvo-eval/results/learn/ledger.<pass>.jsonl` (one file per pass);
+the accumulated playbook of learned lessons is under `arvo-eval/playbook/` (committed only
+as a finished snapshot, not mid-experiment).

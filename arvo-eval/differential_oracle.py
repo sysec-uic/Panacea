@@ -70,17 +70,28 @@ class OracleError(Exception):
 
 
 def grade(bug, agent_diff, *, probes=None, script_texts=None,
-          patched_container=None, poc_only=False, ops=None) -> dict:
+          patched_container=None, poc_only=False, ops=None, on_step=None) -> dict:
     """Compare the agent-patched build against n132/arvo:{id}-fix.
 
     Returns {label, fix_image_available, divergences}. The agent never sees this.
     `script_texts` overrides reading `probes` from disk (used by tests); in
     production `probes` defaults to `default_probes()` and their text is read here.
+
+    `on_step(msg)`, if given, fires a short message before each identifiable step
+    (build agent container, start fix container, run PoC, check binary, build/read
+    probe goldens, each probe as "probe N/M") -- same live-status raw-feed hook as
+    verify_fix.run_check's on_step. Defaults to None so every existing caller (CLI
+    entry points, tests) is unaffected.
     """
+    def _step(msg):
+        if on_step is not None:
+            on_step(msg)
+
     if ops is None:
         ops = DockerOps()
     local_id = bug["localId"]
 
+    _step("check fix image availability")
     if not ops.fix_image_available(local_id):
         return {"label": "no_fix_available", "fix_image_available": False, "divergences": []}
 
@@ -96,10 +107,13 @@ def grade(bug, agent_diff, *, probes=None, script_texts=None,
     fix_c = None
     try:
         if own_agent:
+            _step("build agent container")
             agent_c = ops.build_agent(bug, agent_diff)   # may raise OracleError
+        _step("start fix container")
         fix_c = ops.start_fix(local_id)
 
         divergences = []
+        _step("run PoC")
         a, f = ops.run_poc(agent_c), ops.run_poc(fix_c)
         # PoC stdout contains fuzzer noise we can't fully normalize; only compare
         # exit codes here. Stdout comparison is reserved for the probe scripts.
@@ -107,9 +121,12 @@ def grade(bug, agent_diff, *, probes=None, script_texts=None,
             divergences.append({"probe": "poc", "kind": "exit"})
 
         if not poc_only:
+            _step("check binary")
             ops.check_mruby_binary(agent_c)   # raises OracleError if missing
+            _step("build/read probe goldens")
             goldens = ops.get_probe_goldens(bug, local_id, script_texts, script_labels)
-            for label, text in zip(script_labels, script_texts):
+            for i, (label, text) in enumerate(zip(script_labels, script_texts), start=1):
+                _step(f"probe {i}/{len(script_labels)}")
                 a = ops.run_script(agent_c, text)
                 g = goldens[label]
                 f = (g["exit"], g["stdout"])
