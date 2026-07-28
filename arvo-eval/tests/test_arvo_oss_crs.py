@@ -506,6 +506,54 @@ def test_agent_edit_count(tmp_path):
     assert a.agent_edit_count(tmp_path / "missing.log") == 0
 
 
+def test_agent_edit_count_scoped_to_tree(tmp_path):
+    """With `under=`, only edits inside that source tree count -- stray edits to
+    /src, /tmp, or a sibling dir must NOT satisfy the forced-edit gate."""
+    import arvo_oss_crs as a, json
+    log = tmp_path / "claude_stdout.log"
+    def edit(fp):
+        return {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Edit", "input": {"file_path": fp}}]}}
+    lines = [
+        edit("/work/agent/clean-src/mruby/src/gc.c"),      # authoritative tree
+        edit("/work/agent/clean-src/mruby/include/khash.h"),  # authoritative tree
+        edit("/src/mruby/src/hash.c"),                     # patcher worktree (stray)
+        edit("/tmp/fix_khash.py"),                          # scratch (stray)
+        edit("/work/agent/clean-src/mruby-other/w.c"),     # sibling: must not prefix-match
+        {"type": "assistant", "message": {"content": [     # edit with no file_path
+            {"type": "tool_use", "name": "Write", "input": {"command": "x"}}]}},
+    ]
+    log.write_text("\n".join(json.dumps(x) for x in lines))
+    assert a.agent_edit_count(log) == 6                                    # unscoped: all
+    assert a.agent_edit_count(log, under="/work/agent/clean-src/mruby") == 2
+    assert a.agent_edit_count(log, under="/src/mruby") == 1
+    assert a.agent_edit_count(log, under="/work/agent/clean-src/nope") == 0
+
+
+def test_live_edit_count_scoped_by_mode(tmp_path, monkeypatch):
+    """_live_edit_count with a project keys the scope on the active flow: clean-src
+    when check-patch is enabled, /src (in place) when it is not."""
+    import arvo_oss_crs as a, json
+    run_dir = tmp_path / "run"
+    p = run_dir / "crs/crs-claude-code/proj/LOG_DIR/mruby_fuzzer/agent/claude_stdout.log"
+    p.parent.mkdir(parents=True)
+    def edit(fp):
+        return {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Edit", "input": {"file_path": fp}}]}}
+    p.write_text("\n".join(json.dumps(x) for x in [
+        edit("/work/agent/clean-src/mruby/src/gc.c"),
+        edit("/src/mruby/src/hash.c"),
+    ]))
+    monkeypatch.setattr(a, "find_latest_run_dir", lambda san: run_dir)
+
+    monkeypatch.setenv("OSS_CRS_CHECK_PATCH", "1")
+    assert a._live_edit_count("address", "mruby") == 1    # only clean-src edit
+    monkeypatch.delenv("OSS_CRS_CHECK_PATCH", raising=False)
+    assert a._live_edit_count("address", "mruby") == 1    # only /src edit
+    # No project -> unscoped (backward compatible with the single-arg callers)
+    assert a._live_edit_count("address") == 2
+
+
 def test_find_agent_stdout_log(tmp_path):
     import arvo_oss_crs as a
     run_dir = tmp_path / "run"

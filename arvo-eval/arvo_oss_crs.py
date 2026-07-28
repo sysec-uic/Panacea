@@ -434,14 +434,31 @@ def find_agent_stdout_log(run_dir: Path) -> Path | None:
     return max(logs, key=lambda p: p.stat().st_mtime) if logs else None
 
 
-def _live_edit_count(sanitizer: str) -> int:
+def _authoritative_source_root(project: str) -> str:
+    """The one source tree an edit must land in to become the submitted patch, keyed on
+    the active flow: `/work/agent/clean-src/<project>` when check-patch is enabled (the
+    tree check_patch_instruction tells the agent to edit and check-patch submits from),
+    else `/src/<project>` (the base CLAUDE.md in-place flow)."""
+    if _check_patch_enabled():
+        return f"/work/agent/clean-src/{project}"
+    return f"/src/{project}"
+
+
+def _live_edit_count(sanitizer: str, project: "str | None" = None) -> int:
     """Edit count for the current (newest) run's agent stream. 0 when the run dir or log
-    does not exist yet (early in a run, or run never started)."""
+    does not exist yet (early in a run, or run never started).
+
+    With `project`, only edits inside the authoritative source tree count -- so the
+    forced-edit gate is not satisfied by stray edits to /src, /tmp, or a scratch copy
+    that can never reach check-patch/submission. Without it, counts all edits (unchanged)."""
     run_dir = find_latest_run_dir(sanitizer)
     if run_dir is None:
         return 0
     log = find_agent_stdout_log(run_dir)
-    return agent_edit_count(log) if log is not None else 0
+    if log is None:
+        return 0
+    under = _authoritative_source_root(project) if project is not None else None
+    return agent_edit_count(log, under=under)
 
 
 def copy_session_files(run_dir: Path, output_dir: Path) -> None:
@@ -489,10 +506,24 @@ def parse_token_counts(log_path: Path) -> dict:
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit"}
 
 
-def agent_edit_count(log_path: Path) -> int:
+def _path_under(file_path, root: str) -> bool:
+    """True if `file_path` names a file at or below `root` (a directory prefix).
+    Guards the boundary so `.../mruby` does not prefix-match `.../mruby-other`."""
+    if not isinstance(file_path, str):
+        return False
+    root = root.rstrip("/")
+    return file_path == root or file_path.startswith(root + "/")
+
+
+def agent_edit_count(log_path: Path, under: "str | None" = None) -> int:
     """Count edit-family tool_use events (Edit/Write/MultiEdit) in a
     claude_stdout.log JSONL stream. Missing/unreadable file or malformed lines -> those
-    contribute 0, so the worst case is under-counting to 0 ('treat as no edits')."""
+    contribute 0, so the worst case is under-counting to 0 ('treat as no edits').
+
+    When `under` is given, only edits whose `file_path` is inside that source tree
+    count -- so the forced-edit gate measures edits that can actually become the
+    submitted patch, not stray edits to /src, /tmp, or a scratch copy. An edit with a
+    missing/non-string file_path does not count under a scope (safe: treat as no edit)."""
     n = 0
     try:
         text = Path(log_path).read_text()
@@ -510,7 +541,13 @@ def agent_edit_count(log_path: Path) -> int:
             for b in content:
                 if isinstance(b, dict) and b.get("type") == "tool_use" \
                         and b.get("name") in EDIT_TOOLS:
-                    n += 1
+                    if under is None:
+                        n += 1
+                    else:
+                        inp = b.get("input")
+                        fp = inp.get("file_path") if isinstance(inp, dict) else None
+                        if _path_under(fp, under):
+                            n += 1
     return n
 
 
@@ -866,7 +903,7 @@ def run_oss_crs(bug_id: int, skip_build: bool = False) -> dict:
             single=lambda cmd, cwd, to: _run_agent_with_timeout(cmd, cwd=cwd, timeout=to),
             recon=_recon,
             inject_forced=inject_forced_edit,
-            edit_probe=lambda: _live_edit_count(sanitizer),
+            edit_probe=lambda: _live_edit_count(sanitizer, bug["project"]),
             on_forced_handoff=_recycle_for_phase2)
         timed_out = phase_info["timed_out"]
     finally:
