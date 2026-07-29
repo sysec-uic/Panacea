@@ -171,16 +171,31 @@ def env_prefix(env: dict) -> str:
 
 
 def apply_patch(exec_fn, project: str, diff: str):
-    """Apply `diff` in the bug's source tree, tolerating an extra leading path
-    component. OSS-CRS nests the repo under a project-named dir, so its diffs carry
-    an extra prefix and only apply at -p2; plain diffs apply at -p1. Try -p1 first,
-    fall back to -p2. `exec_fn(command, diff)` returns a CompletedProcess. Returns
-    the first successful attempt, else the last one."""
+    """Apply `diff` in the bug's source tree, robustly and idempotently.
+
+    The check-patch service reuses ONE warm -vul container across many self-checks, so
+    each attempt must start from a pristine tree: `git apply` is atomic on failure but
+    leaves the tree modified on success, so the first diff that applies would otherwise
+    poison the tree and make every later diff fail with patch_apply_failed (the dominant
+    check-patch failure observed in the Jul 28 runs). Before each attempt we
+    `git reset -q --hard`, which reverts tracked modifications back to the pristine
+    vulnerable checkout, clears any half-merged --3way state, and is a no-op on an
+    already-clean tree (so it keeps the build cache and rebuilds stay incremental).
+
+    OSS-CRS nests the repo under a project-named dir, so its diffs carry an extra prefix
+    and only apply at -p2; plain diffs apply at -p1. We escalate strict `git apply` (fast
+    path for a diff whose context matches) to `git apply --3way` (reconstructs from the
+    blob context the diff references, surviving the context drift between the agent's
+    clean-src copy and this fresh checkout), each at -p1 then -p2. `exec_fn(command, diff)`
+    returns a CompletedProcess. Returns the first successful attempt, else the last one."""
     result = None
-    for strip in (1, 2):
-        result = exec_fn(f"git -C /src/{project} apply -p{strip} -", diff)
-        if result.returncode == 0:
-            return result
+    for cmd in ("git -C /src/{p} apply -p{s} -",
+                "git -C /src/{p} apply --3way -p{s} -"):
+        for strip in (1, 2):
+            exec_fn(f"git -C /src/{project} reset -q --hard", "")
+            result = exec_fn(cmd.format(p=project, s=strip), diff)
+            if result.returncode == 0:
+                return result
     return result
 
 

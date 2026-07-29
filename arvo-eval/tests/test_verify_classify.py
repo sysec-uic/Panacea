@@ -136,7 +136,8 @@ def test_apply_patch_uses_p1_first_and_stops_on_success():
 
     result = verify_fix.apply_patch(fake_exec, "mruby", "DIFF")
     assert result.returncode == 0
-    assert calls == ["git -C /src/mruby apply -p1 -"]
+    # Resets to pristine, then strict -p1 succeeds -- no further attempts.
+    assert calls == ["git -C /src/mruby reset -q --hard", "git -C /src/mruby apply -p1 -"]
 
 
 def test_apply_patch_retries_p2_when_p1_fails():
@@ -150,10 +151,46 @@ def test_apply_patch_retries_p2_when_p1_fails():
 
     result = verify_fix.apply_patch(fake_exec, "mruby", "DIFF")
     assert result.returncode == 0
-    assert calls == ["git -C /src/mruby apply -p1 -", "git -C /src/mruby apply -p2 -"]
+    assert calls == [
+        "git -C /src/mruby reset -q --hard", "git -C /src/mruby apply -p1 -",
+        "git -C /src/mruby reset -q --hard", "git -C /src/mruby apply -p2 -"]
 
 
-def test_apply_patch_returns_last_failure_when_all_strips_fail():
+def test_apply_patch_falls_back_to_3way_when_strict_fails():
+    # Strict apply rejects context drift between the agent's clean-src copy and this
+    # fresh checkout; --3way reconstructs from blob context and succeeds.
+    calls = []
+
+    def fake_exec(cmd, diff):
+        calls.append(cmd)
+        return _FakeProc(0 if "--3way" in cmd else 1)
+
+    result = verify_fix.apply_patch(fake_exec, "mruby", "DIFF")
+    assert result.returncode == 0
+    applies = [c for c in calls if " apply " in c]
+    assert applies == [
+        "git -C /src/mruby apply -p1 -", "git -C /src/mruby apply -p2 -",
+        "git -C /src/mruby apply --3way -p1 -"]        # stops at first --3way success
+
+
+def test_apply_patch_resets_to_pristine_before_every_attempt():
+    # The warm -vul container is reused across checks; every apply attempt must start
+    # from a clean tree so a prior success (or a half-merged --3way) can't poison it.
+    calls = []
+
+    def fake_exec(cmd, diff):
+        calls.append(cmd)
+        return _FakeProc(1)                            # force all attempts
+
+    verify_fix.apply_patch(fake_exec, "mruby", "DIFF")
+    resets = [i for i, c in enumerate(calls) if "reset -q --hard" in c]
+    applies = [i for i, c in enumerate(calls) if " apply " in c]
+    assert len(resets) == len(applies) == 4            # 2 strategies x 2 strip levels
+    # each apply is immediately preceded by a reset
+    assert all(a - 1 in resets for a in applies)
+
+
+def test_apply_patch_returns_last_failure_when_all_attempts_fail():
     def fake_exec(cmd, diff):
         return _FakeProc(1)
 
