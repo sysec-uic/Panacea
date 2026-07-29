@@ -217,11 +217,13 @@ def test_resuming_bug_that_hit_max_attempts_returns_exhausted_without_calling_ag
 
 
 def test_usage_limit_interrupts_without_checkpointing_or_calling_verify():
+    # An empty diff means the agent genuinely produced nothing before the cutoff --
+    # there's nothing to salvage, so this stays a true interrupt.
     verify_calls = []
     on_attempt_calls = []
 
     def agent(attempt_no, feedback):
-        return {"diff": "SOME_DIFF", "usage_limit": {"resets_at": 999, "resets_at_human": "9:50pm (UTC)"}}
+        return {"diff": "", "usage_limit": {"resets_at": 999, "resets_at_human": "9:50pm (UTC)"}}
 
     def verify(bug_id, diff):
         verify_calls.append(diff)
@@ -237,12 +239,39 @@ def test_usage_limit_interrupts_without_checkpointing_or_calling_verify():
     assert on_attempt_calls == []
 
 
+def test_usage_limit_with_real_diff_is_verified_not_discarded():
+    # Regression: a usage-cap signal can arrive after the agent's own turn already
+    # produced a genuine patch (the rate-limit event lands on a later call, not the
+    # one that actually wrote the diff). Discarding it as "interrupted" throws away
+    # real, verifiable work -- this bit us twice in practice (462331852, 473582282),
+    # where a correct, oracle-confirmed fix was silently dropped and had to be
+    # manually recovered from the orphaned patch.diff each time. A non-empty diff
+    # must be treated as a real attempt even when usage_limit is also set.
+    verify_calls = []
+    on_attempt_calls = []
+
+    def agent(attempt_no, feedback):
+        return {"diff": "SOME_DIFF", "usage_limit": {"resets_at": 999}}
+
+    def verify(bug_id, diff):
+        verify_calls.append(diff)
+        return {"classification": "verified_correct"}
+
+    result = repair_with_retries(bug=BUG, agent=agent, verify=verify, max_attempts=5,
+                                 on_attempt=lambda r: on_attempt_calls.append(r))
+
+    assert result["status"] == "solved"
+    assert verify_calls == ["SOME_DIFF"]                 # the diff WAS verified
+    assert len(on_attempt_calls) == 1
+    assert result["accepted"]["diff"] == "SOME_DIFF"
+
+
 def test_usage_limit_after_a_real_prior_attempt_preserves_it():
     prior = {"attempt": 1, "diff": "GUARD_DIFF", "verdict": "still_crashes",
              "feedback_for_next": "keep going"}
 
     def agent(attempt_no, feedback):
-        return {"diff": "X", "usage_limit": {"resets_at": 1}}
+        return {"diff": "", "usage_limit": {"resets_at": 1}}
 
     def verify(bug_id, diff):
         return {"classification": "verified_correct"}
@@ -275,9 +304,11 @@ def test_user_abort_interrupts_without_checkpointing():
     assert on_attempt_calls == []
 
 
-def test_usage_limit_takes_priority_over_check_patch_gate():
-    # If both usage_limit and an unchecked patch are present, the usage cap wins --
-    # there's no point rejecting-and-nudging when the agent can't even respond.
+def test_usage_limit_with_unchecked_diff_falls_through_to_check_patch_gate():
+    # With a real diff present, usage_limit no longer force-interrupts -- it falls
+    # through to the same verdict logic as any other attempt, including the
+    # check-patch enforcement gate (an unchecked patch is rejected as "unchecked"
+    # without paying for a verify build, same as when usage_limit isn't set at all).
     def agent(attempt_no, feedback):
         return {"diff": "X", "check_required": True, "check_passed": False,
                 "usage_limit": {"resets_at": 1}}
@@ -285,5 +316,14 @@ def test_usage_limit_takes_priority_over_check_patch_gate():
     def verify(bug_id, diff):
         raise AssertionError("verify should never be called")
 
-    result = repair_with_retries(bug=BUG, agent=agent, verify=verify, max_attempts=5)
+    result = repair_with_retries(bug=BUG, agent=agent, verify=verify, max_attempts=1)
+    assert result["status"] == "exhausted"
+    assert result["attempts"][0]["verdict"] == "unchecked"
+
+    def agent_still_interrupts_with_no_diff(attempt_no, feedback):
+        return {"diff": "", "check_required": True, "check_passed": False,
+                "usage_limit": {"resets_at": 1}}
+
+    result = repair_with_retries(bug=BUG, agent=agent_still_interrupts_with_no_diff,
+                                 verify=verify, max_attempts=5)
     assert result["status"] == "interrupted"

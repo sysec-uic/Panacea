@@ -83,6 +83,16 @@ def repair_with_retries(*, bug, agent, verify, max_attempts=5,
     on this return is exactly what went in, so a caller resuming later retries the
     SAME attempt number rather than advancing past it. `usage_limit`/`aborted` are
     included in the result so the caller can report why and when to retry.
+
+    A `usage_limit` cutoff with a real diff already in hand is NOT treated as
+    interrupted: the agent had already produced a genuine patch before the cutoff
+    landed (a rate-limit signal can arrive after the agent's own turn already
+    finished), so discarding it would throw away real, verifiable work. Bit us
+    twice in practice (462331852, 473582282) -- a correct, oracle-confirmed fix
+    got silently dropped and had to be manually recovered from the orphaned
+    patch.diff each time. `aborted` (a deliberate user 'q') keeps the original
+    always-discard behavior regardless of diff -- that wasn't the reported bug and
+    a user-requested stop shouldn't auto-submit whatever was mid-edit.
     """
     bug_id = bug["localId"]
     attempts = list(resume_attempts) if resume_attempts else []
@@ -91,11 +101,14 @@ def repair_with_retries(*, bug, agent, verify, max_attempts=5,
 
     for n in range(start, max_attempts + 1):
         run = agent(n, feedback)
-        if run.get("usage_limit") or run.get("aborted"):
+        diff = run.get("diff", "")
+        if run.get("aborted"):
+            return {"status": "interrupted", "attempts": attempts, "accepted": None,
+                    "contrastive_pair": None, "usage_limit": None, "aborted": True}
+        if run.get("usage_limit") and not diff.strip():
             return {"status": "interrupted", "attempts": attempts, "accepted": None,
                     "contrastive_pair": None, "usage_limit": run.get("usage_limit"),
-                    "aborted": bool(run.get("aborted"))}
-        diff = run.get("diff", "")
+                    "aborted": False}
         if not diff.strip():
             # No patch. A run that hit the wall-clock cap is a distinct, actionable
             # failure -- feed that back rather than a generic "no changes".

@@ -357,8 +357,11 @@ def test_usage_limit_stops_pass_without_ledger_write_or_checkpoint_clear(tmp_pat
     started = []
 
     def capped_agent(bug_id, project_dir, skip_build):
+        # Empty diff: the agent genuinely produced nothing before the cutoff, so
+        # this is a true interrupt (a non-empty diff would now be verified instead
+        # of discarded -- see test_repair_loop.py's usage-limit-with-real-diff test).
         started.append(bug_id)
-        return {"diff": "X", "trajectory_summary": "t",
+        return {"diff": "", "trajectory_summary": "t",
                 "usage_limit": {"resets_at": 123, "resets_at_human": "9:50pm (UTC)"}}
 
     result = run_pass(
@@ -414,7 +417,8 @@ def test_usage_limit_after_real_checkpointed_attempts_preserves_them(tmp_path):
                              "feedback_for_next": "fb2", "tokens": {}})
 
     def capped_agent(bug_id, project_dir, skip_build):
-        return {"diff": "C", "trajectory_summary": "t", "usage_limit": {"resets_at": 1}}
+        # Empty diff: a true interrupt (see note in the test above).
+        return {"diff": "", "trajectory_summary": "t", "usage_limit": {"resets_at": 1}}
 
     run_pass(
         bugs=[_bug(100)], pass_name="treatment", inject_enabled=True,
