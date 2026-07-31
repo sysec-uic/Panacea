@@ -7,7 +7,7 @@ reproducible crashes from fuzzing (the [ARVO](https://github.com/n132/ARVO) data
 OSS-Fuzz bugs), drives an AI repair agent to fix each one, verifies the fix for real,
 and, as the research bet, **learns from each fix so it gets better at the next one**.
 
-## Current status (2026-07-29)
+## Current status (2026-07-31)
 
 Two parallel efforts are running the same experiment on different backends:
 
@@ -31,6 +31,19 @@ Two parallel efforts are running the same experiment on different backends:
   [`docs/2026-07-13-learn-loop-local-model-campaign.md`](docs/2026-07-13-learn-loop-local-model-campaign.md)
   and
   [`docs/2026-07-15-check-patch-gate-live-validation.md`](docs/2026-07-15-check-patch-gate-live-validation.md).
+  The remaining walls then fell in sequence: inline crash orientation plus
+  serving cache-reuse cleared the read-stall/latency wall and produced the first
+  verified local-model solve (Jul 20-21), and after available VRAM dropped to
+  80 GB the stack migrated to a 24B model served locally through a small
+  responses-to-chat bridge. Two harness bugs found along the way -- a forced-edit
+  gate that miscounted edits, and a check-patch self-check that poisoned its own
+  build container between checks -- were fixed, moving the wall from diff-plumbing
+  to fix-correctness. The local model now solves **12 of 20** tractable-class bugs
+  at a single attempt, all independently oracle-confirmed, with a bounded
+  correctness ceiling on the subtlest memory-safety root causes; a matched
+  no-playbook control pass is in progress. See
+  [`docs/2026-07-30-pipeline-fixes-and-local-model-evaluation.md`](docs/2026-07-30-pipeline-fixes-and-local-model-evaluation.md)
+  and the draft write-up in [`docs/paper/`](docs/paper/).
 
 Infrastructure hardened along the way, shared by both passes:
 
