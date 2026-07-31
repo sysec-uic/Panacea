@@ -790,3 +790,379 @@ def test_inject_orientation_disabled_by_default(tmp_path, monkeypatch):
     bug = {"localId": 1, "project": "mruby", "crash_type": "x", "crash_output": "==ERROR: ..."}
     assert arvo_oss_crs.inject_orientation("address", bug) is False
     assert not (tmp_path / "ORIENTATION.md").exists()
+
+
+def test_force_edit_flag_and_recon_timeout(monkeypatch):
+    import arvo_oss_crs as a
+    monkeypatch.delenv("OSS_CRS_FORCE_EDIT", raising=False)
+    monkeypatch.delenv("OSS_CRS_RECON_TIMEOUT", raising=False)
+    assert a._force_edit_enabled() is False
+    assert a._recon_timeout() == 1800.0
+    monkeypatch.setenv("OSS_CRS_FORCE_EDIT", "1")
+    monkeypatch.setenv("OSS_CRS_RECON_TIMEOUT", "600")
+    assert a._force_edit_enabled() is True
+    assert a._recon_timeout() == 600.0
+
+
+def test_agent_edit_count(tmp_path):
+    import arvo_oss_crs as a, json
+    log = tmp_path / "claude_stdout.log"
+    lines = [
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "let me look"},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "grep x"}}]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Edit", "input": {"file_path": "a.c"}}]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Write", "input": {"file_path": "b.c"}}]}},
+        "this is not json",
+    ]
+    log.write_text("\n".join(json.dumps(x) if isinstance(x, dict) else x for x in lines))
+    assert a.agent_edit_count(log) == 2
+    assert a.agent_edit_count(tmp_path / "missing.log") == 0
+
+
+def test_agent_edit_count_scoped_to_tree(tmp_path):
+    """With `under=`, only edits inside that source tree count -- stray edits to
+    /src, /tmp, or a sibling dir must NOT satisfy the forced-edit gate."""
+    import arvo_oss_crs as a, json
+    log = tmp_path / "claude_stdout.log"
+    def edit(fp):
+        return {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Edit", "input": {"file_path": fp}}]}}
+    lines = [
+        edit("/work/agent/clean-src/mruby/src/gc.c"),      # authoritative tree
+        edit("/work/agent/clean-src/mruby/include/khash.h"),  # authoritative tree
+        edit("/src/mruby/src/hash.c"),                     # patcher worktree (stray)
+        edit("/tmp/fix_khash.py"),                          # scratch (stray)
+        edit("/work/agent/clean-src/mruby-other/w.c"),     # sibling: must not prefix-match
+        {"type": "assistant", "message": {"content": [     # edit with no file_path
+            {"type": "tool_use", "name": "Write", "input": {"command": "x"}}]}},
+    ]
+    log.write_text("\n".join(json.dumps(x) for x in lines))
+    assert a.agent_edit_count(log) == 6                                    # unscoped: all
+    assert a.agent_edit_count(log, under="/work/agent/clean-src/mruby") == 2
+    assert a.agent_edit_count(log, under="/src/mruby") == 1
+    assert a.agent_edit_count(log, under="/work/agent/clean-src/nope") == 0
+
+
+def test_live_edit_count_scoped_by_mode(tmp_path, monkeypatch):
+    """_live_edit_count with a project keys the scope on the active flow: clean-src
+    when check-patch is enabled, /src (in place) when it is not."""
+    import arvo_oss_crs as a, json
+    run_dir = tmp_path / "run"
+    p = run_dir / "crs/crs-claude-code/proj/LOG_DIR/mruby_fuzzer/agent/claude_stdout.log"
+    p.parent.mkdir(parents=True)
+    def edit(fp):
+        return {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Edit", "input": {"file_path": fp}}]}}
+    p.write_text("\n".join(json.dumps(x) for x in [
+        edit("/work/agent/clean-src/mruby/src/gc.c"),
+        edit("/src/mruby/src/hash.c"),
+    ]))
+    monkeypatch.setattr(a, "find_latest_run_dir", lambda san: run_dir)
+
+    monkeypatch.setenv("OSS_CRS_CHECK_PATCH", "1")
+    assert a._live_edit_count("address", "mruby") == 1    # only clean-src edit
+    monkeypatch.delenv("OSS_CRS_CHECK_PATCH", raising=False)
+    assert a._live_edit_count("address", "mruby") == 1    # only /src edit
+    # No project -> unscoped (backward compatible with the single-arg callers)
+    assert a._live_edit_count("address") == 2
+
+
+def test_find_agent_stdout_log(tmp_path):
+    import arvo_oss_crs as a
+    run_dir = tmp_path / "run"
+    p = run_dir / "crs/crs-claude-code/proj/LOG_DIR/mruby_fuzzer/agent/claude_stdout.log"
+    p.parent.mkdir(parents=True)
+    p.write_text("{}")
+    assert a.find_agent_stdout_log(run_dir) == p
+    assert a.find_agent_stdout_log(tmp_path / "empty") is None
+
+
+def test_live_edit_count(tmp_path, monkeypatch):
+    import arvo_oss_crs as a, json
+    run_dir = tmp_path / "run"
+    p = run_dir / "crs/crs-claude-code/proj/LOG_DIR/mruby_fuzzer/agent/claude_stdout.log"
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": "Edit", "input": {"file_path": "a.c"}}]}}))
+    monkeypatch.setattr(a, "find_latest_run_dir", lambda san: run_dir)
+    assert a._live_edit_count("address") == 1
+    monkeypatch.setattr(a, "find_latest_run_dir", lambda san: None)
+    assert a._live_edit_count("address") == 0
+
+
+def test_extract_root_cause(tmp_path):
+    import arvo_oss_crs as a, json
+    log = tmp_path / "claude_stdout.log"
+    big = "The set kset_put path stores keys without a write barrier. " * 6  # >200 chars
+    lines = [
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": big}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+    ]
+    log.write_text("\n".join(json.dumps(x) for x in lines))
+    assert a.extract_root_cause(log).startswith("The set kset_put path")
+    assert a.extract_root_cause(tmp_path / "missing.log") == ""
+
+
+def test_build_forced_edit_directive():
+    import arvo_oss_crs as a
+    out = a.build_forced_edit_directive(
+        project="mruby", root_cause="Missing write barrier in kset_put.",
+        orientation="# Crash orientation\nClass: heap-use-after-free")
+    # Mandate is first and unmissable
+    assert out.lstrip().startswith("# FORCED EDIT")
+    idx_mandate = out.index("only task")
+    idx_repo = out.index("/work/agent/clean-src/mruby")
+    assert idx_mandate < idx_repo               # mandate before mechanics
+    assert "Missing write barrier in kset_put." in out   # agent's own words fed back
+    assert "check-patch" in out
+    assert "Crash orientation" in out
+    # Empty analysis is safe: still a valid directive standing on crash + recipe
+    out2 = a.build_forced_edit_directive(project="mruby", root_cause="", orientation="")
+    assert out2.lstrip().startswith("# FORCED EDIT")
+    assert "You already concluded" not in out2
+
+
+def test_phase2_timeout():
+    import arvo_oss_crs as a
+    # Normal: hard cap 7200, phase1 ran 1800 -> 5400 remaining
+    assert a.phase2_timeout(7200, 1800) == 5400
+    # Floor protects a tiny remainder
+    assert a.phase2_timeout(7200, 7000, floor=900) == 900
+    # No hard cap -> no phase-2 cap
+    assert a.phase2_timeout(None, 1800) is None
+
+
+def test_inject_forced_edit_overwrites_target_source(tmp_path, monkeypatch):
+    import arvo_oss_crs as a, json
+    ts = tmp_path / "target-source"
+    ts.mkdir()
+    (ts / "HEURISTICS.md").write_text("OLD PLAYBOOK CONTENT")
+    # stream log with the agent's diagnosis
+    log = tmp_path / "claude_stdout.log"
+    big = "Root cause: kset_put stores keys without a write barrier. " * 5
+    log.write_text(json.dumps({"type": "assistant",
+        "message": {"content": [{"type": "text", "text": big}]}}))
+    monkeypatch.setattr(a, "find_target_source_dir", lambda san, newer_than=None, exclude=(): ts)
+    monkeypatch.setattr(a, "find_latest_run_dir", lambda san: tmp_path)
+    monkeypatch.setattr(a, "find_agent_stdout_log", lambda rd: log)
+    monkeypatch.setattr(a, "parse_crash_output", lambda *args, **kw: None)  # no orientation
+    ok = a.inject_forced_edit("address", {"localId": 1, "project": "mruby",
+                                          "crash_output": "", "crash_type": ""}, "mruby",
+                              newer_than=None, exclude=())
+    assert ok is True
+    written = (ts / "HEURISTICS.md").read_text()
+    assert written.lstrip().startswith("# FORCED EDIT")
+    assert "OLD PLAYBOOK CONTENT" not in written          # overwritten, not appended
+    assert "kset_put stores keys" in written              # agent's diagnosis fed back
+
+
+def test_edit_helpers_tolerate_non_object_json_lines(tmp_path):
+    import arvo_oss_crs as a, json
+    log = tmp_path / "claude_stdout.log"
+    log.write_text("\n".join([
+        "null", "42", "[1, 2, 3]",
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Edit", "input": {"file_path": "a.c"}}]}}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Root cause: missing write barrier. " * 8}]}}),
+    ]))
+    assert a.agent_edit_count(log) == 1          # does not raise on null/42/list
+    assert a.extract_root_cause(log).startswith("Root cause")
+
+
+def test_inject_forced_edit_returns_false_when_no_target_source(monkeypatch):
+    import arvo_oss_crs as a
+    monkeypatch.setattr(a, "find_target_source_dir", lambda san, newer_than=None, exclude=(): None)
+    ok = a.inject_forced_edit("address", {"localId": 1, "project": "mruby",
+                                          "crash_output": "", "crash_type": ""}, "mruby")
+    assert ok is False
+
+
+def test_run_agent_recon_phase_forces_when_zero_edits():
+    import arvo_oss_crs as a
+
+    class FakeProc:
+        def __init__(self): self.killed = False
+        def poll(self): return None        # never exits on its own
+        def kill(self): self.killed = True
+        def wait(self, timeout=None): return 0
+
+    proc = FakeProc()
+    torn = []
+    clock = {"t": 0.0}
+    def fake_now(): clock["t"] += 10; return clock["t"]   # +10s per poll
+    timed_out, forced = a._run_agent_recon_phase(
+        ["run"], cwd=".", hard_cap=100, recon_cap=30,
+        edit_probe=lambda: 0,                  # agent made no edits
+        popen=lambda cmd, cwd: proc,
+        teardown=lambda: torn.append(True),
+        now=fake_now, sleep=lambda s: None)
+    assert (timed_out, forced) == (False, True)
+    assert proc.killed and torn == [True]
+
+
+def test_run_agent_recon_phase_lets_worker_run_to_hard_cap():
+    import arvo_oss_crs as a
+
+    class FakeProc:
+        def __init__(self): self.killed = False
+        def poll(self): return None
+        def kill(self): self.killed = True
+        def wait(self, timeout=None): return 0
+
+    proc = FakeProc()
+    clock = {"t": 0.0}
+    def fake_now(): clock["t"] += 10; return clock["t"]
+    timed_out, forced = a._run_agent_recon_phase(
+        ["run"], cwd=".", hard_cap=100, recon_cap=30,
+        edit_probe=lambda: 3,                  # already editing at the recon mark
+        popen=lambda cmd, cwd: proc,
+        teardown=lambda: None,
+        now=fake_now, sleep=lambda s: None)
+    # editing -> not forced; runs until hard_cap -> timed_out
+    assert (timed_out, forced) == (True, False)
+    assert proc.killed
+
+
+def test_run_agent_recon_phase_natural_exit():
+    import arvo_oss_crs as a
+
+    class FakeProc:
+        def __init__(self): self.calls = 0
+        def poll(self):
+            self.calls += 1
+            return None if self.calls < 2 else 0   # exits on the 2nd poll
+        def kill(self): pass
+        def wait(self, timeout=None): return 0
+
+    clock = {"t": 0.0}
+    def fake_now(): clock["t"] += 10; return clock["t"]
+    timed_out, forced = a._run_agent_recon_phase(
+        ["run"], cwd=".", hard_cap=100, recon_cap=30,
+        edit_probe=lambda: 0, popen=lambda cmd, cwd: FakeProc(),
+        teardown=lambda: None, now=fake_now, sleep=lambda s: None)
+    assert (timed_out, forced) == (False, False)
+
+
+def test_run_agent_phases_flag_off_single_call(monkeypatch):
+    import arvo_oss_crs as a
+    calls = []
+    monkeypatch.delenv("OSS_CRS_FORCE_EDIT", raising=False)
+    res = a.run_agent_phases(
+        run_cmd=["run"], cwd=".", sanitizer="address", bug={"localId": 1},
+        project="mruby", hard_cap=100, newer_than=None, exclude=(),
+        single=lambda cmd, cwd, timeout: (calls.append(("single", timeout)) or False),
+        recon=lambda **k: (_ for _ in ()).throw(AssertionError("recon must not run")),
+        inject_forced=lambda *a_, **k: True,
+        edit_probe=lambda: 0)
+    assert res["forced_edit_triggered"] is False
+    assert calls == [("single", 100)]
+
+
+def test_run_agent_phases_forced_pair(monkeypatch):
+    import arvo_oss_crs as a
+    monkeypatch.setenv("OSS_CRS_FORCE_EDIT", "1")
+    calls = []
+    injected = []
+    res = a.run_agent_phases(
+        run_cmd=["run"], cwd=".", sanitizer="address", bug={"localId": 1},
+        project="mruby", hard_cap=7200, newer_than=None, exclude=(),
+        single=lambda cmd, cwd, timeout: calls.append(("single", timeout)) or False,
+        recon=lambda **k: (False, True),          # recon ends with 0 edits -> force
+        inject_forced=lambda *a_, **k: injected.append(True) or True,
+        edit_probe=lambda: 0,
+        phase1_elapsed_override=1800)
+    assert res["forced_edit_triggered"] is True
+    assert injected == [True]
+    # Phase 2 is the single-call path, capped at remaining budget (7200-1800=5400)
+    assert calls == [("single", 5400)]
+
+
+def test_run_agent_recon_phase_no_hard_cap_runs_until_exit():
+    import arvo_oss_crs as a
+    class FakeProc:
+        def __init__(self): self.calls = 0; self.killed = False
+        def poll(self):
+            self.calls += 1
+            return None if self.calls < 4 else 0   # exits on the 4th poll
+        def kill(self): self.killed = True
+        def wait(self, timeout=None): return 0
+    clock = {"t": 0.0}
+    def fake_now(): clock["t"] += 10; return clock["t"]
+    timed_out, forced = a._run_agent_recon_phase(
+        ["run"], cwd=".", hard_cap=None, recon_cap=30,
+        edit_probe=lambda: 5,                       # editing -> not forced
+        popen=lambda cmd, cwd: FakeProc(),
+        teardown=lambda: None, now=fake_now, sleep=lambda s: None)
+    assert (timed_out, forced) == (False, False)    # natural exit, no None-comparison crash
+
+
+def test_run_agent_recon_phase_probe_error_does_not_leak():
+    import arvo_oss_crs as a
+    class FakeProc:
+        def __init__(self): self.killed = False
+        def poll(self): return None
+        def kill(self): self.killed = True
+        def wait(self, timeout=None): return 0
+    proc = FakeProc(); torn = []
+    clock = {"t": 0.0}
+    def fake_now(): clock["t"] += 10; return clock["t"]
+    def boom(): raise PermissionError("root-owned log")
+    timed_out, forced = a._run_agent_recon_phase(
+        ["run"], cwd=".", hard_cap=100, recon_cap=30,
+        edit_probe=boom, popen=lambda cmd, cwd: proc,
+        teardown=lambda: torn.append(True), now=fake_now, sleep=lambda s: None)
+    # probe raised -> not forced; runs to hard_cap -> killed + torn down, no leak, no raise
+    assert (timed_out, forced) == (True, False)
+    assert proc.killed and torn == [True]
+
+
+def test_run_agent_phases_flag_off_does_not_probe(monkeypatch):
+    import arvo_oss_crs as a
+    monkeypatch.delenv("OSS_CRS_FORCE_EDIT", raising=False)
+    calls = {"n": 0}
+    def probe(): calls["n"] += 1; return 2
+    res = a.run_agent_phases(
+        run_cmd=["run"], cwd=".", sanitizer="address", bug={"localId": 1},
+        project="mruby", hard_cap=100, newer_than=None, exclude=(),
+        single=lambda cmd, cwd, to: False,
+        recon=lambda **k: (_ for _ in ()).throw(AssertionError("recon must not run")),
+        inject_forced=lambda *a_, **k: True, edit_probe=probe)
+    assert calls["n"] == 0                    # feature off -> two-pass fields meaningless
+    assert res["phase2_edits"] is None
+    assert res["phase1_edits"] is None
+    assert res["edit_phase"] is None          # flag off -> no phase label
+
+
+def test_run_agent_phases_calls_handoff_between_inject_and_phase2(monkeypatch):
+    import arvo_oss_crs as a
+    monkeypatch.setenv("OSS_CRS_FORCE_EDIT", "1")
+    events = []
+    a.run_agent_phases(
+        run_cmd=["run"], cwd=".", sanitizer="address", bug={"localId": 1},
+        project="mruby", hard_cap=7200, newer_than=None, exclude=(),
+        single=lambda cmd, cwd, to: events.append("single") or False,
+        recon=lambda **k: (False, True),
+        inject_forced=lambda *a_, **k: events.append("inject") or True,
+        edit_probe=lambda: 0,
+        on_forced_handoff=lambda: events.append("recycle"),
+        phase1_elapsed_override=1800)
+    assert events == ["inject", "recycle", "single"]
+
+
+def test_run_agent_phases_no_handoff_when_not_forced(monkeypatch):
+    import arvo_oss_crs as a
+    monkeypatch.setenv("OSS_CRS_FORCE_EDIT", "1")
+    called = []
+    a.run_agent_phases(
+        run_cmd=["run"], cwd=".", sanitizer="address", bug={"localId": 1},
+        project="mruby", hard_cap=7200, newer_than=None, exclude=(),
+        single=lambda cmd, cwd, to: False,
+        recon=lambda **k: (False, False),          # recon made edits -> not forced
+        inject_forced=lambda *a_, **k: True, edit_probe=lambda: 2,
+        on_forced_handoff=lambda: called.append(1), phase1_elapsed_override=1800)
+    assert called == []

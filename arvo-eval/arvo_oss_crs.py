@@ -253,8 +253,48 @@ def check_patch_instruction(project: str) -> str:
     )
 
 
+def build_forced_edit_directive(*, project: str, root_cause: str, orientation: str) -> str:
+    """The Phase-2 injected HEURISTICS.md content: a narrow 'make the edit now' directive.
+    Deliberately omits the full playbook and any 'read the codebase' affordance -- Phase 2
+    is about converting a stated diagnosis into one edit, not informing a fresh look."""
+    repo = f"/work/agent/clean-src/{project}"
+    parts = [
+        "# FORCED EDIT -- your only task now",
+        "You already investigated this crash. Do NOT investigate further and do NOT "
+        "re-read the codebase. Make the ONE source edit your analysis points to and "
+        "validate it with check-patch. That is the entire and only task.",
+    ]
+    if orientation.strip():
+        parts.append(orientation.strip())
+    if root_cause.strip():
+        parts.append("## You already concluded\n" + root_cause.strip())
+    parts.append(
+        "## Make the edit and validate\n"
+        f"Edit the source in `{repo}` (already a git repo -- do NOT run `git init`). If "
+        "it is not present yet, run `download-source target-source /work/agent/clean-src` "
+        "first. Then, from that repo:\n"
+        f"    cd {repo} && bash \"$OSS_CRS_SHARED_DIR/check-patch\"\n"
+        "When check-patch prints PASS you are DONE: the validated patch is recorded and "
+        "submitted for you. Do NOT hand-write a diff or write to /patches/."
+    )
+    return "\n\n".join(parts)
+
+
 def _check_patch_enabled() -> bool:
     return os.environ.get("OSS_CRS_CHECK_PATCH") == "1"
+
+
+def _force_edit_enabled() -> bool:
+    """Master switch for the recon->forced-edit two-pass (OSS_CRS_FORCE_EDIT=1).
+    Unset -> single-pass behavior identical to before this feature."""
+    return os.environ.get("OSS_CRS_FORCE_EDIT") == "1"
+
+
+def _recon_timeout() -> float:
+    """Phase-1 elapsed time (seconds) at which the 0-edit check fires.
+    Default 1800 (30 min); bounded above by OSS_CRS_RUN_TIMEOUT in practice."""
+    v = os.environ.get("OSS_CRS_RECON_TIMEOUT")
+    return float(v) if v else 1800.0
 
 
 def inject_heuristics(project_dir: Path, sanitizer: str, bug_id: int, project: str,
@@ -325,6 +365,41 @@ def inject_orientation(sanitizer: str, bug: dict, newer_than: float | None = Non
     return True
 
 
+def inject_forced_edit(sanitizer: str, bug: dict, project: str,
+                       newer_than: float | None = None,
+                       exclude: "set[Path] | tuple" = ()) -> bool:
+    """Overwrite THIS run's target-source HEURISTICS.md with the forced-edit directive,
+    seeded with the agent's own Phase-1 diagnosis. Same `newer_than`/`exclude` pinning as
+    inject_heuristics, so it always targets this run's freshly-built dir. Returns True on
+    write, False if the target-source can't be found."""
+    target_source = find_target_source_dir(sanitizer, newer_than=newer_than, exclude=exclude)
+    if target_source is None:
+        print(f"[{bug['localId']}] WARNING: no fresh target-source dir -- forced-edit "
+              f"directive NOT injected; Phase 2 will run without it.")
+        return False
+    # Agent's own diagnosis from Phase 1 (best effort).
+    root_cause = ""
+    run_dir = find_latest_run_dir(sanitizer)
+    if run_dir is not None:
+        log = find_agent_stdout_log(run_dir)
+        if log is not None:
+            root_cause = extract_root_cause(log)
+    # Crash orientation (best effort; reuse the same parser inject_orientation uses).
+    orientation = ""
+    o = parse_crash_output(bug.get("crash_output") or "", bug.get("crash_type") or "",
+                           bug["project"])
+    if o is not None:
+        orientation = render_orientation(o)
+    directive = build_forced_edit_directive(project=project, root_cause=root_cause,
+                                            orientation=orientation)
+    dest = target_source / "HEURISTICS.md"
+    dest.write_text(directive)
+    ok = dest.exists() and dest.read_text() == directive
+    print(f"[{bug['localId']}] Injected FORCED-EDIT directive ({len(directive)} bytes, "
+          f"verified={ok}, root_cause={len(root_cause)}B) into {dest}")
+    return True
+
+
 def collect_patches(run_dir: Path) -> list[Path]:
     """Find patch diff files the agent produced in this run."""
     return list(run_dir.glob("**/SUBMIT_DIR/*/patches/*.diff"))
@@ -352,9 +427,45 @@ def resolve_autosubmit_patch(*, collected: list, check_passed: bool,
     return autosubmit_diff
 
 
+def find_agent_stdout_log(run_dir: Path) -> Path | None:
+    """Host path of the agent's claude_stdout.log JSONL stream for a run. Written live
+    during the run (bind-mounted LOG_DIR) so it is readable mid-run and after. Newest
+    wins if a run somehow has more than one."""
+    logs = list(run_dir.glob("crs/crs-claude-code/*/LOG_DIR/*/agent/claude_stdout.log"))
+    return max(logs, key=lambda p: p.stat().st_mtime) if logs else None
+
+
+def _authoritative_source_root(project: str) -> str:
+    """The one source tree an edit must land in to become the submitted patch, keyed on
+    the active flow: `/work/agent/clean-src/<project>` when check-patch is enabled (the
+    tree check_patch_instruction tells the agent to edit and check-patch submits from),
+    else `/src/<project>` (the base CLAUDE.md in-place flow)."""
+    if _check_patch_enabled():
+        return f"/work/agent/clean-src/{project}"
+    return f"/src/{project}"
+
+
+def _live_edit_count(sanitizer: str, project: "str | None" = None) -> int:
+    """Edit count for the current (newest) run's agent stream. 0 when the run dir or log
+    does not exist yet (early in a run, or run never started).
+
+    With `project`, only edits inside the authoritative source tree count -- so the
+    forced-edit gate is not satisfied by stray edits to /src, /tmp, or a scratch copy
+    that can never reach check-patch/submission. Without it, counts all edits (unchanged)."""
+    run_dir = find_latest_run_dir(sanitizer)
+    if run_dir is None:
+        return 0
+    log = find_agent_stdout_log(run_dir)
+    if log is None:
+        return 0
+    under = _authoritative_source_root(project) if project is not None else None
+    return agent_edit_count(log, under=under)
+
+
 def copy_session_files(run_dir: Path, output_dir: Path) -> None:
     """Copy claude_stdout.log to output_dir."""
-    for log in run_dir.glob("crs/crs-claude-code/*/LOG_DIR/*/agent/claude_stdout.log"):
+    log = find_agent_stdout_log(run_dir)
+    if log is not None:
         shutil.copy2(log, output_dir / "oss_crs_claude_stdout.log")
 
 
@@ -390,6 +501,82 @@ def parse_token_counts(log_path: Path) -> dict:
         "cache_read_tokens": sum(d["cr"] for d in per_id.values()),
         "cache_write_tokens": sum(d["cw"] for d in per_id.values()),
     }
+
+
+# Edit-family tool_use names this Claude Code CLI emits (MultiEdit kept for older CLI builds).
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit"}
+
+
+def _path_under(file_path, root: str) -> bool:
+    """True if `file_path` names a file at or below `root` (a directory prefix).
+    Guards the boundary so `.../mruby` does not prefix-match `.../mruby-other`."""
+    if not isinstance(file_path, str):
+        return False
+    root = root.rstrip("/")
+    return file_path == root or file_path.startswith(root + "/")
+
+
+def agent_edit_count(log_path: Path, under: "str | None" = None) -> int:
+    """Count edit-family tool_use events (Edit/Write/MultiEdit) in a
+    claude_stdout.log JSONL stream. Missing/unreadable file or malformed lines -> those
+    contribute 0, so the worst case is under-counting to 0 ('treat as no edits').
+
+    When `under` is given, only edits whose `file_path` is inside that source tree
+    count -- so the forced-edit gate measures edits that can actually become the
+    submitted patch, not stray edits to /src, /tmp, or a scratch copy. An edit with a
+    missing/non-string file_path does not count under a scope (safe: treat as no edit)."""
+    n = 0
+    try:
+        text = Path(log_path).read_text()
+    except OSError:
+        return 0
+    for line in text.splitlines():
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        content = obj.get("message", {}).get("content")
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_use" \
+                        and b.get("name") in EDIT_TOOLS:
+                    if under is None:
+                        n += 1
+                    else:
+                        inp = b.get("input")
+                        fp = inp.get("file_path") if isinstance(inp, dict) else None
+                        if _path_under(fp, under):
+                            n += 1
+    return n
+
+
+def extract_root_cause(log_path: Path, min_len: int = 200) -> str:
+    """Return the agent's last substantial (>= min_len chars) assistant text block from
+    the stream log, stripped. Empty string if none / unreadable. This is the agent's own
+    diagnosis, fed back verbatim into the forced-edit directive -- the harness never
+    interprets or rewrites it into a patch."""
+    last = ""
+    try:
+        text = Path(log_path).read_text()
+    except OSError:
+        return ""
+    for line in text.splitlines():
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        content = obj.get("message", {}).get("content")
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    t = (b.get("text") or "").strip()
+                    if len(t) >= min_len:
+                        last = t
+    return last
 
 
 def detect_usage_limit(log_path: Path) -> dict | None:
@@ -487,6 +674,16 @@ def _run_timeout() -> float | None:
     return float(v) if v else None
 
 
+def phase2_timeout(hard_cap: float | None, phase1_elapsed: float,
+                   floor: float = 900.0) -> float | None:
+    """Wall-clock cap for the forced-edit pass: whatever remains of the hard per-run cap
+    after Phase 1, but never less than `floor` so a forced pass always gets a usable
+    budget. No hard cap -> no Phase-2 cap."""
+    if hard_cap is None:
+        return None
+    return max(hard_cap - phase1_elapsed, floor)
+
+
 def terminate_crs_run(*, run=subprocess.run) -> list[str]:
     """Force-remove any live OSS-CRS containers, both phases: the run phase
     (`crs_compose_<runid>-...`, see oss-crs utils.py) and build-target
@@ -505,6 +702,17 @@ def terminate_crs_run(*, run=subprocess.run) -> list[str]:
         run(["docker", "rm", "-f", *ids], capture_output=True, text=True)
         print(f"[cleanup] force-removed {len(ids)} leftover OSS-CRS container(s)")
     return ids
+
+
+def prune_docker_networks(*, run=subprocess.run) -> None:
+    """Reclaim docker networks between the two forced-edit passes. Each oss-crs run
+    leaks ~2 networks and the address pool can exhaust mid-bug now that FORCE_EDIT
+    launches a second run per bug -> a failed compose network reads as a false
+    no_changes. Best-effort; never fails the run."""
+    try:
+        run(["docker", "network", "prune", "-f"], capture_output=True, text=True)
+    except Exception:
+        pass
 
 
 class AbortController:
@@ -634,6 +842,91 @@ def _run_agent_with_timeout(cmd, *, cwd, timeout, popen=subprocess.Popen,
             gate["open"] = False
 
 
+def _run_agent_recon_phase(cmd, *, cwd, hard_cap, recon_cap, edit_probe,
+                           popen=subprocess.Popen, teardown=None,
+                           now=time.monotonic, sleep=time.sleep,
+                           poll_interval=15) -> tuple[bool, bool]:
+    """Run the Phase-1 (recon) agent. Returns (timed_out, forced).
+
+    At `recon_cap` elapsed, check `edit_probe()` exactly once:
+      * 0 edits  -> kill + teardown, return (False, True)  [hand off to forced pass]
+      * >0 edits -> the agent is productively editing; do NOT interrupt, keep running to
+                    `hard_cap`.
+    Natural exit before any cap -> (False, False). Reaching `hard_cap` -> kill + teardown,
+    (True, False). `hard_cap`/`recon_cap` are seconds; None hard_cap = no hard cap."""
+    teardown = teardown or terminate_crs_run
+    proc = popen(cmd, cwd=cwd)
+    start = now()
+    checked_recon = False
+    while True:
+        if proc.poll() is not None:
+            return (False, False)
+        elapsed = now() - start
+        if not checked_recon and elapsed >= recon_cap:
+            checked_recon = True
+            try:
+                no_edits = edit_probe() == 0
+            except Exception:
+                # A probe failure (e.g. PermissionError stat-ing a root-owned log) must
+                # never leak the live run: treat as "still working", don't force-kill.
+                no_edits = False
+            if no_edits:
+                proc.kill()
+                try:
+                    proc.wait(timeout=30)
+                except Exception:
+                    pass
+                teardown()
+                return (False, True)
+        if hard_cap is not None and elapsed >= hard_cap:
+            proc.kill()
+            try:
+                proc.wait(timeout=30)
+            except Exception:
+                pass
+            teardown()
+            return (True, False)
+        sleep(poll_interval)
+
+
+def run_agent_phases(*, run_cmd, cwd, sanitizer, bug, project, hard_cap,
+                     newer_than, exclude, single, recon, inject_forced, edit_probe,
+                     on_forced_handoff=lambda: None,
+                     phase1_elapsed_override=None, now=time.monotonic):
+    """Decide and drive the recon/forced-edit passes. All side-effecting steps are passed
+    in so this is unit-testable:
+      single(cmd, cwd, timeout) -> timed_out      (a normal capped agent run)
+      recon(**kw) -> (timed_out, forced)          (Phase-1 poll runner)
+      inject_forced(sanitizer, bug, project, newer_than, exclude) -> bool
+      edit_probe() -> int                         (edit count for the current run)
+      on_forced_handoff() -> None                 (recycle check service + prune networks;
+                                                    called once on the forced path only)
+    Returns a dict of forced-edit fields for the summary/ledger."""
+    if not _force_edit_enabled():
+        timed_out = single(run_cmd, cwd, hard_cap)
+        return {"timed_out": timed_out, "forced_edit_triggered": False,
+                "phase1_edits": None, "phase2_edits": None, "edit_phase": None}
+
+    t0 = now()
+    timed_out, forced = recon(cmd=run_cmd, cwd=cwd, hard_cap=hard_cap,
+                              recon_cap=_recon_timeout(), edit_probe=edit_probe)
+    phase1_elapsed = phase1_elapsed_override if phase1_elapsed_override is not None \
+        else (now() - t0)
+    phase1_edits = edit_probe()
+    if not forced:
+        return {"timed_out": timed_out, "forced_edit_triggered": False,
+                "phase1_edits": phase1_edits, "phase2_edits": phase1_edits,
+                "edit_phase": "recon" if phase1_edits else None}
+
+    inject_forced(sanitizer, bug, project, newer_than, exclude)
+    on_forced_handoff()
+    timed_out = single(run_cmd, cwd, phase2_timeout(hard_cap, phase1_elapsed))
+    phase2_edits = edit_probe()
+    return {"timed_out": timed_out, "forced_edit_triggered": True,
+            "phase1_edits": phase1_edits, "phase2_edits": phase2_edits,
+            "edit_phase": "forced" if phase2_edits else ("recon" if phase1_edits else None)}
+
+
 def run_oss_crs(bug_id: int, skip_build: bool = False, abort_controller=None,
                 on_phase=None, on_line=None) -> dict:
     """Run crs-claude-code on one ARVO bug. Returns a summary dict.
@@ -743,47 +1036,88 @@ def run_oss_crs(bug_id: int, skip_build: bool = False, abort_controller=None,
     # Holds the exact diff of the latest check-patch PASS, so a validated fix the agent
     # never wrote to /patches/ can still be submitted (see resolve_autosubmit_patch).
     check_autosubmit = output_dir / ".check_passed.diff"
-    check_stop = check_thread = None
-    if _check_patch_enabled():
-        import threading
-        import check_server
-        from build_instance import build_instance
+    import threading
+    import check_server
+    from build_instance import build_instance
+    # Warm the -vul instance metadata once; reused across the recon and forced passes.
+    _instance = build_instance(bug) if _check_patch_enabled() else None
+    # Mutable holder so the finally joins the CURRENT service thread (Phase 2 restarts it).
+    _svc = {"thread": None, "stop": None}
+
+    def _start_check_service():
+        if not _check_patch_enabled():
+            return
         # Fresh marker + saved diff per run: only a PASS from THIS run should let a
         # submission through, and only THIS run's validated diff can be promoted.
         check_marker.unlink(missing_ok=True)
         check_autosubmit.unlink(missing_ok=True)
-        check_stop = threading.Event()
+        stop = threading.Event()
         # Only latch a SHARED_DIR created after now, so a stale dir from a prior/killed
         # run can't win the newest-by-mtime race (observed live: the responder attached
         # to a dead campaign's channel and the agent got no working check-patch).
         svc_start = time.time()
-        check_thread = threading.Thread(
+        t = threading.Thread(
             target=check_server.run_service,
-            args=(bug, build_instance(bug), bug["project"]),
+            args=(bug, _instance, bug["project"]),
             kwargs={"find_dir": lambda: find_shared_dir(sanitizer, newer_than=svc_start),
-                    "stop": check_stop.is_set, "marker_path": check_marker,
+                    "stop": stop.is_set, "marker_path": check_marker,
                     "autosubmit_path": check_autosubmit},
             daemon=True)
-        check_thread.start()
+        t.start()
+        _svc["thread"], _svc["stop"] = t, stop
         _log(f"[{bug_id}] check-patch self-check service running (OSS_CRS_CHECK_PATCH=1)")
 
+    def _stop_check_service():
+        if _svc["stop"] is not None:
+            _svc["stop"].set()
+        if _svc["thread"] is not None:
+            _svc["thread"].join(timeout=30)
+
+    def _recycle_for_phase2():
+        # Between the killed Phase 1 and Phase 2: give Phase 2 a fresh compose-network
+        # budget and a check service latched to ITS new SHARED_DIR (the old thread is
+        # bound to Phase-1's torn-down dir and will never serve Phase 2).
+        _stop_check_service()
+        prune_docker_networks()
+        _start_check_service()
+
+    _start_check_service()
     run_start = time.time()
+    run_cmd = [*base, "run", *compose_args,
+               "--fuzz-proj-path", str(project_dir),
+               "--target-harness", bug["fuzz_target"],
+               "--pov", str(pov_path),
+               "--incremental-build"]
+    def _recon(**kw):
+        return _run_agent_recon_phase(kw.pop("cmd"), **kw)
     try:
-        timed_out, aborted = _run_agent_with_timeout(
-            [*base, "run", *compose_args,
-             "--fuzz-proj-path", str(project_dir),
-             "--target-harness", bug["fuzz_target"],
-             "--pov", str(pov_path),
-             "--incremental-build"],
-            cwd=OSS_CRS_DIR,
-            timeout=timeout,
-            abort_controller=abort_controller,
-            on_line=on_line,
-        )
+        _abort = {"hit": False}
+
+        def _single(cmd, cwd, to):
+            # Wire abort/live-output into every single()-driven agent run (the
+            # non-forced single run and the Phase-2 forced run); capture an abort so
+            # the summary below can report it. (The Phase-1 recon poll runs the agent
+            # directly and is not wired for q-to-abort/on_line -- a known gap.)
+            t, a = _run_agent_with_timeout(
+                cmd, cwd=cwd, timeout=to,
+                abort_controller=abort_controller, on_line=on_line)
+            if a:
+                _abort["hit"] = True
+            return t
+
+        phase_info = run_agent_phases(
+            run_cmd=run_cmd, cwd=OSS_CRS_DIR, sanitizer=sanitizer, bug=bug,
+            project=bug["project"], hard_cap=timeout,
+            newer_than=build_start, exclude=ts_before,
+            single=_single,
+            recon=_recon,
+            inject_forced=inject_forced_edit,
+            edit_probe=lambda: _live_edit_count(sanitizer, bug["project"]),
+            on_forced_handoff=_recycle_for_phase2)
+        timed_out = phase_info["timed_out"]
+        aborted = _abort["hit"]
     finally:
-        if check_stop is not None:
-            check_stop.set()
-            check_thread.join(timeout=30)
+        _stop_check_service()
     _phase("agent", "done")
     run_elapsed = time.time() - run_start
     if timed_out:
@@ -846,6 +1180,10 @@ def run_oss_crs(bug_id: int, skip_build: bool = False, abort_controller=None,
         # auto_submitted: this run's patch is a check-patch-validated diff we promoted
         # because the agent earned a PASS but never wrote one to /patches/.
         "auto_submitted": auto_submitted,
+        "forced_edit_triggered": phase_info["forced_edit_triggered"],
+        "edit_phase": phase_info["edit_phase"],
+        "phase1_edits": phase_info["phase1_edits"],
+        "phase2_edits": phase_info["phase2_edits"],
         "patches": n_patches,
         "patch_files": patch_files,
         "tokens": tokens,
