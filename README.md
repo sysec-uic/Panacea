@@ -7,16 +7,18 @@ reproducible crashes from fuzzing (the [ARVO](https://github.com/n132/ARVO) data
 OSS-Fuzz bugs), drives an AI repair agent to fix each one, verifies the fix for real,
 and, as the research bet, **learns from each fix so it gets better at the next one**.
 
-## Current status (2026-07-29)
+## Current status (2026-07-31)
 
 Two parallel efforts are running the same experiment on different backends:
 
-- **Claude/OAuth pass:** control 26/30 confirmed, treatment 27/30 confirmed (both
-  counts out of 30 minus 3 permanent, environment-level skips), both 100% fix rate
-  after independent re-verification. Treatment has completed every runnable bug;
-  control has 1 bug left, currently rerunning. The headline finding so far:
-  treatment's token savings come from avoiding retries on a handful of bugs, not
-  from making every attempt cheaper -- see [`EVALUATION.md`](EVALUATION.md) for
+- **Claude/OAuth pass:** complete on both arms, 27/30 attempted each (30 minus
+  3 permanent, environment-level skips). Control 26/27 confirmed (96.3% fix
+  rate), treatment 27/27 (100%), the one control miss is also the only failure
+  anywhere in the dataset. The headline finding: treatment's token savings
+  come from avoiding retries on a handful of bugs, not from making every
+  attempt cheaper, and that advantage doesn't concentrate in the dataset's
+  single most repeated bug family the way you'd expect -- see
+  [`EVALUATION.md`](EVALUATION.md) for
   the full methodology and
   current results.
 - **Local-model campaign:** the bottleneck has moved twice as each layer was fixed.
