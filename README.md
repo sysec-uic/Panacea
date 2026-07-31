@@ -21,18 +21,17 @@ Two parallel efforts are running the same experiment on different backends:
   [`EVALUATION.md`](EVALUATION.md) for
   the full methodology and
   current results.
-- **Local-model campaign:** the bottleneck has moved twice as each layer was fixed.
-  A July 10-13 run (0 of 3 bugs in ~57h) pointed at raw serving speed. Two Jul 14-15
-  runs pointed at agent behavior: the model stalled in read-only recon, once trapping
-  itself in plan mode for 26+ minutes, and never submitted a patch. A Jul 15 campaign
-  shipped countermeasures for that (see below) and surfaced the next layer: even when
-  the agent works productively, it is fixing blind. It receives the raw proof-of-crash
-  input but not the sanitizer trace, and it cannot rebuild the fuzzer in its own
-  container to reproduce the crash, so it guesses the wrong subsystem instead of
-  following the trace to the faulting frame. See the postmortems
-  [`docs/2026-07-13-learn-loop-local-model-campaign.md`](docs/2026-07-13-learn-loop-local-model-campaign.md)
-  and
-  [`docs/2026-07-15-check-patch-gate-live-validation.md`](docs/2026-07-15-check-patch-gate-live-validation.md).
+- **Local-model campaign:** cleared a sequence of infrastructure walls, raw serving
+  speed, agent behavior (plan-mode stalling), turn-latency decay under growing
+  context, and two harness bugs (a forced-edit gate miscounting stray edits, and
+  check-patch self-poisoning across repeated checks). A stronger candidate model was
+  evaluated and reverted, good reasoning, but it could not drive the agentic loop.
+  With the incumbent model and a hardened harness, a real solve-rate measurement
+  across a spread of bug difficulty is now in hand, oracle-confirmed on the
+  tractable, recurring bug classes. See
+  [`docs/2026-07-30-pipeline-fixes-and-local-model-evaluation.md`](docs/2026-07-30-pipeline-fixes-and-local-model-evaluation.md)
+  for the walls-cleared writeup, or the earlier postmortems under `docs/` for how
+  each wall before that one was found and cleared.
 
 Infrastructure hardened along the way, shared by both passes:
 

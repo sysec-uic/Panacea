@@ -1,5 +1,17 @@
 # Evaluation Plan & Results
 
+## Summary
+
+This is the results writeup for the mruby heuristic-learning study: does injecting
+a markdown playbook of lessons from earlier solved bugs help Claude Code fix later
+bugs, and if so, how. Short answer: yes, but narrowly. The playbook does not make
+individual repair attempts cheaper or the agent generally sharper; it prevents
+specific, previously-seen bug shapes from needing a retry. Every bit of this
+pilot's net efficiency gain traces to a handful of bugs, and that effect does not
+even concentrate in the dataset's single most common bug family, the opposite of
+the naive expectation going in. Full methodology, data, and reasoning are below;
+the code artifact is the rest of this repository.
+
 ## Question
 
 Does injecting a playbook of lessons, extracted from earlier solved bugs, help
@@ -120,6 +132,29 @@ smaller families -- one each in Karatsuba, type confusion, GC/arena, and MSan.
 The advantage tracks specific bug shapes the playbook happens to have seen
 before, not the single most repeated shape in the dataset.
 
+**A checked example of the actual mechanism, `472538295`:** an earlier bug,
+`456317307`, had already taught the playbook a contrastive lesson: "when a bint
+op crashes, check whether its operand came from a normalizing constructor
+(`mrb_bint_from_bytes`/`from_int64` return a fixnum when the value fits `mrb_int`);
+insert `mrb_as_bint()` to re-promote before the op rather than concluding no fix
+exists. Never emit an empty patch when the crash is a live type-confusion deref."
+`472538295` is the same underlying shape (`mrb_as_bint` / `type-confusion` / `segv`),
+just reached through `mruby-rational` instead of a bytes constructor. Checked what
+control actually did without that lesson: its first attempt came back `no_changes`,
+exactly the failure mode the lesson warns against. Treatment, with the lesson
+already in `HEURISTICS.md`, solved it in one attempt.
+
+Checked the other 3 retry-avoidance bugs the same way (only counting lessons that
+existed, by playbook version, before each bug ran, and only counting
+tag overlap specific enough to mean something, `bigint`/`mruby`/`asan`/`msan`
+alone don't count): `473582282` has a moderate match (3 prior MSan/codegen
+lessons existed); `472567524` has only a weak, generic match (`use-after-free`
+broadly, not the specific arena/callback mechanism); `448702064` has no
+meaningful prior match at all, it was the first Karatsuba-family bug in the
+sequence, so there was nothing yet to recognize. So the mechanism above is real
+and checkable for at least 2 of the 4 bugs driving the whole result, not
+established for the other 2.
+
 **Note on `462331852`:** this bug originally needed 3 attempts on control and
 surfaced two of the confirmed retry-causes below (a safeguard refusal and a
 container OOM). It was later rerun from a clean slate to get fully auto-archived
@@ -189,6 +224,61 @@ infrastructure (holdout-safe playbook injection, independent verification, a
 differential oracle) needed to scale the same method to a larger bug set or more
 projects later. See `arvo-eval/transfer/` for the (currently paused) cross-project
 extension of this idea.
+
+## Possible future plans
+
+### Near-term, scoped follow-ons
+
+**An automated retry-cause classifier.** Every retry-cause finding above came from
+reading archived transcripts by hand, a deliberate choice this cycle given the time
+available, but it doesn't scale and hasn't been run systematically across every
+retry in the dataset. Building a classifier over the archived per-attempt logs
+(matching on known signatures: the exact refusal string, exit code 137, HTTP
+5xx/529 patterns) would let the efficiency numbers be reported corrected for
+infra/refusal noise instead of caveated against it.
+
+**Retrieval-based playbook injection.** The current design compresses the entire
+accumulated playbook into one file every time it grows past a size cap, a known,
+worsening squeeze (already compressed roughly 4x by playbook version 16). The bug
+family finding above suggests a sharper fix: inject only the heuristics whose tags
+actually match the current bug's crash signature, rather than the whole history
+compressed down. This is also the field's own answer to the same problem (see
+"the other data point" investigation), not a novel idea, but not yet built here.
+
+**Cross-project transfer.** Most projects don't have 30 bugs of their own to build
+a same-project playbook from. The paused pilot under `arvo-eval/transfer/` asks
+whether a lesson learned on one project's bug helps a *different* project's bug of
+the same crash class, directly relevant given how concentrated this dataset's own
+bug families turned out to be.
+
+**A Sonnet-vs-Opus ablation.** All results here run the repair agent on Opus. A
+same-design run on Sonnet would give a real cost/capability tradeoff point,
+whether the playbook's effect (or lack of it, on the dominant family) holds, grows,
+or shrinks on a cheaper model. A `compose-oauth-sonnet.yaml` variant already
+exists; the run itself hasn't been done.
+
+**Systematic audit of pre-fix ledger entries.** The `repair_loop.py` bug described
+above (a real diff silently discarded on a `usage_limit` signal) was found and
+fixed after already affecting two bugs in this dataset, both recovered by hand.
+Whether it silently cost data on any *other* already-ledgered bug before the fix
+was never checked systematically, on purpose, to avoid new tooling this late in
+the cycle. A clean audit of historical runs against the fixed code would close
+that gap.
+
+### Bigger-picture, unscoped directions
+
+**Executable memory instead of descriptive memory.** Every lesson in this study is
+text the agent has to read, remember, and choose to apply on its own. The
+local-model track's own postmortems found a recurring failure mode in exactly that
+shape, the agent reading an instruction to *go do something* and never following
+through (the orientation-pointer bug is one documented instance). A different
+design would have the agent write and refine actual reusable tooling, small
+scripts that encode a diagnostic or fix pattern operationally, that later runs can
+just *execute* instead of re-deriving from a description each time. Whether that
+survives the same holdout/deployment-faithful constraints this study enforces, and
+whether it actually outperforms markdown injection rather than just being harder
+to get right, is genuinely open, worth a real design doc before the next cycle,
+not a small follow-on.
 
 ## Running it yourself
 
