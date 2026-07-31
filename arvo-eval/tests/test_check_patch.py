@@ -82,6 +82,32 @@ def test_run_check_empty_diff_is_no_changes():
     assert ex.calls == []
 
 
+def test_run_check_reports_steps_in_order_via_on_step():
+    # Live-status raw feed hook: run_check blocks on apply/compile/PoC/test with no
+    # other insight, so on_step must fire once per identifiable step, in order.
+    ex = make_exec([("apply -p1", _FakeProc(0)), ("build.sh", _FakeProc(0)),
+                    ("compile", _FakeProc(0)), ("arvo", _FakeProc(0, "clean run")),
+                    ("rake test", _FakeProc(0))])
+    steps = []
+    run_check(BUG, DIFF, ex, project="mruby", on_step=steps.append)
+    assert steps == ["apply patch", "compile", "run PoC", "run rake test"]
+
+
+def test_run_check_skips_test_step_when_still_crashing():
+    ex = make_exec([("apply -p1", _FakeProc(0)), ("compile", _FakeProc(0)),
+                    ("arvo", _FakeProc(1, "==1==ERROR: AddressSanitizer: heap-use-after-free"))])
+    steps = []
+    run_check(BUG, DIFF, ex, project="mruby", on_step=steps.append)
+    assert steps == ["apply patch", "compile", "run PoC"]
+
+
+def test_run_check_without_on_step_does_not_raise():
+    ex = make_exec([("apply -p1", _FakeProc(0)), ("compile", _FakeProc(0)),
+                    ("arvo", _FakeProc(0, "clean")), ("rake test", _FakeProc(0))])
+    v = run_check(BUG, DIFF, ex, project="mruby")
+    assert v["classification"] == "verified_correct"
+
+
 # check_feedback: the agent must hear a clear PASS as well as actionable failures.
 def test_feedback_pass_tells_agent_to_submit():
     fb = check_feedback({"classification": "verified_correct"})

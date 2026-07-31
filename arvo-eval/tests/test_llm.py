@@ -1,7 +1,8 @@
 import json
+import subprocess
 import pytest
-from llm import (call_llm, with_retries, _client_args, OAUTH_BETA,
-                 _select_backend, ClaudeCLIClient, OpenAIClient, have_credentials)
+from llm import (call_llm, with_retries, _client_args, OAUTH_BETA, _is_retriable,
+                 _select_backend, ClaudeCLIClient, CLICallError, OpenAIClient, have_credentials)
 
 
 class Boom(Exception):
@@ -270,3 +271,64 @@ def test_cli_client_raises_on_nonzero_exit(monkeypatch):
     with pytest.raises(RuntimeError, match="claude CLI exited 1"):
         ClaudeCLIClient().messages.create(model="m", max_tokens=1, system="",
                                           messages=[{"role": "user", "content": "x"}])
+
+
+# --- CLI backend failures are retriable, not just API status codes ----------
+
+def test_with_retries_prints_notice_for_non_429_retriable_failure(capsys):
+    calls = {"n": 0}
+
+    def fn():
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise CLICallError("claude CLI reported an error: None")
+        return "ok"
+
+    out = with_retries(fn, sleep=lambda s: None, backoff=lambda exc, attempt: 0)
+    assert out == "ok"
+    err = capsys.readouterr().err
+    assert "CLICallError" in err and "retrying" in err
+
+
+def test_is_retriable_treats_cli_call_error_as_retriable():
+    assert _is_retriable(CLICallError("claude CLI reported an error: None")) is True
+
+
+def test_is_retriable_treats_subprocess_timeout_as_retriable():
+    assert _is_retriable(subprocess.TimeoutExpired(cmd="claude", timeout=600)) is True
+
+
+def test_call_llm_retries_transient_cli_error_then_succeeds(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_run(cmd, input, capture_output, text, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return type("P", (), {"returncode": 0,
+                                  "stdout": json.dumps({"is_error": True, "result": None}),
+                                  "stderr": ""})()
+        return type("P", (), {"returncode": 0,
+                              "stdout": json.dumps({"is_error": False, "result": "recovered"}),
+                              "stderr": ""})()
+
+    monkeypatch.setattr("llm.subprocess.run", fake_run)
+    out = call_llm("hi", client=ClaudeCLIClient(), sleep=lambda s: None)
+    assert out == "recovered"
+    assert calls["n"] == 2
+
+
+def test_call_llm_retries_after_cli_timeout_then_succeeds(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_run(cmd, input, capture_output, text, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
+        return type("P", (), {"returncode": 0,
+                              "stdout": json.dumps({"is_error": False, "result": "recovered"}),
+                              "stderr": ""})()
+
+    monkeypatch.setattr("llm.subprocess.run", fake_run)
+    out = call_llm("hi", client=ClaudeCLIClient(), sleep=lambda s: None)
+    assert out == "recovered"
+    assert calls["n"] == 2

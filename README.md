@@ -7,14 +7,18 @@ reproducible crashes from fuzzing (the [ARVO](https://github.com/n132/ARVO) data
 OSS-Fuzz bugs), drives an AI repair agent to fix each one, verifies the fix for real,
 and, as the research bet, **learns from each fix so it gets better at the next one**.
 
-## Current status (2026-07-15)
+## Current status (2026-07-29)
 
 Two parallel efforts are running the same experiment on different backends:
 
-- **Claude/OAuth pass:** control 13/30 confirmed, treatment 3/30, both 100% fix rate
-  after independent re-verification. Two control bugs are being re-run after a real
-  correctness-gate bug (spurious failures on `afl`/`msan` bugs) was found and fixed.
-  See [`EVALUATION.md`](EVALUATION.md) for the full methodology and current results.
+- **Claude/OAuth pass:** control 26/30 confirmed, treatment 27/30 confirmed (both
+  counts out of 30 minus 3 permanent, environment-level skips), both 100% fix rate
+  after independent re-verification. Treatment has completed every runnable bug;
+  control has 1 bug left, currently rerunning. The headline finding so far:
+  treatment's token savings come from avoiding retries on a handful of bugs, not
+  from making every attempt cheaper -- see [`EVALUATION.md`](EVALUATION.md) for
+  the full methodology and
+  current results.
 - **Local-model campaign:** the bottleneck has moved twice as each layer was fixed.
   A July 10-13 run (0 of 3 bugs in ~57h) pointed at raw serving speed. Two Jul 14-15
   runs pointed at agent behavior: the model stalled in read-only recon, once trapping
@@ -127,6 +131,6 @@ OSS_CRS_RUN_TIMEOUT=7200 \
 python3 learn_loop.py --limit 3
 ```
 
-Results accumulate in `arvo-eval/results/learn/ledger.jsonl`; the accumulated playbook of
-learned lessons is under `arvo-eval/playbook/` (committed only as a finished snapshot, not
-mid-experiment).
+Results accumulate in `arvo-eval/results/learn/ledger.<pass>.jsonl` (one file per pass);
+the accumulated playbook of learned lessons is under `arvo-eval/playbook/` (committed only
+as a finished snapshot, not mid-experiment).

@@ -11,6 +11,8 @@ questions, how the pieces fit together). This file is the runbook.
 | `learn_loop.py` | The chronological control/treatment repair-and-learn loop (main entry point) |
 | `arvo_oss_crs.py` | Drives the OSS-CRS repair agent on one bug (wall-clock cap, docker image cleanup, `HEURISTICS.md` injection) |
 | `repair_loop.py` | Per-bug retry loop with deployment-faithful feedback between attempts |
+| `attempt_checkpoint.py` | Durable per-attempt checkpoints so a killed run resumes mid-bug |
+| `live_status.py` | Generic live terminal panel (`LEARN_LIVE_UI=1`) — phases, stats, tallies, q/Ctrl-C to abort |
 | `verify_fix.py` | Real verification: build, re-run PoC, run tests, classify |
 | `differential_oracle.py` | Post-hoc lesson-quality grader vs the `-fix` image |
 | `playbook_store.py` / `injector.py` | Playbook state (load/save/render) and `HEURISTICS.md` injection |
@@ -18,7 +20,7 @@ questions, how the pieces fit together). This file is the runbook.
 | `llm.py` | LLM backend used by the extractor/curator/grader (Claude Code CLI, API key, or local model) |
 | `check_server.py` | Host-side responder for the agent's in-turn self-check (in progress) |
 | `mruby_bugs.py` / `build_instance.py` | Bug ordering and per-bug ARVO instance loading |
-| `results/` | Git-ignored. Per-bug outputs and `results/learn/ledger.jsonl` |
+| `results/` | Git-ignored. Per-bug outputs and `results/learn/ledger.<pass>.jsonl` |
 | `playbook/` | Tracked. Accumulated `playbook_state_<pass>.json` per pass |
 | `tests/` | Pure-logic unit tests, no Docker/network |
 | [`legacy/`](legacy/README.md) | Pre-`learn_loop.py` single-bug runner (mini-SWE-agent). Superseded; kept for reference |
@@ -62,11 +64,11 @@ ARVO images don't match OSS-Fuzz's expected project format, so `arvo_oss_crs.py`
 
 ### Token counts
 
-Token usage is captured automatically per bug in `results/learn/ledger.jsonl` (the `tokens`
+Token usage is captured automatically per bug in `results/learn/ledger.<pass>.jsonl` (the `tokens`
 field). To view a summary across all runs:
 
 ```bash
-cat results/learn/ledger.jsonl | python3 -c "
+cat results/learn/ledger.control.jsonl results/learn/ledger.treatment.jsonl | python3 -c "
 import json, sys
 print(f'{'BUG_ID':<15} {'INPUT':>8} {'OUTPUT':>8} {'CACHE_READ':>12} {'CACHE_WRITE':>12}')
 for line in sys.stdin:
@@ -169,6 +171,55 @@ feedback telling the agent to commit to a fix. This stops one flailing attempt f
 eating many hours (the local-model campaign had a single attempt run 36h; see
 `docs/2026-07-13-learn-loop-local-model-campaign.md`).
 
+**Attempt-level resume:** each attempt is checkpointed to
+`results/<pass>/<bug_id>/attempts.jsonl` (`attempt_checkpoint.py`) as it completes. If
+`learn_loop.py` is killed mid-bug for any reason, just re-run the exact same command —
+it reads the checkpoint and resumes at the next attempt number instead of restarting the
+bug's whole `LEARN_MAX_ATTEMPTS` budget. No flag needed. The checkpoint is cleared once
+the bug's outcome lands in the ledger. This sits one level below the existing bug-level
+resume (a bug already in the ledger is always skipped) — this one covers a bug still
+*in progress*.
+
+**Usage-cap handling:** a Claude Code usage-cap cutoff (a `rate_limit_event` with
+`status: rejected`, or a terminal `api_error_status: 429`) is detected directly from the
+CLI's own stream-json output (`arvo_oss_crs.detect_usage_limit`) and treated differently
+from a genuine failed attempt: it is **not** checkpointed — a usage cutoff costs zero
+real attempts, so the next resume retries the *same* attempt number — and nothing is
+written to the ledger. Since the next bug would hit the identical cap within seconds,
+the whole pass stops there instead of grinding through the rest of `bugs`, and prints
+the reset time the CLI itself reports. Re-run the same command once usage resets.
+
+### Live status UI (optional)
+
+Set `LEARN_LIVE_UI=1` to replace the raw OSS-CRS log spam with a live terminal panel
+(`live_status.py`, generic/pipeline-agnostic — nothing in it knows about ARVO or mruby)
+showing real phase progress (prepare → build target → running agent → verify fix →
+differential oracle), a playbook stat (treatment only) and control/treatment tallies
+straight from the ledger:
+
+```bash
+LEARN_LIVE_UI=1 ARVO_DB_PATH=arvo_new.db LEARN_PASS=control python3 learn_loop.py --bugs <id>
+```
+
+Needs a real interactive terminal (a backgrounded/non-tty run silently falls back to
+normal behavior). Keys:
+- `v` — reveal/hide the last ~20 lines of real, captured OSS-CRS output. The
+  build-target and run subprocesses are piped through `on_line` instead of inheriting
+  the terminal directly, so nothing prints outside the panel while it's up.
+- `q` or Ctrl-C — abort cleanly. Sends a real `SIGTERM` to whichever OSS-CRS subprocess
+  is currently live and relies on OSS-CRS's own graceful shutdown to tear down its
+  docker containers (verified against real runs, both during build-target and during
+  the agent phase). An aborted attempt is **not** checkpointed and **not** written to
+  the ledger — same zero-cost-attempt treatment as a usage-cap cutoff — so re-running
+  the same command resumes cleanly.
+
+`verify_fix.verify()` and `differential_oracle.grade()` are wrapped (`_make_verify` /
+`_make_grade` in `learn_loop.py`) with the same start/done phase timing as the agent
+phases — neither module knows about the panel itself, the wrapping just brackets the
+existing calls. The "verify fix" row only activates on attempts with a real diff to
+check (an empty/unchecked diff skips verify() entirely); "differential oracle" only
+activates once per bug, after a solve.
+
 ### Running the experiment
 
 Two passes over the same chronological ordering — a control (no playbook injected)
@@ -185,7 +236,7 @@ ARVO_DB_PATH=arvo_new.db LEARN_PASS=control   python3 learn_loop.py
 ARVO_DB_PATH=arvo_new.db LEARN_PASS=treatment python3 learn_loop.py
 ```
 
-Per-run records accumulate in `results/learn/ledger.jsonl`. The accumulated playbook
+Per-run records accumulate in `results/learn/ledger.<pass>.jsonl`. The accumulated playbook
 state is `playbook/playbook_state_<pass>.json`.
 
 **Local model:** `llm.py` reads `LLM_MODEL` and `LLM_BASE_URL` from the environment, so
@@ -235,9 +286,8 @@ accumulated playbook exists) between the two passes:
 ```bash
 PYTHONPATH=. python3 -c "
 from ledger import read_records
-r = read_records('results/learn/ledger.jsonl')
 for p in ('control','treatment'):
-    rows = [x for x in r if x['pass']==p]
+    rows = read_records(f'results/learn/ledger.{p}.jsonl')
     tail = rows[len(rows)//3:]   # later two-thirds
     ok = sum(1 for x in tail if x['classification']=='verified_correct')
     print(p, 'tail verified_correct:', ok, '/', len(tail))

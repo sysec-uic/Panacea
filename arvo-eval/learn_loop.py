@@ -8,7 +8,9 @@ learned only from SOLVED bugs, and added to the store AFTER the bug is evaluated
     accepted attempts (richer; warns future bugs off the dead end);
   - solved on the first try -> a plain success lesson.
 """
+import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -18,6 +20,7 @@ from curator import maybe_compress
 from ledger import append_record, read_records
 from mruby_bugs import mruby_bug_ids
 from repair_loop import repair_with_retries
+from attempt_checkpoint import read_checkpoint, append_checkpoint, clear_checkpoint
 
 
 RESULTS_BASE = Path(__file__).parent / "results"
@@ -28,16 +31,50 @@ def _agent_results_dir(bug_id):
     return RESULTS_BASE / _pass / str(bug_id) if _pass else RESULTS_BASE / str(bug_id)
 
 
-def _default_agent(bug_id, project_dir, skip_build):
+def _archive_attempt(bug_id, record):
+    """Copy this attempt's run files into attempt_logs/attempt_<n>/ before the
+    next attempt overwrites the fixed results dir every attempt shares
+    (_agent_results_dir(bug_id) -- oss_crs_claude_stdout.log, oss_crs_patch_*.diff,
+    oss_crs_result.json, patch.diff, verification.json). Without this, only the
+    LAST attempt's files survive a multi-attempt bug -- nothing to inspect for
+    earlier rejected attempts after the fact.
+
+    Also writes `record` itself as record.json alongside the copied files, since
+    verify_fix.verify() is skipped entirely for a no-diff attempt and would
+    otherwise leave a stale verification.json (from some earlier attempt) sitting
+    in the archive with nothing marking it as not belonging to this attempt.
+
+    A no-op if the results dir doesn't exist yet -- true for a bug whose agent
+    never actually ran (e.g. a stub `agent=` collaborator in tests), nothing to
+    archive in that case."""
+    results_dir = _agent_results_dir(bug_id)
+    if not results_dir.exists():
+        return
+    dest = results_dir / "attempt_logs" / f"attempt_{record['attempt']}"
+    dest.mkdir(parents=True, exist_ok=True)
+    for f in results_dir.iterdir():
+        if f.is_file():
+            shutil.copy2(f, dest / f.name)
+    (dest / "record.json").write_text(json.dumps(record, indent=2))
+
+
+def _default_agent(bug_id, project_dir, skip_build, abort_controller=None, on_phase=None,
+                   on_line=None):
     """Real agent: drive OSS-CRS, then return the chosen patch + trajectory tail.
 
     Only patches listed in THIS run's summary count. Globbing the results dir
     resurrected stale oss_crs_patch_*.diff files from earlier runs whenever the
     agent produced nothing, so a dead run got verified (and fed back on) as if it
     had emitted the old patch.
+
+    `abort_controller`, `on_phase`, and `on_line` are passed straight through to
+    run_oss_crs -- see _make_agent, which binds real ones in for a live-status-panel
+    run.
     """
     import arvo_oss_crs
-    summary = arvo_oss_crs.run_oss_crs(bug_id, skip_build=skip_build)
+    summary = arvo_oss_crs.run_oss_crs(bug_id, skip_build=skip_build,
+                                       abort_controller=abort_controller, on_phase=on_phase,
+                                       on_line=on_line)
     results_dir = _agent_results_dir(bug_id)
     patch_files = [Path(p) for p in summary.get("patch_files") or []]
     diff = patch_files[0].read_text() if patch_files and patch_files[0].exists() else ""
@@ -50,17 +87,156 @@ def _default_agent(bug_id, project_dir, skip_build):
     return {"diff": diff, "trajectory_summary": trajectory, "summary": summary,
             "timed_out": summary.get("timed_out", False),
             "check_required": summary.get("check_required", False),
-            "check_passed": summary.get("check_passed", False)}
+            "check_passed": summary.get("check_passed", False),
+            "usage_limit": summary.get("usage_limit"),
+            "aborted": summary.get("aborted", False)}
 
 
-def _default_verify(bug_id, diff):
+def _make_agent(abort_controller=None, on_phase=None, before_attempt=None, on_line=None):
+    """Bind abort_controller/on_phase/before_attempt/on_line into a fresh
+    agent(bug_id, project_dir, skip_build) callable, keeping that 3-arg contract
+    stable for every existing caller/test (run_pass's attempt_agent never needs to
+    know about any of these). `before_attempt(bug_id)`, if given, fires once per
+    agent() call -- each one is a fresh run_oss_crs invocation, so a PhaseTracker
+    resets here."""
+    def agent(bug_id, project_dir, skip_build):
+        if before_attempt is not None:
+            before_attempt(bug_id)
+        return _default_agent(bug_id, project_dir, skip_build,
+                              abort_controller=abort_controller, on_phase=on_phase,
+                              on_line=on_line)
+    return agent
+
+
+PHASE_LABELS = {
+    "prepare": "prepare environment",
+    "build": "build target",
+    "agent": "running agent",
+    "verify": "verify fix · rebuild + PoC + rake test",
+    "grade": "differential oracle · 6 probes + PoC",
+}
+PHASE_ORDER = ["prepare", "build", "agent", "verify", "grade"]
+
+
+class PhaseTracker:
+    """Translates arvo_oss_crs's on_phase(key, event) callbacks into live_status
+    Phase updates for one LiveStatus panel. Call reset_for_bug(bug_id) at the start
+    of each attempt (each agent() call is one fresh run_oss_crs invocation, so
+    phases always restart), then pass .on_phase as the on_phase= callback.
+
+    Kept independent of live_status's Phase/PhaseStatus imports at module scope so
+    this stays easy to unit test without rich/terminal machinery -- imported lazily
+    inside the methods that need it.
+    """
+
+    def __init__(self, status):
+        self.status = status
+        self._phases = []
+        self._start_times = {}
+        self._attempt_counts = {}
+
+    def reset_for_bug(self, bug_id) -> int:
+        from live_status import Phase
+        n = self._attempt_counts.get(bug_id, 0) + 1
+        self._attempt_counts[bug_id] = n
+        self._phases = [Phase(PHASE_LABELS[k]) for k in PHASE_ORDER]
+        self._start_times = {}
+        self.status.set_phases(list(self._phases))
+        return n
+
+    def on_phase(self, key, event) -> None:
+        import time
+        from live_status import Phase, PhaseStatus
+        if key not in PHASE_ORDER:
+            return
+        idx = PHASE_ORDER.index(key)
+        if event == "start":
+            self._start_times[key] = time.time()
+            self._phases[idx] = Phase(PHASE_LABELS[key], PhaseStatus.ACTIVE)
+        elif event == "done":
+            elapsed = time.time() - self._start_times.get(key, time.time())
+            self._phases[idx] = Phase(PHASE_LABELS[key], PhaseStatus.DONE, f"{elapsed:.0f}s")
+        self.status.set_phases(list(self._phases))
+
+
+def pass_tallies(learn_dir):
+    """[Tally("control", verified, total), Tally("treatment", ...)] for the panel's
+    footer line -- always both passes, so the footer compares the whole campaign
+    regardless of which pass is currently running.
+
+    Control and treatment write separate ledger.<pass>.jsonl files (see the
+    per-pass ledger split), so this reads both from `learn_dir` directly instead
+    of taking a single ledger_path -- passing the old shared ledger.jsonl here
+    would silently show the other pass as 0/0 forever, since that file no longer
+    receives writes for it at all."""
+    from live_status import Tally
+    learn_dir = Path(learn_dir)
+    tallies = []
+    for pass_name in ("control", "treatment"):
+        try:
+            records = read_records(learn_dir / f"ledger.{pass_name}.jsonl")
+        except (OSError, ValueError):
+            records = []
+        rows = [r for r in records if r.get("pass") == pass_name]
+        verified = sum(1 for r in rows if r.get("classification") == "verified_correct")
+        tallies.append(Tally(pass_name, verified, len(rows)))
+    return tallies
+
+
+def playbook_stat(state_path):
+    """{'playbook': 'v7 · 14 heuristics'} for the panel's stat line, or {} if
+    the pass doesn't inject (control) or the state can't be read."""
+    try:
+        state = load_state(state_path)
+    except (OSError, ValueError, KeyError):
+        return {}
+    heuristics = state.get("heuristics", [])
+    return {"playbook": f"v{state.get('version', 0)} · {len(heuristics)} heuristics"}
+
+
+def _default_verify(bug_id, diff, quiet=False, on_step=None):
     """Real verification: rebuild in a fresh -vul container, re-run the PoC, run the
     correctness gate. verify_fix reads results/<pass>/<id>/patch.diff, which
-    _default_agent bridges from the OSS-CRS patch naming."""
+    _default_agent bridges from the OSS-CRS patch naming. `quiet`/`on_step` are
+    passed straight through to verify_fix.verify -- see _make_verify."""
     if not diff.strip():
         return {"classification": "no_changes"}
     import verify_fix
-    return verify_fix.verify(bug_id)
+    return verify_fix.verify(bug_id, quiet=quiet, on_step=on_step)
+
+
+def _make_verify(on_phase=None, on_step=None):
+    """Wrap _default_verify with "verify" phase start/done timing for the live status
+    panel. verify_fix knows nothing about phases itself -- this just brackets the
+    (already synchronous, already slow) call, same as _make_agent does for
+    run_oss_crs's own on_phase callbacks. Only called when there's a real diff to
+    check (repair_loop short-circuits verify() entirely on an empty/unchecked diff),
+    so the phase legitimately stays pending on those attempts.
+
+    Also passes quiet=True through to verify_fix (whenever a panel is actually up,
+    i.e. on_phase is given) so its own prints don't land straight in the terminal
+    and corrupt the panel's redraw -- the same reason arvo_oss_crs.py suppresses its
+    own prints via `_log`/`live_mode` for the prepare/build/agent phases.
+
+    `on_step`, given as status.feed_raw by the live-UI caller, gives the raw panel
+    real insight into verify_fix's apply/compile/PoC/test steps instead of a bare
+    spinner for however long the whole blocking call takes. Tagged with a
+    "▸ verify: " prefix so these synthesized status lines are visually
+    distinguishable from the raw OSS-CRS subprocess output sharing the same feed."""
+    def _tagged_step(msg):
+        if on_step is not None:
+            on_step(f"▸ verify: {msg}")
+
+    def verify(bug_id, diff):
+        if on_phase is not None:
+            on_phase("verify", "start")
+        try:
+            return _default_verify(bug_id, diff, quiet=on_phase is not None,
+                                   on_step=_tagged_step if on_step is not None else None)
+        finally:
+            if on_phase is not None:
+                on_phase("verify", "done")
+    return verify
 
 
 def _default_extract(bug, diff, trajectory_summary, verdict):
@@ -74,9 +250,35 @@ def _default_contrastive(bug, rejected_diff, accepted_diff, rejected_verdict):
                                          accepted_diff=accepted_diff, rejected_verdict=rejected_verdict)
 
 
-def _default_grade(bug, diff):
+def _default_grade(bug, diff, on_step=None):
     from differential_oracle import grade
-    return grade(bug, diff)
+    return grade(bug, diff, on_step=on_step)
+
+
+def _make_grade(on_phase=None, on_step=None):
+    """Wrap _default_grade with "grade" phase start/done timing, mirroring
+    _make_verify. Only fires once per bug -- run_pass calls grade() a single time,
+    after a solve -- so the row stays pending on bugs that never got fixed.
+
+    `on_step`, given as status.feed_raw by the live-UI caller, surfaces the
+    oracle's build/start-container/PoC/probe steps in the raw panel -- see
+    differential_oracle.grade's on_step docstring. Tagged with a "▸ oracle: "
+    prefix, mirroring _make_verify's "▸ verify: " tag, so these are visually
+    distinguishable from the raw OSS-CRS subprocess output sharing the same feed."""
+    def _tagged_step(msg):
+        if on_step is not None:
+            on_step(f"▸ oracle: {msg}")
+
+    def grade(bug, diff):
+        if on_phase is not None:
+            on_phase("grade", "start")
+        try:
+            return _default_grade(bug, diff,
+                                  on_step=_tagged_step if on_step is not None else None)
+        finally:
+            if on_phase is not None:
+                on_phase("grade", "done")
+    return grade
 
 
 def forced_edit_fields(summary: dict) -> dict:
@@ -90,13 +292,31 @@ def forced_edit_fields(summary: dict) -> dict:
 def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
              project_dir_for, agent=_default_agent, verify=_default_verify,
              extract=_default_extract, contrastive=_default_contrastive,
-             grade=_default_grade, max_attempts=5, skip_build=False):
+             grade=_default_grade, max_attempts=5, skip_build=False,
+             checkpoint_path_for=None, on_prepare=None):
     """Run one full pass over `bugs` (already in chronological order).
 
     Each bug gets up to `max_attempts` attempts; between them the agent is re-run with
     deployment-faithful feedback (delivered the same way as the playbook -- written into
     the agent's project dir). Both the playbook and the feedback reach the agent via
     `inject`, so the agent contract stays `agent(bug_id, project_dir, skip_build)`.
+
+    `checkpoint_path_for(bug_id) -> Path | None`, if given, enables attempt-level resume:
+    each attempt is durably checkpointed as it completes, so a run killed mid-bug (e.g. a
+    usage cap) picks back up at the next attempt on re-run instead of restarting the bug's
+    whole `max_attempts` budget. Bug-level resume (the `done` set below) already covers a
+    bug that's fully finished; this covers one still in progress. Off by default so
+    existing callers/tests are unaffected.
+
+    The playbook (compressed if needed) is rendered ONCE per bug, not once per attempt --
+    it's holdout-filtered on `bug_id` and doesn't change across a bug's own retries, so
+    recomputing it (a real LLM call once compression kicks in) on every attempt was pure
+    waste that compounds on hard bugs burning multiple retries.
+
+    `on_prepare(bug_id)`, if given, fires once per bug right before that (potentially
+    slow, LLM-backed) compression call -- only when `inject_enabled`, since control never
+    compresses anything. Lets a live-status caller show something instead of sitting on
+    stale phase info from the previous bug for the call's duration.
     """
     state = load_state(state_path)
     # Resume: a bug already recorded in the ledger for this pass is done -- its
@@ -121,10 +341,35 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
             last_run = {}
             total_tokens: dict = {}
 
-            def attempt_agent(attempt_no, feedback, _bug_id=bug_id, _project_dir=project_dir):
-                # Render is holdout-filtered: only lessons from strictly-earlier bugs. Read at
-                # call time, so it reflects this bug's pre-update store.
-                text = maybe_compress(render_playbook(state, before_bug=_bug_id)) if inject_enabled else ""
+            checkpoint_path = checkpoint_path_for(bug_id) if checkpoint_path_for else None
+            resume_attempts = read_checkpoint(checkpoint_path) if checkpoint_path else []
+            resume_feedback = resume_attempts[-1].get("feedback_for_next", "") if resume_attempts else ""
+            for prior in resume_attempts:
+                for k, v in prior.get("tokens", {}).items():
+                    total_tokens[k] = total_tokens.get(k, 0) + v
+            if resume_attempts:
+                print(f"[{bug_id}] resuming pass={pass_name} at attempt {len(resume_attempts) + 1} "
+                      f"({len(resume_attempts)} attempt(s) already checkpointed)")
+
+            def on_attempt(record, _checkpoint_path=checkpoint_path, _bug_id=bug_id):
+                if _checkpoint_path is not None:
+                    tokens = dict(last_run.get("summary", {}).get("tokens", {}))
+                    append_checkpoint(_checkpoint_path, {**record, "tokens": tokens})
+                _archive_attempt(_bug_id, record)
+
+            # Render (holdout-filtered: only lessons from strictly-earlier bugs) and
+            # compress ONCE per bug, not once per attempt -- the playbook doesn't change
+            # across a bug's own retries, so recomputing this on every attempt paid for
+            # the same compression LLM call 3-5x over on a hard bug.
+            playbook_text = ""
+            if inject_enabled:
+                if on_prepare:
+                    on_prepare(bug_id)
+                playbook_text = maybe_compress(render_playbook(state, before_bug=bug_id))
+
+            def attempt_agent(attempt_no, feedback, _bug_id=bug_id, _project_dir=project_dir,
+                              _playbook_text=playbook_text):
+                text = _playbook_text
                 if feedback:
                     text = (text + "\n\n## Feedback on your previous attempt\n" + feedback).strip()
                 inject(text, _project_dir)
@@ -136,10 +381,34 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
                 return {"diff": run.get("diff", ""), "trajectory_summary": run.get("trajectory_summary", ""),
                         "timed_out": run.get("timed_out", False),
                         "check_required": run.get("check_required", False),
-                        "check_passed": run.get("check_passed", False)}
+                        "check_passed": run.get("check_passed", False),
+                        "usage_limit": run.get("usage_limit"),
+                        "aborted": run.get("aborted", False)}
 
             result = repair_with_retries(bug=bug, agent=attempt_agent, verify=verify,
-                                         max_attempts=max_attempts)
+                                         max_attempts=max_attempts,
+                                         resume_attempts=resume_attempts,
+                                         resume_feedback=resume_feedback,
+                                         on_attempt=on_attempt)
+
+            if result["status"] == "interrupted":
+                # A usage cap or a user-requested abort cut the agent off mid-attempt,
+                # not a genuine failure -- that attempt was never checkpointed
+                # (repair_with_retries left `attempts` untouched), so there's nothing
+                # to write to the ledger and whatever real attempts already exist stay
+                # on disk for the next run to resume into. Either way the pass stops
+                # here rather than grinding through the rest of `bugs` (a usage cap
+                # would hit the next bug identically; an abort means the user is done).
+                if result.get("aborted"):
+                    reason = "aborted by user"
+                else:
+                    info = result.get("usage_limit") or {}
+                    reset_msg = f" ({info['resets_at_human']})" if info.get("resets_at_human") else ""
+                    reason = f"usage limit hit{reset_msg}"
+                print(f"[{bug_id}] {reason} -- stopping pass={pass_name}, "
+                      f"{len(result['attempts'])} real attempt(s) already checkpointed")
+                break
+
             solved = result["status"] == "solved"
             final_verdict = "verified_correct" if solved else (
                 result["attempts"][-1]["verdict"] if result["attempts"] else "no_changes")
@@ -166,6 +435,8 @@ def run_pass(*, bugs, pass_name, inject_enabled, state_path, ledger_path,
                       **forced_edit_fields(last_run.get("summary", {})),
                       **oracle_fields, **({"tokens": total_tokens} if total_tokens else {})}
             append_record(ledger_path, record)
+            if checkpoint_path is not None:
+                clear_checkpoint(checkpoint_path)
             records.append({**record, **{k: last_run[k] for k in ("injected_seen",) if k in last_run}})
         except Exception as exc:
             import traceback
@@ -251,16 +522,71 @@ def main():
     project_dir_for = lambda bid: arvo_oss_crs.bug_workdir(bid) / "project"
 
     inject_enabled = pass_name == "treatment"
+    max_attempts = int(os.environ.get("LEARN_MAX_ATTEMPTS", "5"))
+    state_path = pb_dir / f"playbook_state_{pass_name}.json"
+    ledger_path = learn_dir / f"ledger.{pass_name}.jsonl"
     print(f"[learn_loop] pass={pass_name} inject={inject_enabled} "
-          f"bugs={len(bugs)} max_attempts={os.environ.get('LEARN_MAX_ATTEMPTS', '5')}")
-    run_pass(
+          f"bugs={len(bugs)} max_attempts={max_attempts}")
+    checkpoint_path_for = lambda bid: RESULTS_BASE / pass_name / str(bid) / "attempts.jsonl"
+
+    common_kwargs = dict(
         bugs=bugs, pass_name=pass_name, inject_enabled=inject_enabled,
-        state_path=pb_dir / f"playbook_state_{pass_name}.json",
-        ledger_path=learn_dir / f"ledger.{pass_name}.jsonl",
-        project_dir_for=project_dir_for,
-        max_attempts=int(os.environ.get("LEARN_MAX_ATTEMPTS", "5")),
+        state_path=state_path, ledger_path=ledger_path,
+        project_dir_for=project_dir_for, max_attempts=max_attempts,
         skip_build="--skip-build" in sys.argv,
+        checkpoint_path_for=checkpoint_path_for,
     )
+
+    if os.environ.get("LEARN_LIVE_UI") != "1":
+        run_pass(agent=_default_agent, **common_kwargs)
+        return
+
+    # LEARN_LIVE_UI=1: replace raw OSS-CRS log spam with a live status panel.
+    # Ctrl-C is remapped to the SAME graceful stop as pressing q -- both just call
+    # controller.abort(), so nothing downstream cares which one fired. Only
+    # installed here, never at import time, so importing this module (e.g. for
+    # tests) never touches the process's real SIGINT handling.
+    import signal
+    import arvo_oss_crs
+    from live_status import LiveStatus
+
+    controller = arvo_oss_crs.AbortController()
+    status = LiveStatus(command=" ".join(sys.argv) or "learn_loop.py",
+                        subject=f"pass={pass_name}", on_abort=controller.abort)
+    tracker = PhaseTracker(status)
+
+    def before_attempt(bug_id):
+        n = tracker.reset_for_bug(bug_id)
+        idx = next((i for i, b in enumerate(bugs) if b["localId"] == bug_id), None)
+        status.position = (idx + 1, len(bugs_ids)) if idx is not None else None
+        status.subject = f"bug {bug_id} · {pass_name} · attempt {n}/{max_attempts}"
+        status.set_tallies(pass_tallies(learn_dir))
+        status.set_stats(playbook_stat(state_path) if inject_enabled else {})
+
+    def on_prepare(bug_id):
+        # Fires once per bug, before the (now-hoisted) playbook compression call --
+        # deliberately does NOT go through tracker.reset_for_bug, which also bumps
+        # the attempt counter; that must stay reserved for before_attempt's real
+        # attempt-1 reset, or this would make the panel misreport "attempt 2/N" the
+        # first time before_attempt actually fires for this bug.
+        from live_status import Phase
+        idx = next((i for i, b in enumerate(bugs) if b["localId"] == bug_id), None)
+        status.position = (idx + 1, len(bugs_ids)) if idx is not None else None
+        status.subject = f"bug {bug_id} · {pass_name} · preparing playbook"
+        status.set_phases([Phase(PHASE_LABELS[k]) for k in PHASE_ORDER])
+        status.feed_raw(f"[{bug_id}] preparing playbook (compressing if needed)...")
+
+    agent = _make_agent(abort_controller=controller, on_phase=tracker.on_phase,
+                        before_attempt=before_attempt, on_line=status.feed_raw)
+    verify = _make_verify(on_phase=tracker.on_phase, on_step=status.feed_raw)
+    grade = _make_grade(on_phase=tracker.on_phase, on_step=status.feed_raw)
+
+    old_sigint = signal.signal(signal.SIGINT, lambda signum, frame: controller.abort())
+    try:
+        with status:
+            run_pass(agent=agent, verify=verify, grade=grade, on_prepare=on_prepare, **common_kwargs)
+    finally:
+        signal.signal(signal.SIGINT, old_sigint)
 
 
 if __name__ == "__main__":

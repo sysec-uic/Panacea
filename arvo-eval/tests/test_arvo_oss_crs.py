@@ -1,5 +1,8 @@
 """Compose-file selection, preflight reachability, and token-count parsing."""
 import json
+import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -170,37 +173,291 @@ def test_run_timeout_env_parsed_as_seconds(monkeypatch):
     assert arvo_oss_crs._run_timeout() == 7200.0
 
 
+class FakeProc:
+    """Minimal Popen stand-in. `wait_results` is consumed in order across
+    successive .wait() calls: an Exception instance is raised, an int is
+    returned (and stored as .returncode). `stdout_lines`, if given, backs
+    .stdout with an io.StringIO so `iter(proc.stdout.readline, "")` (the real
+    drain loop in _run_agent_with_timeout) works exactly like it would against
+    a real Popen text-mode pipe."""
+
+    def __init__(self, wait_results, stdout_lines=None):
+        self._results = list(wait_results)
+        self.returncode = None
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        if stdout_lines is not None:
+            import io
+            self.stdout = io.StringIO("".join(l + "\n" for l in stdout_lines))
+
+    def wait(self, timeout=None):
+        result = self._results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        self.returncode = result
+        return result
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminate_calls += 1
+
+    def kill(self):
+        self.kill_calls += 1
+
+
 def test_agent_runs_to_completion_without_timeout():
     # No cap: run once, no teardown, and report the run did NOT time out.
-    calls = []
     teardowns = []
+    proc = FakeProc([0])
 
-    def fake_run(cmd, **kw):
-        calls.append(kw.get("timeout", "MISSING"))
-
-    timed_out = arvo_oss_crs._run_agent_with_timeout(
+    timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
         ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
-        run=fake_run, teardown=lambda: teardowns.append(True))
+        popen=lambda cmd, cwd, **kw: proc, teardown=lambda: teardowns.append(True))
     assert timed_out is False
-    assert calls == [None]          # the cap is threaded through to subprocess.run
+    assert aborted is False
     assert teardowns == []          # nothing to tear down on a clean finish
 
 
-def test_agent_timeout_tears_down_containers_and_reports_timed_out():
-    # A run that blows the cap: subprocess.run raises TimeoutExpired (it SIGKILLs the
-    # oss-crs process), but the orphaned compose containers survive -- so we must tear
-    # them down and tell the caller this was a no-patch, timed-out attempt.
+def test_agent_timeout_gracefully_terminates_then_kills_and_tears_down():
+    # A run that blows the cap: SIGTERM first (mirrors OSS-CRS's own graceful
+    # shutdown), escalate to SIGKILL only if that doesn't work within _graceful_kill's
+    # own wait, then sweep leftover containers and report a no-patch timed-out attempt.
     import subprocess
     teardowns = []
+    proc = FakeProc([
+        subprocess.TimeoutExpired(cmd=["x"], timeout=1.0),   # original cap blown
+        subprocess.TimeoutExpired(cmd=["x"], timeout=20),    # unresponsive to SIGTERM
+        -9,                                                   # SIGKILL finishes it
+    ])
 
-    def slow_run(cmd, **kw):
-        raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
-
-    timed_out = arvo_oss_crs._run_agent_with_timeout(
+    timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
         ["uv", "run", "oss-crs"], cwd="/x", timeout=1.0,
-        run=slow_run, teardown=lambda: teardowns.append(True))
+        popen=lambda cmd, cwd, **kw: proc, teardown=lambda: teardowns.append(True))
     assert timed_out is True
+    assert aborted is False
+    assert proc.terminate_calls == 1
+    assert proc.kill_calls == 1
     assert teardowns == [True]
+
+
+def test_agent_reports_aborted_when_controller_already_requested():
+    # Abort raced in before this call even started (e.g. q pressed between phases):
+    # the process is terminated immediately on registration, and the clean-ish exit
+    # that follows is reported as aborted, with the safety-net teardown sweep run.
+    teardowns = []
+    controller = arvo_oss_crs.AbortController()
+    controller.requested.set()
+    proc = FakeProc([-15])
+
+    timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
+        popen=lambda cmd, cwd, **kw: proc, teardown=lambda: teardowns.append(True),
+        abort_controller=controller)
+    assert timed_out is False
+    assert aborted is True
+    assert proc.terminate_calls == 1     # caught up immediately since requested was already set
+    assert teardowns == [True]
+
+
+def test_agent_not_aborted_when_controller_absent_or_unrequested():
+    proc = FakeProc([0])
+    timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None, popen=lambda cmd, cwd, **kw: proc)
+    assert aborted is False   # no abort_controller passed at all
+
+    proc = FakeProc([0])
+    controller = arvo_oss_crs.AbortController()   # passed but never requested
+    timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None, popen=lambda cmd, cwd, **kw: proc,
+        abort_controller=controller)
+    assert aborted is False
+
+
+def test_check_true_raises_on_a_genuine_failure_not_caused_by_abort():
+    # build-target's semantics: a real nonzero exit (not an abort) must still raise.
+    import subprocess
+    proc = FakeProc([1])
+    try:
+        arvo_oss_crs._run_agent_with_timeout(
+            ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
+            popen=lambda cmd, cwd, **kw: proc, check=True)
+        assert False, "expected CalledProcessError"
+    except subprocess.CalledProcessError:
+        pass
+
+
+def test_check_true_does_not_raise_when_the_nonzero_exit_was_our_own_abort():
+    proc = FakeProc([-15])
+    controller = arvo_oss_crs.AbortController()
+    controller.requested.set()
+
+    timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
+        popen=lambda cmd, cwd, **kw: proc, check=True, abort_controller=controller)
+    assert aborted is True   # no CalledProcessError, even though returncode != 0
+
+
+def test_abort_controller_terminates_the_currently_registered_process():
+    controller = arvo_oss_crs.AbortController()
+    proc = FakeProc([])
+    controller.register(proc)
+    controller.abort()
+    assert controller.requested.is_set()
+    assert proc.terminate_calls == 1
+
+
+def test_abort_controller_noop_when_nothing_registered():
+    controller = arvo_oss_crs.AbortController()
+    controller.abort()   # must not raise
+    assert controller.requested.is_set()
+
+
+def test_abort_controller_does_not_terminate_after_unregister():
+    controller = arvo_oss_crs.AbortController()
+    proc = FakeProc([])
+    controller.register(proc)
+    controller.unregister(proc)
+    controller.abort()
+    assert proc.terminate_calls == 0   # already unregistered -- must not touch it
+
+
+def test_abort_controller_switches_registration_across_phases():
+    # Simulates build-target's process finishing and the run phase's process
+    # registering next -- abort() must always reach whichever is CURRENT.
+    controller = arvo_oss_crs.AbortController()
+    build_proc = FakeProc([])
+    controller.register(build_proc)
+    controller.unregister(build_proc)   # build-target finished, its finally unregisters
+    run_proc = FakeProc([])
+    controller.register(run_proc)
+
+    controller.abort()
+    assert run_proc.terminate_calls == 1
+    assert build_proc.terminate_calls == 0
+
+
+def test_on_line_receives_every_line_from_the_subprocess():
+    proc = FakeProc([0], stdout_lines=["CC src/foo.c -> foo.o", "CC src/bar.c -> bar.o", "OK Build"])
+    received = []
+
+    timed_out, aborted = arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
+        popen=lambda cmd, cwd, **kw: proc, on_line=received.append)
+
+    assert received == ["CC src/foo.c -> foo.o", "CC src/bar.c -> bar.o", "OK Build"]
+    assert timed_out is False
+    assert aborted is False
+
+
+def test_on_line_none_does_not_pipe_stdout_at_all():
+    # Default behavior (no live panel) must be unaffected for stdout/stderr: the
+    # child's output inherits the terminal directly, exactly like before this
+    # feature existed -- confirmed here by checking NO stdout/stderr kwargs are
+    # passed to popen at all when on_line is absent. stdin IS always closed
+    # (DEVNULL) regardless of on_line -- see test_stdin_is_always_closed_to_the_child.
+    seen_kwargs = {}
+
+    def fake_popen(cmd, cwd, **kw):
+        seen_kwargs.update(kw)
+        return FakeProc([0])
+
+    arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None, popen=fake_popen)
+    assert seen_kwargs == {"stdin": subprocess.DEVNULL}   # no stdout=PIPE, no stderr=STDOUT, no text=True
+
+
+def test_stdin_is_always_closed_to_the_child():
+    # The child (and its own descendants, e.g. build-target's docker compose/buildx
+    # chain) must never share the real terminal's stdin fd with live_status's
+    # key-listener thread -- two readers racing on the same tty fd is exactly the
+    # kind of thing that can make a keystroke (v/q) appear to double-fire or drop.
+    seen_kwargs = {}
+
+    def fake_popen(cmd, cwd, **kw):
+        seen_kwargs.update(kw)
+        return FakeProc([0], stdout_lines=[])
+
+    arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None, popen=fake_popen, on_line=lambda l: None)
+    assert seen_kwargs["stdin"] == subprocess.DEVNULL
+
+
+def test_on_line_pipes_stdout_and_merges_stderr():
+    seen_kwargs = {}
+
+    def fake_popen(cmd, cwd, **kw):
+        seen_kwargs.update(kw)
+        return FakeProc([0], stdout_lines=[])
+
+    arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None, popen=fake_popen, on_line=lambda l: None)
+    assert seen_kwargs["stdout"] == subprocess.PIPE
+    assert seen_kwargs["stderr"] == subprocess.STDOUT
+    assert seen_kwargs["text"] is True
+
+
+def test_reader_thread_is_joined_before_returning():
+    # The finally block must wait for the drain loop to finish before
+    # _run_agent_with_timeout returns, so a caller never sees a partial read.
+    proc = FakeProc([0], stdout_lines=["a", "b", "c"])
+    received = []
+
+    arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
+        popen=lambda cmd, cwd, **kw: proc, on_line=received.append)
+    # By the time the call returns, every line must already be collected --
+    # not "eventually" on some still-running background thread.
+    assert received == ["a", "b", "c"]
+
+
+class _SlowStdout:
+    """A stdout stand-in whose readline() blocks until the test explicitly
+    releases the next line -- lets a test deterministically control exactly
+    when the background drain thread produces output, instead of racing real
+    wall-clock sleeps against the join timeout."""
+
+    def __init__(self, lines):
+        self._lines = list(lines)
+        self._idx = 0
+        self.release = threading.Event()
+
+    def readline(self):
+        if self._idx >= len(self._lines):
+            return ""
+        self.release.wait()
+        self.release.clear()
+        line = self._lines[self._idx] + "\n"
+        self._idx += 1
+        return line
+
+
+def test_late_lines_after_drain_timeout_are_not_delivered():
+    # Regression: if the drain thread is still catching up on a final burst of
+    # output when the join gives up (docker compose teardown logs, etc.), the
+    # caller moves on to the NEXT phase while that background thread keeps
+    # calling on_line -- so its stale output visually bleeds into whatever the
+    # panel shows next. Once _run_agent_with_timeout stops waiting, it must
+    # stop delivering, even though the thread is still alive.
+    proc = FakeProc([0])
+    proc.stdout = _SlowStdout(["late line"])
+    received = []
+
+    # proc.wait() returns immediately (FakeProc), but the drain thread's first
+    # readline() blocks on the Event, which the test never releases during the
+    # call -- so the tiny drain_timeout expires before any line is read.
+    arvo_oss_crs._run_agent_with_timeout(
+        ["uv", "run", "oss-crs"], cwd="/x", timeout=None,
+        popen=lambda cmd, cwd, **kw: proc, on_line=received.append,
+        drain_timeout=0.05)
+    assert received == []   # gave up waiting before the line arrived
+
+    # The background thread is still alive and will now produce its line --
+    # confirm it does NOT reach on_line once the gate has closed.
+    proc.stdout.release.set()
+    time.sleep(0.2)   # let the (still-running, harmless) daemon thread run
+    assert received == []
 
 
 def test_terminate_crs_run_force_removes_live_containers():
@@ -363,6 +620,65 @@ def test_token_counts_missing_file_is_zeroed(tmp_path):
         "input_tokens": 0, "output_tokens": 0,
         "cache_read_tokens": 0, "cache_write_tokens": 0,
     }
+
+
+def test_detect_usage_limit_none_on_clean_log(tmp_path):
+    log = _write_log(tmp_path, [
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "allowed", "resetsAt": 123}},
+        {"type": "result", "subtype": "success", "is_error": False},
+    ])
+    assert arvo_oss_crs.detect_usage_limit(log) is None
+
+
+def test_detect_usage_limit_none_on_warning_status(tmp_path):
+    # allowed_warning (approaching the cap) is not a cutoff -- must not trip the gate.
+    log = _write_log(tmp_path, [
+        {"type": "rate_limit_event",
+         "rate_limit_info": {"status": "allowed_warning", "resetsAt": 123, "utilization": 0.91}},
+    ])
+    assert arvo_oss_crs.detect_usage_limit(log) is None
+
+
+def test_detect_usage_limit_missing_file_is_none(tmp_path):
+    assert arvo_oss_crs.detect_usage_limit(tmp_path / "nope.log") is None
+
+
+def test_detect_usage_limit_real_rejected_event_shape(tmp_path):
+    # Real payload captured from a live run (bug 455612769, 2026-07-16) that got cut
+    # off by the 5-hour cap mid-investigation.
+    log = _write_log(tmp_path, [
+        {"type": "rate_limit_event",
+         "rate_limit_info": {"status": "rejected", "resetsAt": 1784238600,
+                             "rateLimitType": "five_hour", "overageStatus": "rejected",
+                             "overageDisabledReason": "org_level_disabled", "isUsingOverage": False},
+         "uuid": "dcce88a7-42ea-4e85-aacc-99dcd8be3ce1"},
+        {"type": "assistant", "error": "rate_limit",
+         "message": {"content": [{"type": "text", "text": "You've hit your session limit · resets 9:50pm (UTC)"}]}},
+        {"type": "result", "subtype": "success", "is_error": True, "api_error_status": 429,
+         "result": "You've hit your session limit · resets 9:50pm (UTC)"},
+    ])
+    result = arvo_oss_crs.detect_usage_limit(log)
+    assert result == {"resets_at": 1784238600,
+                      "resets_at_human": "You've hit your session limit · resets 9:50pm (UTC)"}
+
+
+def test_detect_usage_limit_result_object_alone_is_sufficient(tmp_path):
+    # If the log gets cut off before/without a rate_limit_event line (e.g. the CLI
+    # process itself got killed), the terminal result object alone must still trip it.
+    log = _write_log(tmp_path, [
+        {"type": "result", "subtype": "success", "is_error": True, "api_error_status": 429,
+         "result": "You've hit your session limit · resets 4:00am (UTC)"},
+    ])
+    assert arvo_oss_crs.detect_usage_limit(log) == {
+        "resets_at": None, "resets_at_human": "You've hit your session limit · resets 4:00am (UTC)",
+    }
+
+
+def test_detect_usage_limit_ignores_unparseable_lines(tmp_path):
+    log = tmp_path / "claude_stdout.log"
+    log.write_text('not json\n{"type": "rate_limit_event", "rate_limit_info": '
+                   '{"status": "rejected", "resetsAt": 5}}\n')
+    assert arvo_oss_crs.detect_usage_limit(log) == {"resets_at": 5, "resets_at_human": None}
 
 
 # --- check-patch auto-submit: promote the validated diff when the agent never submits ---
