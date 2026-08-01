@@ -1,1 +1,35 @@
+# --- databases (large, downloaded/generated) ---
 *.db
+
+# --- python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# --- logs & scratch ---
+*.log
+*.tmp
+*.bak
+*.bak-*
+*.aux-split.yaml
+
+# --- LaTeX build artifacts (keep sources + figs) ---
+docs/paper/*.aux
+docs/paper/*.out
+docs/paper/*.toc
+docs/paper/*.fls
+docs/paper/*.fdb_latexmk
+docs/paper/*.synctex.gz
+docs/paper/paper.pdf
+
+# --- separate/scratch eval trees (results only, not core) ---
+swe-agent-eval/
+
+# --- editor / OS junk ---
+.DS_Store
+*.swp
+.idea/
+.vscode/
