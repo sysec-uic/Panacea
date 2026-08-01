@@ -1,5 +1,17 @@
 # Evaluation Plan & Results
 
+## Summary
+
+This is the results writeup for the mruby heuristic-learning study: does injecting
+a markdown playbook of lessons from earlier solved bugs help Claude Code fix later
+bugs, and if so, how. Short answer: yes, but narrowly. The playbook does not make
+individual repair attempts cheaper or the agent generally sharper; it prevents
+specific, previously-seen bug shapes from needing a retry. Every bit of this
+pilot's net efficiency gain traces to a handful of bugs, and that effect does not
+even concentrate in the dataset's single most common bug family, the opposite of
+the naive expectation going in. Full methodology, data, and reasoning are below;
+the code artifact is the rest of this repository.
+
 ## Question
 
 Does injecting a playbook of lessons, extracted from earlier solved bugs, help
@@ -43,43 +55,105 @@ every bug.
 | **`n_attempts`** (solved bugs only) | Efficiency: how many of the 5 allowed attempts it took. Lower is better; watch whether treatment trends down relative to control as the playbook accumulates. |
 | **Token counts** (input, output, cache-read, cache-write) | Cost/effort proxy, recorded per bug in the ledger. Cache-read dominates and scales with conversation length (more tool calls, more retries), so it's a more sensitive efficiency signal than fix rate at this sample size. |
 
-## Current results (in progress, snapshot 2026-07-29)
+## Current results (final, both passes complete, 2026-07-31)
 
-**This is a live snapshot, not a final result.** Treatment has completed every
-runnable bug (27/27; 30 minus 3 permanent environment-level skips). Control has
-completed 26/27 -- one bug, `455612769`, is mid-rerun (see note below) and is
-excluded from the numbers here until it lands. Numbers below cover the 26 bugs
-both arms have completed **identically** (matched pairs):
+Both passes have now attempted every runnable bug: 27/30 each (30 minus 3
+permanent environment-level skips). "Fix rate" below means solved within up to
+5 attempts per bug, not on the first try -- a single-attempt success rate would
+be noticeably lower; this measures an agent that gets deployment-faithful
+feedback and can retry, not one-shot performance.
 
 | | Bugs confirmed | Fix rate | `oracle_confirmed` |
 |---|---|---|---|
-| **Control** | 26 / 30 | 26 / 26 (100%) | 26 / 26 |
-| **Treatment** | 27 / 30 | 27 / 27 (100%) | 27 / 27 |
+| **Control** | 26 / 27 | 96.3% | 26 / 26 (100%) |
+| **Treatment** | 27 / 27 | 100% | 27 / 27 (100%) |
 
-Both arms remain at 100% fix rate on every bug either has actually completed.
-That's a real limitation worth stating plainly: with zero failures on either arm,
-this dataset so far can only speak to **efficiency** (attempts, tokens), not to
-whether the playbook changes whether a bug gets solved at all.
+Control's one miss, `455612769`, is the only failure anywhere in the dataset,
+and treatment solved the same bug in its first attempt. It took control 5
+attempts across two separate runs to exhaust the budget: 3 of those attempts
+were cut short by external causes (a cyber-safeguard refusal, a raw 500 error,
+a 529 Overloaded), but the other 2 ran their full time budget while genuinely
+still debugging real, unresolved sub-bugs (it fixed a GCD underflow, then an
+unnormalized-zero divide-by-zero, then started chasing a memory leak, never
+converging in time). A harder bug, not just an unlucky one.
 
-| Metric (avg. per bug, matched pairs, n=26) | Control | Treatment |
+Given both arms sit at or near 100%, fix rate alone still can't say much on its
+own here (95% confidence intervals on n=27 overlap heavily); the more
+informative comparison is effort, covered next.
+
+| Metric (avg. per bug, matched pairs where both solved, n=26) | Control | Treatment |
 |---|---|---|
 | Attempts | 1.19 | 1.00 |
 | Total tokens (sum, all 26) | 64,767,282 | 61,254,096 |
 | Mean tokens/bug | 2,491,049 | 2,355,927 |
+
+By token type (same 26 bugs, mean per bug): input tokens control 3,293 /
+treatment 3,036 (-7.8%); output tokens 833 / 793 (-4.8%); cache-read tokens
+2,424,560 / 2,291,332 (-5.5%); cache-write tokens 62,364 / 60,765 (-2.6%).
+Every category moved the same direction by a similar amount, so no single
+token type is driving the gap on its own.
 
 **Where the token gap actually comes from:** splitting the 26 matched bugs into
 "both arms solved in 1 attempt" (22 bugs) vs "at least one arm needed a retry"
 (4 bugs: `448702064`, `472538295`, `472567524`, `473582282`) shows the savings
 are NOT a general per-attempt efficiency gain. On the 22 one-shot-both bugs, the
 two arms are within ~3% of each other in aggregate tokens (control 56.1M vs
-treatment 54.4M) -- close to a coin flip, not a systematic per-attempt
-advantage. All of the net savings come from the handful of bugs where control
-needed extra attempts and treatment didn't -- treatment has not needed a retry
-on any matched bug so far (avg attempts across all 26 matched pairs is exactly
-1.00). This reframes the mechanism: **the playbook isn't making individual
-attempts cheaper, it's preventing some bugs from needing a retry at all** --
-closer to "pattern-matching against a known bug family" than "generally sharper
-reasoning."
+treatment 54.4M) -- close to a coin flip (per-bug swings range from -71% to
++159%, they just cancel out in aggregate; 11 of 22 bugs are cheaper under
+treatment, 11 are more expensive) -- not a systematic per-attempt advantage.
+All of the net savings come from the 4 bugs where control needed extra
+attempts and treatment didn't -- treatment has not needed a retry on any
+matched bug (avg attempts across all 26 matched pairs is exactly 1.00). This
+reframes the mechanism: **the playbook isn't making individual attempts
+cheaper, it's preventing some bugs from needing a retry at all.**
+
+**Robustness check:** the original plan was to restrict this analysis to the
+last ~20 of 30 bugs (the playbook is too thin on the first ~10 to be a fair
+test). Checked directly -- all 4 retry-avoidance bugs fall in that later
+window anyway, and the excluded first 6 chronological bugs had zero retries on
+either arm -- so the conclusion is identical whether the full 26 or the
+last-20 subset is used. We report the full set.
+
+**Bug families, and where the advantage actually concentrates:** clustering
+the 27 solved bugs by root-cause tags from the playbook itself (not by hand)
+finds one dominant, repeated pattern: 10 of 27 are the same bigint
+stack/pool-lifetime bug (`stack-use-after-return` / `pool-escape`, a scratch
+buffer's contents outliving the stack frame it was allocated on). The
+remaining 17 split across MSan uninitialized-value bugs (6), one-off bugs (4),
+bignum boxing type confusion (3), GC write-barrier/arena lifetime bugs (2),
+and bigint Karatsuba scratch-buffer overflows (2).
+
+The naive expectation was that this dominant family is where a heuristic
+playbook has the best shot at helping ("genus recognition"). The data says
+otherwise: restricted to the 9 dominant-family bugs both arms solved, control
+needed **zero retries** and treatment cost slightly *more* tokens (+13.8%).
+Every one of the 4 real retry-avoidance bugs sits instead in one of the
+smaller families -- one each in Karatsuba, type confusion, GC/arena, and MSan.
+The advantage tracks specific bug shapes the playbook happens to have seen
+before, not the single most repeated shape in the dataset.
+
+**A checked example of the actual mechanism, `472538295`:** an earlier bug,
+`456317307`, had already taught the playbook a contrastive lesson: "when a bint
+op crashes, check whether its operand came from a normalizing constructor
+(`mrb_bint_from_bytes`/`from_int64` return a fixnum when the value fits `mrb_int`);
+insert `mrb_as_bint()` to re-promote before the op rather than concluding no fix
+exists. Never emit an empty patch when the crash is a live type-confusion deref."
+`472538295` is the same underlying shape (`mrb_as_bint` / `type-confusion` / `segv`),
+just reached through `mruby-rational` instead of a bytes constructor. Checked what
+control actually did without that lesson: its first attempt came back `no_changes`,
+exactly the failure mode the lesson warns against. Treatment, with the lesson
+already in `HEURISTICS.md`, solved it in one attempt.
+
+Checked the other 3 retry-avoidance bugs the same way (only counting lessons that
+existed, by playbook version, before each bug ran, and only counting
+tag overlap specific enough to mean something, `bigint`/`mruby`/`asan`/`msan`
+alone don't count): `473582282` has a moderate match (3 prior MSan/codegen
+lessons existed); `472567524` has only a weak, generic match (`use-after-free`
+broadly, not the specific arena/callback mechanism); `448702064` has no
+meaningful prior match at all, it was the first Karatsuba-family bug in the
+sequence, so there was nothing yet to recognize. So the mechanism above is real
+and checkable for at least 2 of the 4 bugs driving the whole result, not
+established for the other 2.
 
 **Note on `462331852`:** this bug originally needed 3 attempts on control and
 surfaced two of the confirmed retry-causes below (a safeguard refusal and a
@@ -95,15 +169,24 @@ itself more evidence for the non-determinism point made below.
 (a capability added 2026-07-23; earlier multi-attempt runs only kept the last
 attempt's logs) surfaced that "needed a retry" conflates several very different
 causes that the ledger's `n_attempts` field cannot currently distinguish:
-- a genuine Anthropic cyber-safeguard refusal, confirmed directly in two
-  transcripts (`462331852`'s original run, `472567524` attempt 1 -- both
-  control, both triggered on ordinary, benign actions like decoding PoC bytes)
-- an apparent container OOM-kill (exit code 137) mid-verification on
-  `462331852`'s original run, after the agent had already root-caused the bug
-  correctly and built what looks like a working fix
+- a genuine Anthropic cyber-safeguard refusal (3 confirmed instances:
+  `462331852`'s original run, `472567524` attempt 1, `455612769` attempt 1 --
+  all control, all triggered on ordinary, benign actions like decoding PoC
+  bytes)
+- an apparent container OOM-kill (exit code 137, 1 confirmed instance)
+  mid-verification on `462331852`'s original run, after the agent had already
+  root-caused the bug correctly and built what looks like a working fix
+- raw API server instability (2 confirmed instances, a 500 and a 529
+  Overloaded, both on `455612769`) that cut the agent off mid-turn with no
+  chance to submit
+- the agent genuinely running its full time budget while still debugging real
+  sub-bugs (2 confirmed instances, both on `455612769`'s later attempts) --
+  not an infra artifact and not the agent stalling, real incremental progress
+  that just didn't converge in time
 - two bugs (`446362556`, `462331852`) that each took multiple attempts on one
   run and only 1 attempt on an identical rerun -- confirmation that `n_attempts`
-  has real run-to-run non-determinism, not just a fixed property of a given bug
+  has real run-to-run non-determinism (the eventual fix was correct either way;
+  only how many attempts it took changed), not a fixed property of a given bug
 - a real, pipeline-level bug (fixed in PR #18, `fix/usage-limit-diff-check`):
   `repair_loop.py` was silently discarding an entire attempt -- including a real,
   working diff -- whenever a `usage_limit` signal arrived, before checking
@@ -117,8 +200,7 @@ None of this has yet been done systematically across every retry in the dataset
 deliberate choice to avoid new pipeline tooling this late in the project), so the
 efficiency numbers above should be read as **not yet corrected for
 refusal/infra-driven retries** -- the true "genuine reasoning" efficiency gap
-could be smaller, larger, or about the same once that's accounted for. Revisit
-this section once the full run is done (2 control bugs remain).
+could be smaller, larger, or about the same once that's accounted for.
 
 ## Verification methodology
 
@@ -142,6 +224,61 @@ infrastructure (holdout-safe playbook injection, independent verification, a
 differential oracle) needed to scale the same method to a larger bug set or more
 projects later. See `arvo-eval/transfer/` for the (currently paused) cross-project
 extension of this idea.
+
+## Possible future plans
+
+### Near-term, scoped follow-ons
+
+**An automated retry-cause classifier.** Every retry-cause finding above came from
+reading archived transcripts by hand, a deliberate choice this cycle given the time
+available, but it doesn't scale and hasn't been run systematically across every
+retry in the dataset. Building a classifier over the archived per-attempt logs
+(matching on known signatures: the exact refusal string, exit code 137, HTTP
+5xx/529 patterns) would let the efficiency numbers be reported corrected for
+infra/refusal noise instead of caveated against it.
+
+**Retrieval-based playbook injection.** The current design compresses the entire
+accumulated playbook into one file every time it grows past a size cap, a known,
+worsening squeeze (already compressed roughly 4x by playbook version 16). The bug
+family finding above suggests a sharper fix: inject only the heuristics whose tags
+actually match the current bug's crash signature, rather than the whole history
+compressed down. This is also the field's own answer to the same problem (see
+"the other data point" investigation), not a novel idea, but not yet built here.
+
+**Cross-project transfer.** Most projects don't have 30 bugs of their own to build
+a same-project playbook from. The paused pilot under `arvo-eval/transfer/` asks
+whether a lesson learned on one project's bug helps a *different* project's bug of
+the same crash class, directly relevant given how concentrated this dataset's own
+bug families turned out to be.
+
+**A Sonnet-vs-Opus ablation.** All results here run the repair agent on Opus. A
+same-design run on Sonnet would give a real cost/capability tradeoff point,
+whether the playbook's effect (or lack of it, on the dominant family) holds, grows,
+or shrinks on a cheaper model. A `compose-oauth-sonnet.yaml` variant already
+exists; the run itself hasn't been done.
+
+**Systematic audit of pre-fix ledger entries.** The `repair_loop.py` bug described
+above (a real diff silently discarded on a `usage_limit` signal) was found and
+fixed after already affecting two bugs in this dataset, both recovered by hand.
+Whether it silently cost data on any *other* already-ledgered bug before the fix
+was never checked systematically, on purpose, to avoid new tooling this late in
+the cycle. A clean audit of historical runs against the fixed code would close
+that gap.
+
+### Bigger-picture, unscoped directions
+
+**Executable memory instead of descriptive memory.** Every lesson in this study is
+text the agent has to read, remember, and choose to apply on its own. The
+local-model track's own postmortems found a recurring failure mode in exactly that
+shape, the agent reading an instruction to *go do something* and never following
+through (the orientation-pointer bug is one documented instance). A different
+design would have the agent write and refine actual reusable tooling, small
+scripts that encode a diagnostic or fix pattern operationally, that later runs can
+just *execute* instead of re-deriving from a description each time. Whether that
+survives the same holdout/deployment-faithful constraints this study enforces, and
+whether it actually outperforms markdown injection rather than just being harder
+to get right, is genuinely open, worth a real design doc before the next cycle,
+not a small follow-on.
 
 ## Running it yourself
 
